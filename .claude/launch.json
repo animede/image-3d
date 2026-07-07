@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "image3d-server",
+      "runtimeExecutable": "env",
+      "runtimeArgs": ["IMAGE3D_GENERATOR=hunyuan3d", ".venv/bin/uvicorn", "server.main:app", "--host", "127.0.0.1", "--port", "8020"],
+      "port": 8020
+    },
+    {
+      "name": "image3d-server-verify",
+      "runtimeExecutable": "env",
+      "runtimeArgs": ["IMAGE3D_GENERATOR=mock", ".venv/bin/uvicorn", "server.main:app", "--host", "127.0.0.1", "--port", "8021"],
+      "port": 8021
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+fastapi>=0.111
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
+trimesh>=4.4
+scipy>=1.13
+networkx>=3.3
+lxml>=5.2
+numpy>=1.26,<3.0
+pillow>=10.3
+fast-simplification>=0.1.7
+pytest>=8.2
+httpx>=0.27

@@ -1,0 +1,65 @@
+# Phase 2: Hunyuan3D-2 実モデル統合用の追加依存
+#
+# Blackwell (sm_120: RTX PRO 6000 Blackwell等) 対応のため CUDA 12.8 ビルドの
+# torch/torchvision を使用する(cu121等の旧ビルドはsm_120非対応で動作しない)。
+# 実機検証済みバージョン(2026-07時点):
+#   torch==2.11.0+cu128 / torchvision==0.26.0+cu128
+#
+#   pip install --index-url https://download.pytorch.org/whl/cu128 torch torchvision
+#
+# 背景除去(FR-2)
+# rembgはonnxruntime(CPU版)で導入する。GPUはHunyuan3D-2生成専用に使い、
+# 軽量なu2netモデルの背景除去はCPUで十分高速(実測 約1秒/枚)なためVRAMを消費しない
+# CPU版を採用する(onnxruntime-gpuは依存衝突・導入不安定のリスクがあるため避けた)。
+rembg>=2.0.59
+onnxruntime>=1.18
+
+# Hunyuan3D-2 (hy3dgen) shape pipeline
+# 公式リポジトリからのインストールを推奨(PyPI配布がないため):
+#   git clone https://github.com/Tencent/Hunyuan3D-2 third_party/Hunyuan3D-2
+#   pip install -e third_party/Hunyuan3D-2 --no-deps
+# --no-deps とする理由: setup.pyのinstall_requiresにはtexgen/デモ用途の
+# 重い依存(gradio, xatlas, pygltflib, ninja, pybind11等)が含まれ、
+# shapeパイプラインのみの利用では不要なため、必要な依存だけを以下で個別導入する。
+huggingface_hub>=0.23
+einops>=0.8
+omegaconf>=2.3
+transformers>=4.42
+diffusers>=0.30
+accelerate>=0.30
+opencv-python-headless>=4.9
+scikit-image>=0.23
+pymeshlab>=2023.12
+# 実機検証済みバージョン(2026-07時点、上記制約を満たす):
+#   diffusers==0.39.0 / transformers==5.13.0 / accelerate==1.14.0
+#   einops==0.8.2 / omegaconf==2.3.1 / opencv-python-headless==5.0.0.93
+#   scikit-image==0.26.0 / pymeshlab==2025.7.post1 / huggingface_hub==1.22.0
+#
+# 注意: rembg/hy3dgenの依存解決により numpy が 2.x 系に上がる
+# (requirements.txt の numpy<2.0 制約と矛盾するが、trimesh/fast-simplification/
+# meshprocは numpy 2.x でも問題なく動作することを確認済み)。
+
+# --- Phase 3c: texgen (Hunyuan3D-2 paint pipeline, FR-10) 追加依存 -----------
+# shapeパイプラインのみの導入時(--no-deps)には含まれない、texgen専用の依存。
+# custom_rasterizer (CUDA拡張) のビルドにはpybind11/ninjaが必要。
+xatlas>=0.0.9
+pybind11>=2.11
+ninja>=1.11
+pygltflib>=1.16
+#
+# custom_rasterizer (hy3dgen/texgen/custom_rasterizer) のビルド手順:
+#   システムのnvccがtorchのCUDAビルドとメジャーバージョン不一致な場合
+#   (例: システムCUDA 13.0 / torch cu128)、CUDA 12.8ツールチェーンを別途用意し
+#   CUDA_HOME/PATHで明示的に指定してビルドする。
+#   (RTX PRO 6000 Blackwell / sm_120 実機で /usr/local/cuda-12.8 使用時に
+#   ビルド成功・動作確認済み。詳細はREADME.md「Phase 3c」参照)
+#
+#   cd third_party/Hunyuan3D-2/hy3dgen/texgen/custom_rasterizer
+#   CUDA_HOME=/usr/local/cuda-12.8 PATH="/usr/local/cuda-12.8/bin:$PATH" \
+#     TORCH_CUDA_ARCH_LIST="12.0" \
+#     pip install . --no-build-isolation --no-deps
+#
+# 注意: differentiable_renderer/mesh_processor(pybind11拡張)はビルド不要。
+# hy3dgenのコードは `from .mesh_processor import meshVerticeInpaint` という
+# パッケージ内相対importのため、同名の純Python実装(mesh_processor.py)が
+# 優先解決され、CUDA/C++拡張(mesh_processor.cpp)を別途ビルドしなくても動作する。

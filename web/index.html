@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Image-3D — 画像から3Dプリントデータ生成</title>
+<link rel="stylesheet" href="/style.css" />
+<script type="importmap">
+{
+  "imports": {
+    "three": "/vendor/three/build/three.module.js",
+    "three/addons/": "/vendor/three/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<div id="app">
+  <header id="app-header">
+    <h1>Image-3D</h1>
+    <span class="subtitle">画像から3Dプリントデータ生成</span>
+  </header>
+
+  <main id="app-main">
+    <!-- 左ペイン -->
+    <section id="left-pane">
+      <div class="panel">
+        <h2>1. 画像アップロード</h2>
+        <div id="dropzone" class="dropzone">
+          <p>ここに正面画像をドラッグ&amp;ドロップ<br/>またはクリックして選択</p>
+          <input type="file" id="file-input" accept="image/png,image/jpeg,image/webp" hidden />
+        </div>
+        <img id="preview-image" class="preview-image" hidden />
+        <p class="hint">PNG / JPEG / WebP、最大20MB(正面画像は必須)</p>
+
+        <div class="extra-views-section">
+          <p class="sub-hint">追加ビュー(任意、マルチビュー生成 FR-9)</p>
+          <div class="extra-views-row">
+            <div class="extra-view-slot" data-view="back">
+              <div class="extra-dropzone" data-view="back">
+                <span class="extra-view-label">背面</span>
+                <img class="extra-view-preview" hidden />
+                <input type="file" class="extra-view-input" accept="image/png,image/jpeg,image/webp" hidden />
+              </div>
+              <button type="button" class="extra-view-clear" data-view="back" hidden>×クリア</button>
+            </div>
+            <div class="extra-view-slot" data-view="left">
+              <div class="extra-dropzone" data-view="left">
+                <span class="extra-view-label">左側面</span>
+                <img class="extra-view-preview" hidden />
+                <input type="file" class="extra-view-input" accept="image/png,image/jpeg,image/webp" hidden />
+              </div>
+              <button type="button" class="extra-view-clear" data-view="left" hidden>×クリア</button>
+            </div>
+            <div class="extra-view-slot" data-view="right">
+              <div class="extra-dropzone" data-view="right">
+                <span class="extra-view-label">右側面</span>
+                <img class="extra-view-preview" hidden />
+                <input type="file" class="extra-view-input" accept="image/png,image/jpeg,image/webp" hidden />
+              </div>
+              <button type="button" class="extra-view-clear" data-view="right" hidden>×クリア</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>キャラクターシート分割(任意)</h2>
+        <p class="sub-hint">複数ビューが1枚に並んだ画像から、パネルを自動検出してビューに割り当てられます。</p>
+        <input type="file" id="sheet-file-input" accept="image/png,image/jpeg,image/webp" hidden />
+        <button type="button" id="sheet-split-btn" class="secondary-btn">シート画像を選んで分割</button>
+        <div id="sheet-panels-area" hidden>
+          <div id="sheet-panels-list"></div>
+          <button type="button" id="sheet-apply-btn" class="primary-btn">この割当を使用</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>2. 生成パラメータ</h2>
+        <form id="params-form">
+          <label class="field">
+            <span>プリセット</span>
+            <select id="preset-select" name="preset">
+              <option value="custom" selected>カスタム</option>
+              <option value="figure">フィギュア(高さ100mm/384/20万面)</option>
+              <option value="small_figure">小型フィギュア(高さ60mm/256/10万面)</option>
+              <option value="pendant">ペンダント(高さ40mm/256/8万面/カラーOFF)</option>
+              <option value="high_detail">高精細(高さ150mm/512/40万面)</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>ステップ数 (steps)</span>
+            <input type="number" name="steps" value="30" min="1" max="200" />
+          </label>
+          <label class="field">
+            <span>ガイダンススケール (guidance_scale)</span>
+            <input type="number" name="guidance_scale" value="5.5" step="0.1" min="0" max="20" />
+          </label>
+          <label class="field">
+            <span>メッシュ解像度 (octree_resolution)</span>
+            <select name="octree_resolution">
+              <option value="256">256</option>
+              <option value="384" selected>384</option>
+              <option value="512">512</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>シード (seed, 空欄でランダム)</span>
+            <input type="number" name="seed" placeholder="ランダム" />
+          </label>
+          <label class="field checkbox">
+            <input type="checkbox" name="remove_bg" checked />
+            <span>背景除去 (rembg)</span>
+          </label>
+          <label class="field">
+            <span>目標高さ (mm)</span>
+            <input type="number" name="target_height_mm" value="100" min="1" max="500" />
+          </label>
+          <label class="field">
+            <span>最大面数 (max_faces)</span>
+            <input type="number" name="max_faces" value="200000" min="100" step="100" />
+          </label>
+          <label class="field checkbox">
+            <input type="checkbox" name="color_mode" id="color-mode-checkbox" />
+            <span>カラーモード(4色プリンタ向け)</span>
+          </label>
+          <label class="field" id="n-colors-field" hidden>
+            <span>色数 (n_colors)</span>
+            <select name="n_colors" id="n-colors-select">
+              <option value="2">2</option>
+              <option value="3">3</option>
+              <option value="4" selected>4</option>
+            </select>
+          </label>
+          <label class="field checkbox">
+            <input type="checkbox" name="texture_mode" id="texture-mode-checkbox" />
+            <span>テクスチャ生成(実験的)</span>
+          </label>
+          <div class="hint" id="texture-mode-unavailable-note" hidden>
+            この環境では利用できません(texgenが未導入・未ビルドです)。
+          </div>
+          <button type="submit" id="generate-btn" class="primary-btn">3Dモデルを生成</button>
+        </form>
+      </div>
+
+      <div class="panel">
+        <h2>3. 進捗</h2>
+        <div id="multiview-note" class="multiview-note" hidden></div>
+        <div id="progress-area">
+          <div class="progress-status" id="progress-status">待機中</div>
+          <div class="progress-bar-track">
+            <div class="progress-bar-fill" id="progress-bar-fill"></div>
+          </div>
+          <div class="progress-error" id="progress-error" hidden></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>4. ジョブ履歴</h2>
+        <ul id="job-history"></ul>
+      </div>
+    </section>
+
+    <!-- 右ペイン -->
+    <section id="right-pane">
+      <div id="model-info-bar">
+        <span class="info-item">頂点数: <b id="info-vertices">-</b></span>
+        <span class="info-item">面数: <b id="info-faces">-</b></span>
+        <span class="info-item">寸法(mm): <b id="info-bbox">-</b></span>
+        <span class="info-item">watertight: <b id="info-watertight">-</b></span>
+        <span class="info-item">体積(cm³): <b id="info-volume">-</b></span>
+        <span class="info-item" id="info-palette-item" hidden>
+          パレット: <span id="info-palette"></span>
+        </span>
+
+        <span class="viewer-toggle">
+          <button id="shading-btn" class="toggle-btn active" type="button">シェーディング</button>
+          <button id="wireframe-btn" class="toggle-btn" type="button">ワイヤーフレーム</button>
+          <button id="overhang-btn" class="toggle-btn" type="button">オーバーハング</button>
+        </span>
+      </div>
+
+      <div id="overhang-controls" hidden>
+        <label class="overhang-threshold-label">
+          閾値: <span id="overhang-threshold-value">45</span>°
+          <input type="range" id="overhang-threshold" min="30" max="70" step="1" value="45" />
+        </label>
+        <span class="overhang-legend">
+          <span class="legend-swatch legend-safe"></span>安全
+          <span class="legend-swatch legend-overhang"></span>要サポート
+          <span class="legend-swatch legend-base"></span>接地面
+        </span>
+      </div>
+
+      <div id="viewer-container">
+        <canvas id="viewer-canvas"></canvas>
+        <div id="viewer-placeholder">モデルを生成するとここに表示されます</div>
+      </div>
+
+      <div id="export-bar">
+        <span class="export-label">エクスポート:</span>
+        <button class="export-btn" data-format="stl" disabled>STL</button>
+        <button class="export-btn" data-format="3mf" disabled
+                title="カラーモード時: 色ごとに分割された最大4オブジェクトを出力します。スライサーでオブジェクトごとにフィラメントを割り当ててください。">3MF</button>
+        <button class="export-btn" data-format="glb" disabled>GLB</button>
+        <button class="export-btn" data-format="obj" disabled>OBJ</button>
+        <span class="hint" id="export-color-note" hidden>
+          ※カラーモード時の3MFは色ごとに分割された最大4オブジェクトです。スライサーでフィラメントを割り当ててください。
+        </span>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script type="module" src="/app.js"></script>
+</body>
+</html>
