@@ -728,5 +728,62 @@ image-3d/
 `TENCENT HUNYUAN 3D 2.0 COMMUNITY LICENSE AGREEMENT`
 (`third_party/Hunyuan3D-2/LICENSE`)など、それぞれの配布元のライセンス条件に
 従ってください(利用地域制限・利用者数に応じた追加許諾要件などが定められて
-います)。`requirements*.txt` に列挙されたPython依存パッケージも、それぞれ
-独自のOSSライセンス下にあります。
+います)。
+
+### 利用しているOSS
+
+`requirements*.txt` に列挙されたPython依存パッケージ、および同梱の
+フロントエンドライブラリは、それぞれ独自のOSSライセンス下にあります(本プロジェクト
+自体のライセンスとは別)。主要なものは以下の通りです(ライセンス表記は各配布元の
+情報に基づく参考情報であり、正確な条件は各プロジェクトの配布物・パッケージ情報を
+必ず確認してください)。
+
+**バックエンド (`requirements.txt`)**
+
+| パッケージ | ライセンス |
+|---|---|
+| FastAPI | MIT |
+| Uvicorn | BSD-3-Clause |
+| python-multipart | Apache-2.0 |
+| trimesh | MIT |
+| SciPy | BSD-3-Clause |
+| NetworkX | BSD-3-Clause |
+| lxml | BSD-3-Clause |
+| NumPy | BSD-3-Clause |
+| Pillow | MIT-CMU (HPND系) |
+| fast-simplification | MIT |
+| pytest | MIT |
+| HTTPX | BSD-3-Clause |
+
+**GPU/Hunyuan3D-2連携 (`requirements-gpu.txt`)**
+
+| パッケージ | ライセンス |
+|---|---|
+| rembg | MIT |
+| onnxruntime | MIT |
+| PyTorch / torchvision | BSD-3-Clause |
+| huggingface_hub | Apache-2.0 |
+| einops | MIT |
+| OmegaConf | BSD-3-Clause |
+| Transformers | Apache-2.0 |
+| Diffusers | Apache-2.0 |
+| Accelerate | Apache-2.0 |
+| opencv-python-headless | MIT(同梱のOpenCV本体はApache-2.0) |
+| scikit-image | BSD-3-Clause |
+| **pymeshlab** | **GPL-3.0**(デュアルライセンス、商用ライセンスも別途提供)。本プロジェクト自身のコード(`server/`)からは呼び出しておらず、`third_party/Hunyuan3D-2`(hy3dgen)側の内部依存として使用される。GPLの条件に懸念がある場合は導入を見送ることも可能(その場合hy3dgen側の一部後処理機能が制限される可能性があります)。 |
+| xatlas | MIT |
+| pybind11 | BSD-3-Clause |
+| Ninja | Apache-2.0 |
+| pygltflib | MIT |
+
+**フロントエンド (`web/vendor/`)**
+
+| ライブラリ | ライセンス |
+|---|---|
+| Three.js (r160, `web/vendor/three/`) | MIT |
+
+**別リポジトリのモデル(`third_party/Hunyuan3D-2`、本リポジトリには含まれない)**
+
+| 対象 | ライセンス |
+|---|---|
+| Tencent Hunyuan3D-2 (hy3dgen) | TENCENT HUNYUAN 3D 2.0 COMMUNITY LICENSE AGREEMENT(独自ライセンス。地域制限・月間アクティブユーザー数100万人超での別途許諾要件あり) |
