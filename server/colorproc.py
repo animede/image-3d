@@ -2,8 +2,9 @@
 
 テクスチャ生成AIは使用せず、以下の簡易パイプラインで頂点カラーを付与する:
 
-1. `project_colors`: 背景除去済み入力画像をメッシュ正面軸に沿って直交投影し、
-   各頂点にRGBAカラーを割り当てる。
+1. `project_multiview_colors`: 背景除去済み入力画像をメッシュ正面軸に沿って
+    直交投影し、正面側の頂点にRGBAカラーを割り当てる。背面画像がある場合は
+    背面側の頂点に背面画像を投影し、無い場合はベース色にする。
 2. `quantize`: 頂点カラーを scipy.cluster.vq.kmeans2 で `n_colors` (2〜4) 色に
    量子化する。
 3. `split_by_color`: 面ごとの多数決で色ラベルを決め、色ごとにサブメッシュへ
@@ -20,7 +21,9 @@
         画像の縦方向 v (0=上 .. 1=下) → メッシュ Z (上下反転、v=0が高いZに対応)
     メッシュのXZバウンディングボックスを画像の被写体バウンディングボックス
     (アルファ>0領域、なければ画像全体)にフィットさせる。
-    背面の頂点にも正面の投影色がそのまま回り込む簡易方式でよい。
+    `project_colors` は互換用に従来通り全頂点へ正面投影する。
+    実ジョブのカラーモードでは `project_multiview_colors` を使い、正面色が
+    背面全面へ回り込まないよう、頂点法線で正面/背面を分ける。
 
     実生成検証(momo.png, hunyuan3d, GPU実機。README/報告参照)の結果、
     画像の u=0(左端)がメッシュの -X 側、u=1(右端)が +X 側に対応する
@@ -42,6 +45,13 @@ from scipy.spatial import cKDTree
 # 逆に見える場合はここを -1 に反転する。
 _U_TO_X_SIGN = 1.0
 
+# 正面/背面判定に使う頂点法線Y成分のしきい値。
+# 正面は -Y 方向を向くため normal_y < -threshold、背面は normal_y > threshold。
+_VIEW_NORMAL_THRESHOLD = 0.10
+
+# 背面画像が無い場合や側面/上下など明確に正面・背面でない頂点へ使うベース色。
+_DEFAULT_BASE_COLOR = np.array([220, 220, 220], dtype=np.uint8)
+
 
 def _subject_bbox_uv(image: Image.Image) -> tuple[float, float, float, float]:
     """画像内の被写体(アルファ>0領域)のバウンディングボックスを
@@ -61,16 +71,14 @@ def _subject_bbox_uv(image: Image.Image) -> tuple[float, float, float, float]:
     return (0.0, 1.0, 0.0, 1.0)
 
 
-def project_colors(mesh: trimesh.Trimesh, image: Image.Image) -> np.ndarray:
-    """背景除去済み入力画像をメッシュ正面軸に沿って直交投影し、頂点カラーを返す。
+def _project_image_colors(mesh: trimesh.Trimesh, image: Image.Image, *, view: str) -> np.ndarray:
+    """単一ビュー画像をメッシュXZへ直交投影し、全頂点分のRGBAカラーを返す。
 
-    Args:
-        mesh: Z-up・正面が-Y方向を向くメッシュ(hunyuan3d.py の出力座標系)。
-        image: 背景除去済みの入力画像(RGBA推奨。RGBの場合は不透明として扱う)。
-
-    Returns:
-        (N, 4) uint8 の頂点カラー配列(RGBA)。
+    `view="front"` は -Y 側から見た画像、`view="back"` は +Y 側から見た画像として
+    扱う。背面ビューはカメラ方向が反対になるため、X→u の対応を反転する。
     """
+    if view not in ("front", "back"):
+        raise ValueError(f"viewは'front'または'back'である必要があります(got {view})。")
     if image.mode != "RGBA":
         image = image.convert("RGBA")
 
@@ -87,10 +95,12 @@ def project_colors(mesh: trimesh.Trimesh, image: Image.Image) -> np.ndarray:
     x_extent = max(x_max - x_min, 1e-9)
     z_extent = max(z_max - z_min, 1e-9)
 
-    # メッシュX -> 正規化u (被写体bbox基準)
-    # _U_TO_X_SIGN=+1 (実生成検証済み): u=0(左端)が-X側、u=1(右端)が+X側に対応。
+    # メッシュX -> 正規化u (被写体bbox基準)。
+    # front: _U_TO_X_SIGN=+1 (実生成検証済み): u=0(左端)が-X側、u=1(右端)が+X側。
+    # back: カメラが反対側(+Y)のため、左右対応を反転する。
     x_norm = (vertices[:, 0] - x_min) / x_extent  # 0..1, 0=-X側, 1=+X側
-    if _U_TO_X_SIGN < 0:
+    u_sign = _U_TO_X_SIGN if view == "front" else -_U_TO_X_SIGN
+    if u_sign < 0:
         u_norm = 1.0 - x_norm  # +X側(x_norm=1) -> u=0(画像左端) (反転版)
     else:
         u_norm = x_norm  # -X側(x_norm=0) -> u=0(画像左端)
@@ -121,6 +131,70 @@ def project_colors(mesh: trimesh.Trimesh, image: Image.Image) -> np.ndarray:
     colors = np.empty((len(vertices), 4), dtype=np.uint8)
     colors[:, :3] = sampled_rgb
     colors[:, 3] = 255
+    return colors
+
+
+def project_colors(mesh: trimesh.Trimesh, image: Image.Image) -> np.ndarray:
+    """背景除去済み入力画像をメッシュ正面軸に沿って全頂点へ直交投影する。
+
+    互換用の従来方式。実ジョブの `color_mode=color4` では、背面への正面色の
+    回り込みを避けるため `project_multiview_colors` を使用する。
+
+    Args:
+        mesh: Z-up・正面が-Y方向を向くメッシュ(hunyuan3d.py の出力座標系)。
+        image: 背景除去済みの入力画像(RGBA推奨。RGBの場合は不透明として扱う)。
+
+    Returns:
+        (N, 4) uint8 の頂点カラー配列(RGBA)。
+    """
+    return _project_image_colors(mesh, image, view="front")
+
+
+def _front_back_vertex_masks(mesh: trimesh.Trimesh) -> tuple[np.ndarray, np.ndarray]:
+    """頂点法線から正面側・背面側の頂点マスクを返す。"""
+    normals = np.asarray(mesh.vertex_normals)
+    if normals.shape != (len(mesh.vertices), 3):
+        mesh = mesh.copy()
+        mesh.fix_normals()
+        normals = np.asarray(mesh.vertex_normals)
+    y = normals[:, 1]
+    front_mask = y < -_VIEW_NORMAL_THRESHOLD
+    back_mask = y > _VIEW_NORMAL_THRESHOLD
+    return front_mask, back_mask
+
+
+def project_multiview_colors(
+    mesh: trimesh.Trimesh,
+    front_image: Image.Image,
+    back_image: Optional[Image.Image] = None,
+    base_color: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """正面/背面を分けて頂点カラーを投影する。
+
+    - 正面側の頂点: 正面画像を投影する。
+    - 背面側の頂点: 背面画像があれば背面画像を投影し、無ければベース色にする。
+    - 側面/上下など正面・背面判定が曖昧な頂点: ベース色にする。
+
+    これにより、正面画像が背面全面へ薄く回り込む従来の簡易投影を避ける。
+    """
+    if base_color is None:
+        base_rgb = _DEFAULT_BASE_COLOR
+    else:
+        base_rgb = np.asarray(base_color[:3], dtype=np.uint8)
+
+    colors = np.empty((len(mesh.vertices), 4), dtype=np.uint8)
+    colors[:, :3] = base_rgb
+    colors[:, 3] = 255
+
+    front_mask, back_mask = _front_back_vertex_masks(mesh)
+
+    front_colors = _project_image_colors(mesh, front_image, view="front")
+    colors[front_mask] = front_colors[front_mask]
+
+    if back_image is not None:
+        back_colors = _project_image_colors(mesh, back_image, view="back")
+        colors[back_mask] = back_colors[back_mask]
+
     return colors
 
 

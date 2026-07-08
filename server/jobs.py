@@ -72,7 +72,7 @@ class Job:
     original_filename: Optional[str] = None
     views: list[str] = field(default_factory=lambda: ["front"])
     # SPEC.md §3.9 (FR-10): texture_mode=paint 失敗時、jobをfailedにせず警告を記録して
-    # 従来の正面投影方式にフォールバックする(graceful degradation)。
+    # 正面/背面投影方式にフォールバックする(graceful degradation)。
     warnings: list[str] = field(default_factory=list)
     textured: bool = False
 
@@ -154,7 +154,7 @@ class JobManager:
         except Exception as exc:
             logger.exception("texture_mode=paint failed for job %s; falling back", job.job_id)
             job.warnings.append(
-                f"テクスチャ生成(paint)に失敗したため、従来の正面投影方式にフォールバックしました: {exc}"
+                f"テクスチャ生成(paint)に失敗したため、正面/背面投影方式にフォールバックしました: {exc}"
             )
             return None
 
@@ -307,7 +307,7 @@ class JobManager:
             original.save(job.original_image_path())
 
             # 追加ビュー(back/left/right)の前処理。各ビューにも背景除去を適用する
-            # (SPEC.md §3.8)。カラー投影(colorproc)は常にfront画像(`processed`)を使う。
+            # (SPEC.md §3.8)。カラーモードではback画像があれば背面投影に利用する。
             extra_views: dict[str, Image.Image] = {}
             for view in EXTRA_VIEW_LABELS:
                 if view not in job.views:
@@ -338,7 +338,7 @@ class JobManager:
 
             # SPEC.md §3.9 (FR-10): texture_mode=paint 時、texgenで全周テクスチャを
             # 生成する。ビューア用GLBはテクスチャ付きメッシュを使う。失敗時はjobを
-            # failedにせず警告を記録し、従来の正面投影方式にフォールバックする。
+            # failedにせず警告を記録し、正面/背面投影方式にフォールバックする。
             textured_mesh: Optional[trimesh.Trimesh] = None
             if params.texture_mode == "paint":
                 textured_mesh = await loop.run_in_executor(
@@ -354,6 +354,7 @@ class JobManager:
                 def _apply_color(
                     mesh=processed_mesh,
                     image=processed,
+                    back_image=extra_views.get("back"),
                     n_colors=params.n_colors,
                     tex_mesh=textured_mesh,
                 ):
@@ -362,7 +363,9 @@ class JobManager:
                         # 量子化・分割ロジックに接続する(正面投影の代わり)。
                         vertex_colors = texture.sample_vertex_colors_from_texture(tex_mesh)
                     else:
-                        vertex_colors = colorproc.project_colors(mesh, image)
+                        vertex_colors = colorproc.project_multiview_colors(
+                            mesh, image, back_image=back_image
+                        )
                     palette, labels = colorproc.quantize(vertex_colors, n_colors)
                     stats_data = colorproc.palette_stats(labels, palette, mesh)
                     submeshes = colorproc.split_by_color(mesh, labels, palette)

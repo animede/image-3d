@@ -2,7 +2,8 @@
 
 画像から3Dプリントデータ(STL / 3MF / GLB / OBJ)を生成するローカルWebアプリ。
 
-詳細仕様は [`docs/SPEC.md`](docs/SPEC.md)、開発方針は
+Web UIの使い方は [`docs/USAGE.md`](docs/USAGE.md)、詳細仕様は
+[`docs/SPEC.md`](docs/SPEC.md)、開発方針は
 [`docs/DEVELOPMENT_POLICY.md`](docs/DEVELOPMENT_POLICY.md)、実装計画は
 [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md) を参照。
 
@@ -22,7 +23,7 @@
 - Phase 3c でテクスチャ生成(`texture_mode=paint`、FR-10)に対応(下記
   「Phase 3c: テクスチャ生成 (texgen)」参照)。custom_rasterizer CUDA拡張の
   ビルドが必要で、未導入環境では `/api/health` の `texgen_available=false` に
-  応じてUI上で無効表示し、従来の正面投影方式(FR-8)にフォールバックする。
+  応じてUI上で無効表示し、正面/背面投影方式(FR-8)にフォールバックする。
 
 ## セットアップ
 
@@ -33,11 +34,25 @@
 
 ### venv作成 + 依存インストール
 
+Linux / macOS / WSL2:
+
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install --upgrade pip
 .venv/bin/pip install -r requirements.txt
 ```
+
+Windows PowerShell:
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\pip.exe install -r requirements.txt
+```
+
+Windowsネイティブでは **Phase 1(mockジェネレータ / CPU)** の利用を想定する。
+Hunyuan3D-2 / CUDA / texgen の実モデル生成は、依存関係やCUDA拡張ビルドの都合で
+WSL2 Ubuntu または Linux 環境を推奨する。
 
 `requirements.txt` は base 依存のみ(FastAPI / trimesh / fast-simplification 等)。
 rembg・torch・hy3dgen 等の重い依存は `requirements-gpu.txt` に分離されており、
@@ -52,8 +67,23 @@ Three.js はビルド工程なしで `web/vendor/` にローカル配置済み
 
 ## 起動
 
+Linux / macOS / WSL2:
+
 ```bash
 ./run.sh
+```
+
+Windows PowerShell:
+
+```powershell
+.\run.ps1
+```
+
+PowerShellの実行ポリシーでブロックされる場合は、カレントプロセスのみ許可してから起動する:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\run.ps1
 ```
 
 デフォルトで `http://127.0.0.1:8000` で待ち受ける。ブラウザで開くとUIが表示される。
@@ -62,6 +92,15 @@ Three.js はビルド工程なしで `web/vendor/` にローカル配置済み
 
 ```bash
 IMAGE3D_GENERATOR=mock IMAGE3D_HOST=127.0.0.1 IMAGE3D_PORT=8000 ./run.sh
+```
+
+Windows PowerShellでは `$env:` で指定する:
+
+```powershell
+$env:IMAGE3D_GENERATOR = "mock"
+$env:IMAGE3D_HOST = "127.0.0.1"
+$env:IMAGE3D_PORT = "8000"
+.\run.ps1
 ```
 
 主な環境変数(`server/config.py`):
@@ -208,7 +247,9 @@ RTX PRO 6000 Blackwell (sm_120) 上で動作確認済みの手順。
 Bambu Lab AMS、Prusa MMU等のマルチフィラメント方式カラー3Dプリンタ(最大4色)
 向けの出力に対応する。テクスチャ生成AIは使わず、入力画像(背景除去後)を
 メッシュ正面から直交投影して頂点カラーを取得し、k-meansで2〜4色に量子化する
-簡易方式(`server/colorproc.py`)。
+簡易方式(`server/colorproc.py`)。正面画像は正面側の頂点にのみ投影し、追加ビューに
+背面画像がある場合は背面側へ背面画像を投影する。背面画像が無い場合、背面側と
+側面/上下の曖昧な頂点はベース色になる。
 
 ### 使い方
 
@@ -312,8 +353,8 @@ curl -s -X POST http://127.0.0.1:8000/api/jobs \
 ジョブ完了後、`GET /api/jobs/<job_id>` の応答に `views`(例:
 `["front", "back"]`)が含まれ、実際にどのビューが使われたかを確認できる。
 各追加ビューにも背景除去(`remove_bg`指定時)が適用される。カラー投影
-(`color_mode=color4`時の頂点カラー、FR-8)は従来通り正面(front)画像のみを
-使用する。
+(`color_mode=color4`時の頂点カラー、FR-8)は正面(front)画像を正面側に使い、
+背面(back)画像があれば背面側にも使用する。
 
 ### 使い方(キャラクターシート自動分割)
 
@@ -526,7 +567,7 @@ print('OK:', cr.rasterize)
 
 paint実行が失敗した場合(モデル未DL・OOM・その他例外)もジョブは `failed` に
 せず、`meta.json` の `warnings` に日本語メッセージを記録した上で、従来の
-正面投影方式(FR-8、`colorproc.project_colors`)による `color_mode=color4`
+正面/背面投影方式(FR-8、`colorproc.project_multiview_colors`)による `color_mode=color4`
 処理を続行する。ジョブJSONの `textured` フィールドで実際にpaintが成功したか
 どうかを判定できる(`true`=テクスチャ付きGLB、`false`=フォールバック)。
 
@@ -590,6 +631,17 @@ curl -s -X POST http://127.0.0.1:8000/api/jobs \
 - paint後のテクスチャは全周を6視点(正面/背面/左右/上/下相当)からの
   マルチビュー拡散結果をベイクする方式のため、細部の一貫性は入力画像の
   品質・被写体の複雑さに依存する。
+- **目など小さく高コントラストな特徴のズレ・シームは既知の限界**:
+  正面画像は参照にのみ使われ、他の5ビューは `Hunyuan3DPaintPipeline`
+  (`third_party/Hunyuan3D-2/hy3dgen/texgen/pipelines.py`)がマルチビュー
+  拡散モデルで新規生成する。生成ビュー間で目の位置が完全には一致せず、
+  それをメッシュへベイクする際にズレ・二重写り・輪郭のシームとして
+  現れることがある。彫りの浅い(平坦に近い)ジオメトリのぬいぐるみ系被写体
+  で特に目立ちやすい。`__call__(self, mesh, image)` にsteps/解像度等の
+  品質調整パラメータは公開されておらず、アプリ側からのチューニング余地は
+  無い。正面の色精度を優先したい場合は `texture_mode=none` にして
+  従来の正面/背面投影(`colorproc.project_multiview_colors`)を使う方が
+  ズレは出ないが、360°の質感は失われ側面が単色寄りになるトレードオフがある。
 - `hy3dgen/texgen/utils/multiview_utils.py` に `trust_remote_code=True` を
   追加するパッチが必要(上記セットアップ参照)。third_party ディレクトリを
   再取得(git clone)した場合は再適用が必要。
@@ -638,7 +690,7 @@ image-3d/
 - テクスチャ生成AIによるカラー3Dプリント(Hunyuan3D-2 paint pipeline)は
   Phase 3cで `texture_mode=paint` として対応済み(上記「Phase 3c」参照)。
   ビルド・依存が利用できない環境では自動的に無効化され、Phase 2.5の
-  入力画像正面投影+k-means量子化による簡易4色対応(`server/colorproc.py`)に
+  入力画像の正面/背面投影+k-means量子化による簡易4色対応(`server/colorproc.py`)に
   フォールバックする。
 - `hy3dgen` はPyPI未配布のため、`third_party/Hunyuan3D-2` をgit cloneしての
   editableインストール(`--no-deps`)が必要。
@@ -646,10 +698,35 @@ image-3d/
   `meshproc.process()` の後処理(穴埋め・簡略化)により実用上のwatertight化を
   行う。まれに複雑な形状で後処理後もwatertight化に失敗する場合があり、
   その際は `stats.watertight=false` としてUIに明示される(SPEC.md FR-4)。
-- カラーモード(FR-8)は背景除去済み画像の正面投影のみで頂点カラーを決めるため、
-  側面・背面は正面色がそのまま回り込む簡易方式であり、実際の側面・背面の
-  配色とは一致しない場合がある(SPEC.md §3.7に明記の既知の制約)。
+- カラーモード(FR-8)は背景除去済み画像の正面/背面投影で頂点カラーを決める。
+  追加ビューに背面画像が無い場合、背面側と側面/上下の曖昧な頂点はベース色に
+  なるため、実際の側面・背面の配色とは一致しない場合がある。
 - 3MFの色ごとのサブメッシュ(`color_1`〜`color_4`)は単体ではwatertightと
   限らない(積層方式のマルチカラー印刷では通常問題にならない)。
 - パレット量子化はRGB色空間での単純なk-means(scipy.cluster.vq.kmeans2)で
   あり、知覚色差(CIE Lab等)は考慮していない。
+
+## ライセンス
+
+このリポジトリ(`server/`・`web/`・`docs/`・`tests/` 等、本プロジェクトのオリジナル
+コード)は [Polyform Small Business License 1.0.0](LICENSE) の下で提供されます。
+
+要約(法的拘束力があるのは[LICENSE](LICENSE)本文のみです):
+
+- **非商用利用**は誰でも自由に可能。
+- **商用利用**も、利用者の所属組織が
+  - 従業員・業務委託者を合わせて100人未満、かつ
+  - 直近の課税年度の総収益が100万USD未満(1982〜1984年基準のCPIで物価調整)
+
+  の「小規模事業者」に該当する場合は許可されます。上記条件を満たさない大企業
+  による商用利用のみが制限されます。
+- 個人利用・小規模団体の商用利用は上記の通り許可されるため、条件を除外(許可)
+  しています。
+
+**third_party/Hunyuan3D-2 は対象外**: このリポジトリには含まれず(`.gitignore`
+対象)、利用者が別途 `git clone` して導入します。Tencentの
+`TENCENT HUNYUAN 3D 2.0 COMMUNITY LICENSE AGREEMENT`
+(`third_party/Hunyuan3D-2/LICENSE`)など、それぞれの配布元のライセンス条件に
+従ってください(利用地域制限・利用者数に応じた追加許諾要件などが定められて
+います)。`requirements*.txt` に列挙されたPython依存パッケージも、それぞれ
+独自のOSSライセンス下にあります。

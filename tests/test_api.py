@@ -465,7 +465,7 @@ def test_texture_mode_paint_job_completes_with_mock(client, monkeypatch):
 def test_texture_mode_paint_with_color4_completes_with_mock(client, monkeypatch):
     """texture_mode=paint + color_mode=color4 の組合せもmockでジョブ完了すること。
 
-    paint失敗時は従来の正面投影方式(colorproc.project_colors)に
+    paint失敗時は正面/背面投影方式(colorproc.project_multiview_colors)に
     フォールバックしてパレット統計が生成されることを検証する。
     """
     from server import main as main_module

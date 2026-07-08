@@ -23,6 +23,12 @@ def make_4color_image(size=128):
     return Image.fromarray(arr, "RGBA")
 
 
+def make_solid_image(color, size=64):
+    arr = np.zeros((size, size, 4), dtype=np.uint8)
+    arr[:, :] = color
+    return Image.fromarray(arr, "RGBA")
+
+
 def make_subdivided_box():
     box = trimesh.creation.box(extents=[10.0, 10.0, 20.0])
     # 単純なboxだと頂点が8個しかなく色のバリエーションが乏しいため細分化する
@@ -47,6 +53,33 @@ def test_project_colors_handles_rgb_image():
     image = make_4color_image().convert("RGB")
     colors = colorproc.project_colors(mesh, image)
     assert colors.shape == (len(mesh.vertices), 4)
+
+
+def test_project_multiview_colors_keeps_back_base_without_back_image():
+    """背面画像が無い場合、背面には正面画像が回り込まずベース色になること。"""
+    mesh = make_subdivided_box()
+    front = make_solid_image([255, 0, 0, 255])
+    colors = colorproc.project_multiview_colors(mesh, front)
+
+    front_mask, back_mask = colorproc._front_back_vertex_masks(mesh)
+    assert front_mask.any()
+    assert back_mask.any()
+    assert (colors[front_mask, :3] == [255, 0, 0]).all()
+    assert (colors[back_mask, :3] == colorproc._DEFAULT_BASE_COLOR).all()
+
+
+def test_project_multiview_colors_uses_back_image_for_back_vertices():
+    """背面画像がある場合、背面側の頂点には背面画像の色が使われること。"""
+    mesh = make_subdivided_box()
+    front = make_solid_image([255, 0, 0, 255])
+    back = make_solid_image([0, 0, 255, 255])
+    colors = colorproc.project_multiview_colors(mesh, front, back_image=back)
+
+    front_mask, back_mask = colorproc._front_back_vertex_masks(mesh)
+    assert front_mask.any()
+    assert back_mask.any()
+    assert (colors[front_mask, :3] == [255, 0, 0]).all()
+    assert (colors[back_mask, :3] == [0, 0, 255]).all()
 
 
 @pytest.mark.parametrize("n_colors", [2, 3, 4])

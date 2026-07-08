@@ -31,6 +31,25 @@ def make_three_panel_sheet(
     return Image.fromarray(arr, "RGBA")
 
 
+def test_split_sheet_detects_more_than_six_panels():
+    """MAX_PANELSの旧上限(6)を超える枚数(8体)でも全て検出され、
+    切り捨てられないこと。"""
+    panel_w, panel_h, gap = 150, 300, 80
+    count = 8
+    w = gap * (count + 1) + panel_w * count
+    h = 400
+    arr = np.zeros((h, w, 4), dtype=np.uint8)
+    y0 = (h - panel_h) // 2
+
+    for i in range(count):
+        x0 = gap * (i + 1) + panel_w * i
+        arr[y0 : y0 + panel_h, x0 : x0 + panel_w] = [255, 0, 0, 255]
+
+    image = Image.fromarray(arr, "RGBA")
+    panels = sheet.split_sheet(image)
+    assert len(panels) == count
+
+
 def test_split_sheet_detects_three_panels_in_left_to_right_order():
     image = make_three_panel_sheet()
     panels = sheet.split_sheet(image)
@@ -64,16 +83,36 @@ def test_split_sheet_filters_small_noise_components():
     assert len(panels) == 3
 
 
-def test_split_sheet_merges_close_boxes():
-    """間隔が画像幅の2%未満の近接ボックスはマージされ、1パネルとして扱われること。"""
+def test_split_sheet_does_not_merge_close_similar_sized_boxes():
+    """間隔が近くても同程度の大きさのボックス(=別々のキャラクター)は
+    マージされず、別パネルとして扱われること。"""
     w, h = 900, 400
     arr = np.zeros((h, w, 4), dtype=np.uint8)
     y0 = 50
     panel_h = 300
-    # 画像幅の1%(9px)しか離れていない2つの矩形 -> マージされるはず
+    # 画像幅の1%(9px)しか離れていないが、同サイズの2つの矩形 -> マージしない
     gap_px = int(w * 0.01)
     arr[y0 : y0 + panel_h, 100:300] = [255, 0, 0, 255]
     arr[y0 : y0 + panel_h, 300 + gap_px : 500 + gap_px] = [0, 255, 0, 255]
+
+    image = Image.fromarray(arr, "RGBA")
+    panels = sheet.split_sheet(image)
+    assert len(panels) == 2
+
+
+def test_split_sheet_merges_close_small_fragment_into_main_box():
+    """間隔が近く、かつ一方が明らかに小さい断片の場合はマージされ、
+    1パネルとして扱われること(欠片を主要パネルに統合する)。"""
+    w, h = 900, 400
+    arr = np.zeros((h, w, 4), dtype=np.uint8)
+    y0 = 50
+    panel_h = 300
+    gap_px = int(w * 0.01)
+    # メインの矩形(大)
+    arr[y0 : y0 + panel_h, 100:300] = [255, 0, 0, 255]
+    # 小さな断片(帽子の飾りなど想定、メインの1/10未満だがノイズ除去閾値(1%)は超える面積)
+    frag_x0 = 300 + gap_px
+    arr[y0 : y0 + 40, frag_x0 : frag_x0 + 100] = [255, 0, 0, 255]
 
     image = Image.fromarray(arr, "RGBA")
     panels = sheet.split_sheet(image)

@@ -13,6 +13,7 @@ const progressError = document.getElementById("progress-error");
 const multiviewNote = document.getElementById("multiview-note");
 
 const sheetFileInput = document.getElementById("sheet-file-input");
+const sheetDropzone = document.getElementById("sheet-dropzone");
 const sheetSplitBtn = document.getElementById("sheet-split-btn");
 const sheetPanelsArea = document.getElementById("sheet-panels-area");
 const sheetPanelsList = document.getElementById("sheet-panels-list");
@@ -184,13 +185,38 @@ function updateMultiviewNote() {
 }
 
 // --- キャラクターシート分割 ---------------------------------------------------
-sheetSplitBtn.addEventListener("click", () => sheetFileInput.click());
+sheetDropzone.addEventListener("click", () => {
+  if (!sheetSplitBtn.disabled) sheetFileInput.click();
+});
+sheetSplitBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
+  if (!sheetSplitBtn.disabled) sheetFileInput.click();
+});
+sheetDropzone.addEventListener("dragover", (e) => {
+  e.preventDefault();
+  if (!sheetSplitBtn.disabled) sheetDropzone.classList.add("dragover");
+});
+sheetDropzone.addEventListener("dragleave", () => sheetDropzone.classList.remove("dragover"));
+sheetDropzone.addEventListener("drop", async (e) => {
+  e.preventDefault();
+  sheetDropzone.classList.remove("dragover");
+  if (sheetSplitBtn.disabled || e.dataTransfer.files.length === 0) return;
+  await handleSheetFile(e.dataTransfer.files[0]);
+});
 sheetFileInput.addEventListener("change", async () => {
   if (sheetFileInput.files.length === 0) return;
-  const file = sheetFileInput.files[0];
+  await handleSheetFile(sheetFileInput.files[0]);
+  sheetFileInput.value = "";
+});
 
+async function handleSheetFile(file) {
+  if (!file.type.startsWith("image/")) {
+    alert("シート画像ファイルを選択してください。");
+    return;
+  }
   sheetSplitBtn.disabled = true;
   sheetSplitBtn.textContent = "分割中...";
+  sheetDropzone.classList.add("processing");
   try {
     const formData = new FormData();
     formData.append("image", file);
@@ -207,9 +233,9 @@ sheetFileInput.addEventListener("change", async () => {
   } finally {
     sheetSplitBtn.disabled = false;
     sheetSplitBtn.textContent = "シート画像を選んで分割";
-    sheetFileInput.value = "";
+    sheetDropzone.classList.remove("processing");
   }
-});
+}
 
 function renderSheetPanels() {
   sheetPanelsList.innerHTML = "";

@@ -213,6 +213,19 @@ html, body {
 .secondary-btn:hover { border-color: var(--accent); background: rgba(91, 140, 255, 0.1); }
 .secondary-btn:disabled { opacity: 0.6; cursor: not-allowed; }
 
+.sheet-dropzone {
+  padding: 14px 12px;
+}
+
+.sheet-dropzone p {
+  margin: 0 0 10px 0;
+}
+
+.sheet-dropzone.processing {
+  opacity: 0.75;
+  cursor: wait;
+}
+
 #sheet-panels-area {
   margin-top: 12px;
   display: flex;

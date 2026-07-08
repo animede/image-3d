@@ -10,9 +10,13 @@
   2. マスクの連結成分解析 (scipy.ndimage.label)。
      - 面積が画像全体の1%未満の成分は除去する。
      - バウンディングボックスが重なる、または近接する(間隔が画像幅の2%未満)
-       成分同士はマージする。
+       "かつ" 面積比(小/大)が閾値未満(=小さい断片が大きい本体に吸収される
+       ケースとみなせる)場合のみマージする。同程度の大きさの成分同士
+       (=別々のキャラクター)はマージしない。
   3. 残ったボックスを左→右(同じ列とみなせるものは上→下)にソートし、
-     少しのパディング付きで元画像から切り出して返す(最大6パネル)。
+     少しのパディング付きで元画像から切り出して返す(最大 MAX_PANELS 枚。
+     検出された被写体が全て見えるよう、通常のシートでは実質上限に
+     達しない値を設定している)。
 """
 from __future__ import annotations
 
@@ -25,8 +29,10 @@ from scipy import ndimage
 logger = logging.getLogger(__name__)
 
 MIN_AREA_FRACTION = 0.01  # 画像全体の1%未満の連結成分は除去
-MERGE_GAP_FRACTION = 0.02  # 間隔が画像幅の2%未満のボックスはマージ
-MAX_PANELS = 6
+MERGE_GAP_FRACTION = 0.02  # 間隔が画像幅の2%未満のボックスはマージ候補
+MERGE_AREA_RATIO = 0.5  # 面積比(小/大)がこの値未満の場合のみマージする
+# (同程度の大きさの成分は別々の被写体とみなし、隣接していてもマージしない)
+MAX_PANELS = 20  # 暴走検出時の安全上限。通常のキャラクターシートでは到達しない想定
 PADDING_FRACTION = 0.02  # 切り出し時のパディング(画像幅・高さに対する割合)
 
 # パネル数に応じた suggested_view の割当順(左から)。
@@ -152,8 +158,25 @@ def _connected_component_boxes(mask: np.ndarray) -> list[BBox]:
     return boxes
 
 
+def _should_merge(a: BBox, b: BBox, max_gap: float) -> bool:
+    """2つのボックスをマージすべきか判定する。
+
+    間隔が近い(または重なる)だけでなく、面積比(小/大)が
+    MERGE_AREA_RATIO 未満の場合のみマージ対象とする。同程度の大きさの
+    ボックス同士は別々の被写体(例: 隣接する2キャラクター)とみなし、
+    どれだけ近くてもマージしない。
+    """
+    if a.gap_to(b) >= max_gap:
+        return False
+    smaller = min(a.area(), b.area())
+    larger = max(a.area(), b.area())
+    if larger == 0:
+        return False
+    return (smaller / larger) < MERGE_AREA_RATIO
+
+
 def _merge_close_boxes(boxes: list[BBox], image_width: int) -> list[BBox]:
-    """重なり/近接(間隔が画像幅の2%未満)するボックスをマージする。"""
+    """近接(間隔が画像幅の2%未満)し、かつ面積比が閾値未満のボックスをマージする。"""
     max_gap = image_width * MERGE_GAP_FRACTION
     merged = list(boxes)
 
@@ -162,7 +185,7 @@ def _merge_close_boxes(boxes: list[BBox], image_width: int) -> list[BBox]:
         changed = False
         for i in range(len(merged)):
             for j in range(i + 1, len(merged)):
-                if merged[i].gap_to(merged[j]) < max_gap:
+                if _should_merge(merged[i], merged[j], max_gap):
                     merged[i] = merged[i].merged(merged[j])
                     del merged[j]
                     changed = True

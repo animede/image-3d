@@ -68,7 +68,10 @@
         <h2>キャラクターシート分割(任意)</h2>
         <p class="sub-hint">複数ビューが1枚に並んだ画像から、パネルを自動検出してビューに割り当てられます。</p>
         <input type="file" id="sheet-file-input" accept="image/png,image/jpeg,image/webp" hidden />
-        <button type="button" id="sheet-split-btn" class="secondary-btn">シート画像を選んで分割</button>
+        <div id="sheet-dropzone" class="dropzone sheet-dropzone">
+          <p>ここにシート画像をドラッグ&amp;ドロップ<br/>またはクリックして分割</p>
+          <button type="button" id="sheet-split-btn" class="secondary-btn">シート画像を選んで分割</button>
+        </div>
         <div id="sheet-panels-area" hidden>
           <div id="sheet-panels-list"></div>
           <button type="button" id="sheet-apply-btn" class="primary-btn">この割当を使用</button>
