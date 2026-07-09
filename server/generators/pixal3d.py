@@ -7,7 +7,7 @@
   - 例外は意味のあるメッセージに変換して送出
 
 前提環境 (requirements-pixal3d.txt 参照):
-  - 専用venv .venv-pixal3d (Python 3.10 / torch cu128 / o_voxel / nvdiffrast / natten)
+  - 専用venv .venv-pixal3d (Python 3.10 / torch cu128 / o_voxel / drtk / natten)
   - third_party/Pixal3D のclone (pipインストールせず sys.path 経由でimport)
   - ATTN_BACKEND=sdpa / SPARSE_ATTN_BACKEND=sdpa (flash_attn不使用。
     launch.json の image3d-server-pixal3d が設定する)
@@ -27,6 +27,12 @@
     server/texture.py の sample_vertex_colors_from_texture で頂点カラーを
     サンプリングし、ColorVisuals としてメッシュに載せて返す。jobs.py 側が
     meshproc 後のメッシュへ最近傍転写する (colorproc.transfer_vertex_colors_nearest)。
+  - ラスタライザ: o_voxel.postprocess.to_glb のUVテクスチャベイクは本来
+    nvdiffrast (非商用限定ライセンス) 必須だが、本モジュールは
+    pixal3d_raster.py (drtk, MIT) のシムに `o_voxel.postprocess.dr` を
+    差し替えることでMITライセンスのみで完結させる (select_rasterizer_module /
+    _inject_rasterizer、IMAGE3D_PIXAL3D_RASTERIZER で切替可能。既定 auto は
+    drtkがあればdrtkを使う)。README.md「Pixal3Dジェネレータ」節参照。
 """
 from __future__ import annotations
 
@@ -49,7 +55,7 @@ logger = logging.getLogger(__name__)
 
 _IMPORT_ERROR_HINT = (
     "Pixal3D の依存関係が見つかりません。requirements-pixal3d.txt を参照し、"
-    "専用venv (.venv-pixal3d) に torch (cu128) / o_voxel / nvdiffrast / natten を"
+    "専用venv (.venv-pixal3d) に torch (cu128) / o_voxel / drtk / natten を"
     "導入し、third_party/Pixal3D をcloneしてください。"
     "サーバは .venv-pixal3d/bin/uvicorn で起動する必要があります"
     "(.claude/launch.json の image3d-server-pixal3d 参照)。"
@@ -111,6 +117,84 @@ def _has_meaningful_alpha(image: Image.Image) -> bool:
         return False
     alpha = np.asarray(image.getchannel("A"))
     return bool((alpha < 255).any())
+
+
+def select_rasterizer_module(choice: Optional[str] = None) -> Any:
+    """`IMAGE3D_PIXAL3D_RASTERIZER` に基づき、ラスタライザモジュールを選択する。
+
+    `o_voxel.postprocess.to_glb` は `dr.RasterizeCudaContext` /
+    `dr.rasterize` / `dr.interpolate` の3 APIのみを使用する (postprocess.py
+    223〜266行付近)。これらをMIT (drtk) 実装のシムに差し替えることで、
+    非商用限定の nvdiffrast への依存を既定構成から除去する (README.md
+    「Pixal3Dジェネレータ」節参照)。
+
+    Args:
+        choice: "auto" | "drtk" | "nvdiffrast"。Noneの場合は
+            `config.PIXAL3D_RASTERIZER` を使う。
+
+    Returns:
+        `dr.RasterizeCudaContext` / `dr.rasterize` / `dr.interpolate` 互換の
+        呼び出し規約を持つモジュール (`pixal3d_raster` シム、または
+        `nvdiffrast.torch` そのもの)。
+
+    Raises:
+        ImportError: choice="drtk" を明示指定したがdrtkが利用不可、または
+            choice="nvdiffrast" を明示指定したがnvdiffrastが利用不可の場合。
+        RuntimeError: choiceが不正な値の場合。
+    """
+    resolved = choice if choice is not None else config.PIXAL3D_RASTERIZER
+    if resolved not in ("auto", "drtk", "nvdiffrast"):
+        raise RuntimeError(
+            f"IMAGE3D_PIXAL3D_RASTERIZER は 'auto' | 'drtk' | 'nvdiffrast' の"
+            f"いずれかを指定してください (got: {resolved!r})。"
+        )
+
+    from . import pixal3d_raster
+
+    if resolved == "drtk":
+        if not pixal3d_raster.is_available():
+            raise ImportError(
+                "IMAGE3D_PIXAL3D_RASTERIZER=drtk が指定されましたが drtk が"
+                "importできません。requirements-pixal3d.txt のdrtkビルド手順を"
+                "参照してください。"
+            )
+        logger.info("Pixal3D: rasterizer backend = drtk (MIT, 明示指定)")
+        return pixal3d_raster
+
+    if resolved == "nvdiffrast":
+        import nvdiffrast.torch as ndr  # noqa: F401 (import可否のみ確認)
+
+        logger.info(
+            "Pixal3D: rasterizer backend = nvdiffrast (NVIDIA Source Code "
+            "License, 非商用限定, 明示指定)"
+        )
+        return ndr
+
+    # auto: drtkがimport可能ならdrtkを優先し、そうでなければnvdiffrastへ
+    # フォールバックする(ログでどちらが選ばれたかを明示する)。
+    if pixal3d_raster.is_available():
+        logger.info("Pixal3D: rasterizer backend = drtk (MIT, auto解決)")
+        return pixal3d_raster
+
+    logger.warning(
+        "Pixal3D: drtk (MIT) が利用できないため nvdiffrast (NVIDIA Source Code "
+        "License, 非商用限定) にフォールバックします。requirements-pixal3d.txt "
+        "のdrtkビルド手順を参照し、可能であればdrtkの導入を推奨します。"
+    )
+    import nvdiffrast.torch as ndr
+
+    return ndr
+
+
+def _inject_rasterizer(o_voxel_module: Any) -> Any:
+    """`o_voxel.postprocess.dr` を選択したラスタライザモジュールに差し替える。
+
+    to_glb呼び出し前に呼ぶ (Pixal3DGenerator._to_textured_trimesh 参照)。
+    差し替え後のモジュールも返す (呼び出し側でのログ・テスト用途)。
+    """
+    module = select_rasterizer_module()
+    o_voxel_module.postprocess.dr = module
+    return module
 
 
 class Pixal3DGenerator(Generator):
@@ -389,6 +473,8 @@ class Pixal3DGenerator(Generator):
     def _to_textured_trimesh(pipeline: Any, raw: Any, grid_size: Any) -> trimesh.Trimesh:
         """MeshWithVoxel を o_voxel.postprocess.to_glb でテクスチャ付きtrimeshに変換する。"""
         import o_voxel
+
+        _inject_rasterizer(o_voxel)
 
         # upstream inference.py と同じ引数 (texture_size/decimationは設定値)。
         glb = o_voxel.postprocess.to_glb(

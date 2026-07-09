@@ -29,7 +29,16 @@
 #   git clone -b main --recursive https://github.com/microsoft/TRELLIS.2.git third_party/TRELLIS.2
 #   uv pip install --python .venv-pixal3d/bin/python --no-build-isolation third_party/TRELLIS.2/o-voxel
 #
-#   # nvdiffrast (o_voxel.postprocess.to_glb が必須依存。PyPI配布なし)
+#   # drtk (Meta製、MIT。o_voxel.postprocess.to_glb のUVテクスチャベイクで
+#   # 使う nvdiffrast の3 API (RasterizeCudaContext/rasterize/interpolate) を
+#   # MITライセンスで代替する (server/generators/pixal3d_raster.py のシム経由)。
+#   # PyPI配布は無くgit経由のソースビルドになる (実機検証: sm_120で約3分40秒)。
+#   uv pip install --python .venv-pixal3d/bin/python --no-build-isolation \
+#       "git+https://github.com/facebookresearch/drtk.git"
+#
+#   # nvdiffrast (フォールバック用。drtkが使えない環境向け。非商用ライセンス
+#   # 注意 — 下記「ライセンスに関する注意」参照。IMAGE3D_PIXAL3D_RASTERIZER=auto
+#   # の既定ではdrtkが導入されていればこちらは一切使用されない)
 #   uv pip install --python .venv-pixal3d/bin/python --no-build-isolation \
 #       "git+https://github.com/NVlabs/nvdiffrast.git@v0.4.0"
 #
@@ -52,6 +61,16 @@
 # - NAF重み(~2.5MB)は初回実行時に torch.hub が valeoai/NAF から自動DLする。
 # - モデル重み: TencentARC/Pixal3D 約23GB + DINOv3 (camenduru/dinov3-vitl16) 約1.2GB
 #   (初回実行時にHuggingFaceから自動DL)。
+#
+# --- ラスタライザ選択 (IMAGE3D_PIXAL3D_RASTERIZER) --------------------------------
+# 既定 (auto) は drtk (MIT) がimport可能ならdrtkを使い、無ければ nvdiffrast
+# (非商用ライセンス) にフォールバックする (server/generators/pixal3d.py の
+# select_rasterizer_module / server/generators/pixal3d_raster.py 参照)。
+# drtk・nvdiffrastの両方を導入する必要はない — drtkのみの導入でも動作する
+# (nvdiffrastは非商用限定ライセンスのため、可能な限りdrtkのみの構成を推奨)。
+#   IMAGE3D_PIXAL3D_RASTERIZER=auto        # 既定。drtk優先、フォールバックあり
+#   IMAGE3D_PIXAL3D_RASTERIZER=drtk        # drtk必須 (無ければエラー)
+#   IMAGE3D_PIXAL3D_RASTERIZER=nvdiffrast  # nvdiffrast必須 (無ければエラー)
 
 # ---- アプリ本体のbase依存 (requirements.txt相当; Pixal3Dのピンと共存する版) ----
 fastapi>=0.111

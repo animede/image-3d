@@ -86,6 +86,17 @@ PIXAL3D_FOV = float(os.environ.get("IMAGE3D_PIXAL3D_FOV", "0.6"))
 # GLB化(o_voxel.postprocess.to_glb)のテクスチャサイズ / デシメーション目標
 PIXAL3D_TEXTURE_SIZE = int(os.environ.get("IMAGE3D_PIXAL3D_TEXTURE_SIZE", "2048"))
 PIXAL3D_DECIMATION_TARGET = int(os.environ.get("IMAGE3D_PIXAL3D_DECIMATION_TARGET", "1000000"))
+# UVテクスチャベイクのラスタライザ選択 ("auto" | "drtk" | "nvdiffrast")。
+# auto: drtk (Meta製, MIT) がimport可能ならdrtkを使用し、そうでなければ
+# nvdiffrast (NVIDIA Source Code License, 非商用限定) にフォールバックする
+# (server/generators/pixal3d_raster.py 参照)。
+PIXAL3D_RASTERIZER = os.environ.get("IMAGE3D_PIXAL3D_RASTERIZER", "auto")
+_PIXAL3D_RASTERIZER_CHOICES = {"auto", "drtk", "nvdiffrast"}
+if PIXAL3D_RASTERIZER not in _PIXAL3D_RASTERIZER_CHOICES:
+    raise ValueError(
+        f"IMAGE3D_PIXAL3D_RASTERIZER は {sorted(_PIXAL3D_RASTERIZER_CHOICES)} のいずれかを"
+        f"指定してください (got: {PIXAL3D_RASTERIZER!r})。"
+    )
 
 
 def ensure_dirs() -> None:

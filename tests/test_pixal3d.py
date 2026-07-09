@@ -8,10 +8,15 @@
   - 頂点カラー検出ヘルパ(jobs._mesh_vertex_colors)
   - 頂点カラー付きraw mesh → 後処理 → 転写 → color4量子化・GLB出力のE2E
     (頂点カラーを返すスタブジェネレータ使用)
+  - ラスタライザ選択ロジック (IMAGE3D_PIXAL3D_RASTERIZER=auto|drtk|nvdiffrast)
+    のモックによる解決挙動と、o_voxel.postprocess.dr への注入
 """
 import io
 import math
+import sys
 import time
+import types
+from unittest import mock
 
 import numpy as np
 import pytest
@@ -25,6 +30,8 @@ from server.generators.pixal3d import (
     Pixal3DGenerator,
     _distance_from_fov,
     _has_meaningful_alpha,
+    _inject_rasterizer,
+    select_rasterizer_module,
 )
 
 
@@ -244,3 +251,124 @@ def test_generator_vertex_colors_on_glb_without_color_mode(colored_client):
         list(scene.geometry.values()) if isinstance(scene, trimesh.Scene) else [scene]
     )
     assert meshes[0].visual.kind == "vertex"
+
+
+# --- ラスタライザ選択ロジック (drtk/nvdiffrast, IMAGE3D_PIXAL3D_RASTERIZER) --------
+#
+# drtk/nvdiffrastの実importはGPU/CUDA拡張ビルドが必要なため、ここでは
+# sys.modules をモックしてimport可否だけを制御し、GPU無しで選択ロジックを検証する。
+
+
+def _mock_module(monkeypatch, name, present):
+    """sys.modules[name] を差し替え、import可否をモックする。
+
+    present=Trueならダミーモジュールをsys.modulesに置き、present=Falseなら
+    ImportErrorを送出するようにする (importlibの標準的な挙動を模す)。
+    """
+    if present:
+        dummy = types.ModuleType(name)
+        monkeypatch.setitem(sys.modules, name, dummy)
+        return dummy
+    else:
+        monkeypatch.setitem(sys.modules, name, None)  # None登録でImportErrorになる
+        return None
+
+
+def test_select_rasterizer_auto_prefers_drtk_when_available(monkeypatch):
+    from server.generators import pixal3d_raster
+
+    monkeypatch.setattr(pixal3d_raster, "is_available", lambda: True)
+    module = select_rasterizer_module("auto")
+    assert module is pixal3d_raster
+
+
+def test_select_rasterizer_auto_falls_back_to_nvdiffrast(monkeypatch, caplog):
+    from server.generators import pixal3d_raster
+
+    monkeypatch.setattr(pixal3d_raster, "is_available", lambda: False)
+    fake_ndr = _mock_module(monkeypatch, "nvdiffrast", present=True)
+    fake_ndr_torch = types.ModuleType("nvdiffrast.torch")
+    monkeypatch.setitem(sys.modules, "nvdiffrast.torch", fake_ndr_torch)
+    fake_ndr.torch = fake_ndr_torch
+
+    with caplog.at_level("WARNING"):
+        module = select_rasterizer_module("auto")
+    assert module is fake_ndr_torch
+    assert any("nvdiffrast" in rec.message for rec in caplog.records)
+
+
+def test_select_rasterizer_explicit_drtk_missing_raises(monkeypatch):
+    from server.generators import pixal3d_raster
+
+    monkeypatch.setattr(pixal3d_raster, "is_available", lambda: False)
+    with pytest.raises(ImportError, match="drtk"):
+        select_rasterizer_module("drtk")
+
+
+def test_select_rasterizer_explicit_drtk_present(monkeypatch):
+    from server.generators import pixal3d_raster
+
+    monkeypatch.setattr(pixal3d_raster, "is_available", lambda: True)
+    module = select_rasterizer_module("drtk")
+    assert module is pixal3d_raster
+
+
+def test_select_rasterizer_explicit_nvdiffrast(monkeypatch):
+    fake_ndr = _mock_module(monkeypatch, "nvdiffrast", present=True)
+    fake_ndr_torch = types.ModuleType("nvdiffrast.torch")
+    monkeypatch.setitem(sys.modules, "nvdiffrast.torch", fake_ndr_torch)
+    fake_ndr.torch = fake_ndr_torch
+
+    module = select_rasterizer_module("nvdiffrast")
+    assert module is fake_ndr_torch
+
+
+def test_select_rasterizer_invalid_choice_raises():
+    with pytest.raises(RuntimeError, match="IMAGE3D_PIXAL3D_RASTERIZER"):
+        select_rasterizer_module("bogus")
+
+
+def test_select_rasterizer_uses_config_default(monkeypatch):
+    from server import config
+    from server.generators import pixal3d_raster
+
+    monkeypatch.setattr(config, "PIXAL3D_RASTERIZER", "drtk")
+    monkeypatch.setattr(pixal3d_raster, "is_available", lambda: True)
+    module = select_rasterizer_module()
+    assert module is pixal3d_raster
+
+
+def test_inject_rasterizer_sets_o_voxel_postprocess_dr(monkeypatch):
+    """o_voxel.postprocess.dr が選択したモジュールに差し替わること。"""
+    from server.generators import pixal3d_raster
+
+    fake_o_voxel = types.SimpleNamespace(postprocess=types.SimpleNamespace(dr=None))
+    monkeypatch.setattr(pixal3d_raster, "is_available", lambda: True)
+
+    result = _inject_rasterizer(fake_o_voxel)
+    assert result is pixal3d_raster
+    assert fake_o_voxel.postprocess.dr is pixal3d_raster
+
+
+# --- config.py: IMAGE3D_PIXAL3D_RASTERIZER バリデーション ------------------------
+
+
+def test_config_rasterizer_default_is_auto():
+    from server import config
+
+    assert config.PIXAL3D_RASTERIZER in ("auto", "drtk", "nvdiffrast")
+
+
+def test_config_rasterizer_rejects_invalid_env(monkeypatch):
+    """config.py モジュールロード時に不正値ならValueErrorを送出する。"""
+    monkeypatch.setenv("IMAGE3D_PIXAL3D_RASTERIZER", "bogus")
+    import importlib
+
+    from server import config as config_module
+
+    with pytest.raises(ValueError, match="IMAGE3D_PIXAL3D_RASTERIZER"):
+        importlib.reload(config_module)
+
+    # 後始末: 他のテストに影響しないよう正常な状態に戻す
+    monkeypatch.delenv("IMAGE3D_PIXAL3D_RASTERIZER", raising=False)
+    importlib.reload(config_module)
