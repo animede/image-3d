@@ -30,10 +30,6 @@ Web UIの使い方は [`docs/USAGE.md`](docs/USAGE.md)、詳細仕様は
 - 3つ目のジェネレータとして **Pixal3D**(MITライセンス、PBRテクスチャ付き出力)を
   統合(下記「Pixal3Dジェネレータ」参照)。専用venv `.venv-pixal3d` +
   `IMAGE3D_GENERATOR=pixal3d` の明示指定で使用する。
-- Phase 4a+4b で **ぬいぐるみ型紙生成**(FR-13)に対応(下記「Phase 4a+4b:
-  ぬいぐるみ型紙生成」参照)。生成済みジョブのメッシュをパネルに分割し、
-  各パネルを平坦化(LSCM+ARAP)した上で、縫い代・合印(ノッチ)・布目線付きの
-  実寸SVG型紙をダウンロードできる。
 
 ## セットアップ
 
@@ -183,13 +179,6 @@ curl -s -X POST http://127.0.0.1:8000/api/jobs \
 
 # キャラクターシート分割(Phase 3a、ジョブを作らない同期API)
 curl -s -X POST http://127.0.0.1:8000/api/sheet/split -F "image=@sheet.png"
-
-# ぬいぐるみ型紙生成(Phase 4a、FR-13。対象ジョブはcompleted必須)
-curl -s -X POST http://127.0.0.1:8000/api/jobs/<job_id>/pattern \
-  -H "Content-Type: application/json" \
-  -d '{"n_panels": 6, "use_colors": true}'
-curl -s http://127.0.0.1:8000/api/jobs/<job_id>/pattern.json
-curl -s http://127.0.0.1:8000/api/jobs/<job_id>/pattern_preview.glb -o pattern_preview.glb
 ```
 
 全エンドポイントは [`docs/SPEC.md`](docs/SPEC.md) §5 を参照。
@@ -226,30 +215,6 @@ curl -s http://127.0.0.1:8000/api/jobs/<job_id>/pattern_preview.glb -o pattern_p
   `texture_mode=paint`(単体・`color_mode=color4`併用)を指定してもジョブが
   正常completedすること(paint失敗→フォールバック経路を`_run_paint`の
   モンキーパッチで検証。実際のpaint成功経路はGPU実機検証でカバー)。
-- `tests/test_pattern_segment.py`(Phase 4a追加): `server/pattern/` の
-  TestClient不要の純粋関数テスト。icosphere・カプセルで全面被覆・パネル数・
-  各パネルの連結性・円盤位相(境界ループ1本)・面積合計の整合を検証。
-  上半球赤/下半球青に着色した球で、色境界誘導(`use_colors=True`)が
-  誘導なしと比べ明確にパネル境界を色境界へ寄せることを検証
-  (境界エッジの色差整合率で比較)。`prepare_mesh`/`build_preview_mesh`の
-  基本性質も検証。
-- `tests/test_pattern_api.py`(Phase 4a追加、4bで拡張): mockジェネレータで
-  ジョブ作成→ `POST /api/jobs/{id}/pattern` →
-  `pattern.json`/`pattern_preview.glb`/`pattern.svg`取得をE2E検証(GLBはtrimeshで
-  再読込可能、SVGはXMLパース可能なことも確認)。未完了ジョブへのリクエストが409、
-  `n_panels`/`smooth_iterations`/`seam_allowance_mm` の範囲外が400になることを検証。
-- `tests/test_pattern_flatten.py`(Phase 4b追加): `server/pattern/flatten.py` の
-  純粋関数テスト。円筒側面(切り開いた円盤位相メッシュ、UV既知)を平坦化し、
-  展開後の高さ・周長が解析解と1%未満の誤差で一致することを検証。平面メッシュは
-  歪みほぼゼロ、半球は歪みが出るが妥当な範囲であることを検証。ARAP反復が
-  LSCM単独より辺長歪みを改善すること、円盤位相でない・空・非連結パネルが
-  例外を投げず`flatten_failed: true`を返すことも検証。
-- `tests/test_pattern_svg.py`(Phase 4b追加): `server/pattern/svg.py` の
-  純粋関数テスト。`xml.etree.ElementTree`(標準ライブラリ、テスト側のみで使用)で
-  SVGをパースし、viewBoxがmm実寸であること、パネル数分のグループが存在すること、
-  縫い代パス(オフセットポリゴン)が本体パスより外側(面積が大きい)であること、
-  シームごとの合印が両パネルに同数(偶数個)存在すること、`_detect_seams`が
-  面の双対グラフから求めた真のパネル隣接ペアと一致することを検証。
 
 ## Phase 2: GPU導入手順(Hunyuan3D-2、実機検証済み)
 
@@ -715,148 +680,6 @@ curl -s -X POST http://127.0.0.1:8000/api/jobs \
   追加するパッチが必要(上記セットアップ参照)。third_party ディレクトリを
   再取得(git clone)した場合は再適用が必要。
 
-## Phase 4a+4b: ぬいぐるみ型紙生成
-
-生成済みジョブのメッシュから、ぬいぐるみ縫製用の型紙(SPEC.md §3.12 / FR-13)を
-生成する。Phase 4aで**パネル分割+3Dプレビュー**、Phase 4bで**平坦化
-(LSCM+ARAP)+実寸SVG出力**(縫い代・合印・布目線付き)を実装済み。
-
-### モジュール設計
-
-`server/pattern/` は将来の独立リポジトリ化に備えた**純粋モジュール**
-(`server/DEVELOPMENT_POLICY.md` §3.5)。`server/` 内の他モジュール
-(config・jobs・generators・colorprocなど)を一切importせず、依存は
-numpy / scipy / trimesh のみ(新規pip依存の追加なし)。
-
-- `server/pattern/preprocess.py`: `prepare_mesh()` — Taubin平滑化
-  (失敗時はラプラシアンにフォールバック)→ 簡略化(1万〜2万面。
-  `fast-simplification` は既存の `requirements.txt` 依存を流用、
-  失敗時は trimesh標準の `simplify_quadric_decimation` にフォールバック)
-  → 最大連結成分抽出。頂点カラーがあれば最近傍で新メッシュへ転写する。
-- `server/pattern/segment.py`: `segment_panels()` — 面の双対グラフ上で
-  farthest-point samplingによりシード面を選び、エッジ重み付き多始点
-  最短路(`scipy.sparse.csgraph.dijkstra`)でVoronoi風にパネルを成長させる。
-  凹エッジ(谷折れ)・色境界(`use_colors=True`時)のエッジは**通行コストを
-  上げる**ことでパネル境界がそこに沿いやすくなるよう誘導する
-  (直感に反して「軽くする」方向では逆効果になることを実験で確認済み。
-  詳細はモジュール内docstring参照)。後処理で (a) 非連結パネルの最寄り
-  パネルへの再割当、(b) 極小パネル(全面積2%未満)の隣接吸収、
-  (c) 円盤位相(境界ループ1本)の判定・修復を行う。修復しきれない場合は
-  例外にせず `panel_stats()` の `disk_topology: false` に正直に反映する。
-- `server/pattern/preview.py`: `build_preview_mesh()` — パネルごとに
-  隣接パネルが似た色にならない固定12色パレットで面カラーを塗ったメッシュを返す。
-- `server/pattern/flatten.py`(Phase 4b): `flatten_panel(mesh, face_indices)` —
-  円盤位相のパネル(部分メッシュ)を2Dへ展開する。
-  1. **LSCM初期解**(least squares conformal map): 各三角形を法線に直交する
-     局所2D等長座標系へ写し、コーシー・リーマン残差を最小二乗(`scipy.sparse.linalg.lsqr`)
-     で解く。固定する2頂点は、メッシュ上で実際に隣接する**最長エッジの両端**を選ぶ
-     (バウンディングボックス対角の任意2点を選ぶと、直線距離と測地距離の乖離から
-     大きなシェア(せん断)が生じ、後段のARAPでも解消できないことを実験で確認し、
-     この選び方に変更した)。
-  2. **ARAP反復**(as-rigid-as-possible、5〜15回): 三角形ごとに3D→2Dの最適回転を
-     2x2 SVDで求める局所ステップと、コットジェント重み付きラプラシアン系
-     (`scipy.sparse.linalg.spsolve`)を解く大域ステップを交互に反復し、辺長歪みを
-     低減する。大域ステップのRHSは三角形ごとの**半コットジェント**(この三角形単独の
-     寄与)を使う(大域行列の対称重み=両側三角形の和をそのままRHSにも使うと
-     二重計上になり発散することを実装時に確認・修正した)。
-  歪み指標(辺長歪みの最大・最小・平均・±10%超の割合、2D/3D面積比)を返す。
-  円盤位相でないパネルは例外にせず `{"flatten_failed": True, "reason": ...}` を返し、
-  他パネルの処理を継続できるようにする。
-- `server/pattern/svg.py`(Phase 4b): `build_pattern_svg(panels_2d, seam_allowance_mm, ...)` —
-  平坦化済みパネルから実寸(mm単位viewBox)SVG型紙を組み立てる。パネルは単純な
-  シェルフ法で矩形パッキング。縫い代線は境界ポリゴンの頂点法線方向オフセット
-  (マイタ近似+短エッジ間引きによる簡易クリーンアップ)。合印(ノッチ)は、
-  パネル境界の3D座標を突き合わせて隣接パネル間のシーム(共有境界)を検出し、
-  シームごとに2〜4個、対応する2パネルの両側に同一シームIDを付けて配置する。
-  パネル番号ラベル・布目線(縦の両矢印)・凡例(モデル名・高さ・縫い代・
-  シーム対応表)も含む。XMLライブラリには依存せず文字列組み立てで生成する。
-
-### API・UI
-
-- `POST /api/jobs/{id}/pattern`(body: `n_panels`(4〜12, 既定6)、
-  `use_colors`(既定true)、`smooth_iterations`(既定10)、`seam_allowance_mm`
-  (1〜30, 既定7)) → 同期実行(数秒)で `pattern.json`(実パネル数・パネルごとの
-  面数/面積/円盤位相/平坦化歪み指標)、`pattern_preview.glb`(パネル色分けメッシュ)、
-  `pattern.svg`(実寸型紙)をジョブディレクトリへ保存。対象ジョブが `completed`
-  でなければ409、パラメータ範囲外は400。
-- `GET /api/jobs/{id}/pattern.json` / `pattern_preview.glb` / `pattern.svg`
-  で取得(未生成時404、`pattern.svg` は `image/svg+xml`)。
-- UI: ビューア下部に「ぬいぐるみ型紙を生成」ボタン。クリックでパネル数・
-  縫い代(mm)スライダ、色境界誘導チェックボックスを表示。実行するとビューアに
-  パネル色分けプレビューが表示され(「モデル表示に戻す」で通常表示に戻せる)、
-  パネルごとの辺長歪み(±10%超の割合、閾値超は警告色)、「型紙SVGをダウンロード」
-  ボタン、SVGのインラインプレビュー(`<details>`内`<img>`)が表示される。
-
-### 実メッシュでの検証結果
-
-mockジェネレータ(`IMAGE3D_GENERATOR=mock`)でAPI・UIのE2E動作を確認した上で、
-実際に生成済みの `data/jobs/` 内メッシュに対して直接 `server/pattern/` を
-実行して検証した。
-
-- **hunyuan3d生成メッシュ(momo.png、頂点カラーなし)**: 3ジョブ ×
-  パネル数 4/6/8/10/12 の計15ケースで **disk_topology達成率 89.8%
-  (106/118パネル)**。パネル数を増やすほど個々のパネルが小さくなり
-  円盤位相を保ちやすくなる傾向(n_panels=10, 12では概ね90%超〜100%)。
-  処理時間は前処理+分割で1ジョブあたり1秒未満。
-- **pixal3d生成メッシュ(momo.png、頂点カラー付き、ジョブ`58d8e1d0`)**:
-  色境界誘導は機能する(球のような単純形状でのテストでは境界エッジの
-  色差整合率が誘導なしの2〜9%から63〜85%まで改善することを単体テストで
-  確認済み)一方、このジョブの実メッシュでは **disk_topology達成率が
-  0/5** と低かった。原因を調査したところ、`model.glb` 自体が
-  `merge_vertices()` 後も440個の連結成分・940本の非多様体エッジ
-  (3面以上を共有するエッジ)を含む、UVアトラス起因の位相的に汚れた
-  メッシュであることが判明した(パネル分割アルゴリズム側の不具合ではなく、
-  Pixal3D側のGLB化パイプラインに起因する既知の制約。関連: 本READMEの
-  「Pixal3Dジェネレータ」節、`server/generators/pixal3d_raster.py`)。
-  `prepare_mesh()` の平滑化・簡略化・最大連結成分抽出はこの種の非多様体
-  性を完全には解消できないため、円盤位相修復に失敗したパネルは
-  `disk_topology: false` として正直に報告される(仕様通りの挙動)。
-
-**Phase 4b(平坦化+SVG)の解析解検証**: 円筒側面(高さ40mm・半径8mm相当、
-UVパラメータ化が既知)を1本の縦シームで切り開いたメッシュを`flatten_panel()`で
-展開し、展開後の高さ・周長が3D解析解と一致するかを検証した。
-
-- 高さ誤差 **約0.0000012%**、周長誤差 **約0.29%**(いずれも目標の1%未満)。
-- ARAP反復による改善: 半球パネル(非可展)でLSCM単独(0回反復)は辺長歪み
-  ±10%超の割合96.6%・面積比0.36(3D比)だったのに対し、ARAP12回反復後は
-  ±10%超48.4%・面積比0.96まで改善。ARAP反復が確かに歪みを低減することを確認。
-
-**Phase 4b の実データ検証(momo.png、hunyuan3dジョブ、mockサーバ:8021)**:
-既存ジョブ `02edf6c8-b1e2-4267-9306-dd5bb387794a`(頂点カラー付き、
-モデル寸法 67.8×45.1×100.0mm)に対し `n_panels=8, seam_allowance_mm=7` で
-`POST /pattern` → `pattern.svg` を取得して検証した。
-
-- disk_topology 8/8、flatten成功 8/8(全パネル平坦化成功)。
-- SVG: `viewBox`・`width`/`height` ともmm実寸(全体 767.5mm×156.0mm、
-  8パネルをシェルフパッキング)。個々のパネルの実寸bboxは約40×38mm〜
-  84×74mm(100mmモデルに対し数cm〜十数cm弱のオーダーで妥当)。XMLとして
-  パース可能、パネルグループ8個、合印(ノッチ)128個(12シーム対応×両側2〜4個)。
-- 辺長歪み(±10%超の割合)はパネルごとに **47%〜82%**、面積比(2D/3D)は
-  0.62〜1.13。momoのような複雑な形状(頭部・耳・手足の接合部を含むパネル)は
-  非可展性が強く、円筒・半球の単体テストと比べ歪みが大きい。ARAP反復回数を
-  5→40まで増やしても収束済み(59〜60%付近で頭打ち)であり、反復不足ではなく
-  幾何形状自体の限界であることを確認した(パネル分割の粒度を上げる・
-  分割線を可展になるよう誘導する等の改善はPhase 4c「シーム直線化」の対象)。
-
-### 既知の制限
-
-- 円盤位相の完全保証はしない。メッシュ自体が非多様体・多数の連結成分を
-  持つ場合(上記pixal3d例)、修復しきれないパネルが残りうる。
-- 平坦化(LSCM/ARAP)は円盤位相でないパネルには適用できず
-  `flatten_failed: true` としてSVGから除外される(型紙生成自体は継続する)。
-- 複雑な非可展形状(頭部・四肢の接合部等)では辺長歪みが大きくなりうる
-  (momo実測で±10%超が最大82%のパネルあり)。パネル分割を細かくする・
-  縫い代を大きめに取ることで布の伸縮により実用上は吸収可能な場合が多いが、
-  数学的な可展面保証はしない(仕様通りの制約)。
-- 縫い代オフセットは頂点法線方向オフセット+短エッジ間引きの簡易実装で、
-  自己交差を完全には排除しない(極端に凹んだ境界形状では縫い代線が
-  自己交差する可能性がある)。
-- 詰め物による膨張の逆補正・型紙の縫い合わせ長の厳密整合・シーム直線化・
-  PDF出力はPhase 4c以降。
-- `n_panels` は要求値の上限であり、極小パネル吸収により実際のパネル数は
-  それより少なくなることがある(`pattern.json` の `n_panels_actual` を
-  参照)。
-
 ## Pixal3Dジェネレータ(MITライセンス、実機検証済み)
 
 [Pixal3D](https://github.com/TencentARC/Pixal3D)(TencentARC、SIGGRAPH 2026、
@@ -1067,13 +890,7 @@ image-3d/
 │   ├── meshproc.py           # メッシュ後処理
 │   ├── colorproc.py          # 4色カラープリント対応(Phase 2.5、頂点カラー投影・量子化・分割)
 │   ├── sheet.py              # キャラクターシート自動分割(Phase 3a、パネル検出)
-│   ├── texture.py            # テクスチャ生成 texgen 統合(Phase 3c、paint常駐ラッパ・頂点カラーサンプリング)
-│   └── pattern/               # ぬいぐるみ型紙生成(Phase 4a+4b、純粋モジュール。numpy/scipy/trimeshのみに依存)
-│       ├── preprocess.py     # prepare_mesh(): 平滑化+簡略化+最大連結成分抽出
-│       ├── segment.py        # segment_panels(): パネル分割(円盤位相保証・色境界誘導)
-│       ├── preview.py        # build_preview_mesh(): パネル色分けプレビューメッシュ
-│       ├── flatten.py        # flatten_panel(): LSCM+ARAPによる2D展開・歪み指標(Phase 4b)
-│       └── svg.py            # build_pattern_svg(): 実寸SVG型紙(縫い代・合印・布目線、Phase 4b)
+│   └── texture.py            # テクスチャ生成 texgen 統合(Phase 3c、paint常駐ラッパ・頂点カラーサンプリング)
 ├── web/                      # 静的フロントエンド
 ├── tests/                    # pytest
 ├── data/jobs/                # 生成物(gitignore対象)

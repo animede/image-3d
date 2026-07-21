@@ -57,32 +57,6 @@ const presetSelect = document.getElementById("preset-select");
 
 const exportButtons = document.querySelectorAll(".export-btn");
 
-const patternToggleBtn = document.getElementById("pattern-toggle-btn");
-const patternBackToModelBtn = document.getElementById("pattern-back-to-model-btn");
-const patternPanel = document.getElementById("pattern-panel");
-const patternNPanelsInput = document.getElementById("pattern-n-panels");
-const patternNPanelsValue = document.getElementById("pattern-n-panels-value");
-const patternUseColorsCheckbox = document.getElementById("pattern-use-colors");
-const patternSeamAllowanceInput = document.getElementById("pattern-seam-allowance");
-const patternSeamAllowanceValue = document.getElementById("pattern-seam-allowance-value");
-const patternRunBtn = document.getElementById("pattern-run-btn");
-const patternError = document.getElementById("pattern-error");
-const patternResult = document.getElementById("pattern-result");
-const patternResultCount = document.getElementById("pattern-result-count");
-const patternResultDiskOk = document.getElementById("pattern-result-disk-ok");
-const patternResultFlattenOk = document.getElementById("pattern-result-flatten-ok");
-const patternPanelList = document.getElementById("pattern-panel-list");
-const patternSvgDownloadBtn = document.getElementById("pattern-svg-download-btn");
-const patternSvgPreview = document.getElementById("pattern-svg-preview");
-
-// server/pattern/preview.py の _PALETTE_HEX と同じ並び(隣接パネルが
-//似た色にならないよう色相を大きく飛ばした固定パレット)。
-const PATTERN_PALETTE_HEX = [
-  "#e6194b", "#3cb44b", "#4363d8", "#f58231",
-  "#911eb4", "#42d4f4", "#f032e6", "#bfef45",
-  "#fabed4", "#469990", "#9a6324", "#ffe119",
-];
-
 const STATUS_LABELS = {
   queued: "待機中(キュー)",
   preprocessing: "画像前処理中...",
@@ -103,7 +77,6 @@ const STATUS_PROGRESS = {
 
 let selectedFile = null;
 let currentJobId = null;
-let showingPatternPreview = false;
 let pollTimer = null;
 
 // 追加ビュー(back/left/right)の選択中File(未選択はnull)
@@ -523,14 +496,6 @@ async function loadJobIntoViewer(job) {
 
   updateModelInfo(job.stats);
   exportButtons.forEach((btn) => (btn.disabled = false));
-
-  // 型紙(Phase 4a): 新しいジョブに切り替わったら状態をリセットする
-  patternToggleBtn.disabled = false;
-  patternPanel.hidden = true;
-  patternBackToModelBtn.hidden = true;
-  patternResult.hidden = true;
-  patternError.hidden = true;
-  showingPatternPreview = false;
 }
 
 function updateModelInfo(stats) {
@@ -610,112 +575,6 @@ exportButtons.forEach((btn) => {
     window.location.href = `/api/jobs/${currentJobId}/download?format=${format}`;
   });
 });
-
-// --- ぬいぐるみ型紙生成 (SPEC.md §3.12 / FR-13, Phase 4a+4b) ----------------
-patternNPanelsInput.addEventListener("input", () => {
-  patternNPanelsValue.textContent = patternNPanelsInput.value;
-});
-
-patternSeamAllowanceInput.addEventListener("input", () => {
-  patternSeamAllowanceValue.textContent = patternSeamAllowanceInput.value;
-});
-
-patternToggleBtn.addEventListener("click", () => {
-  patternPanel.hidden = !patternPanel.hidden;
-});
-
-patternRunBtn.addEventListener("click", async () => {
-  if (!currentJobId) return;
-
-  patternRunBtn.disabled = true;
-  patternError.hidden = true;
-  patternResult.hidden = true;
-
-  try {
-    const res = await fetch(`/api/jobs/${currentJobId}/pattern`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        n_panels: Number(patternNPanelsInput.value),
-        use_colors: patternUseColorsCheckbox.checked,
-        seam_allowance_mm: Number(patternSeamAllowanceInput.value),
-      }),
-    });
-
-    if (!res.ok) {
-      const errBody = await res.json().catch(() => ({}));
-      throw new Error(errBody.detail || `型紙生成に失敗しました(status=${res.status})`);
-    }
-
-    const data = await res.json();
-    renderPatternResult(data);
-
-    await viewer.loadGLB(`/api/jobs/${currentJobId}/pattern_preview.glb?t=${Date.now()}`);
-    viewerPlaceholder.hidden = true;
-    showingPatternPreview = true;
-    patternBackToModelBtn.hidden = false;
-  } catch (err) {
-    console.error(err);
-    patternError.textContent = err.message || String(err);
-    patternError.hidden = false;
-  } finally {
-    patternRunBtn.disabled = false;
-  }
-});
-
-patternBackToModelBtn.addEventListener("click", async () => {
-  if (!currentJobId) return;
-  try {
-    await viewer.loadGLB(`/api/jobs/${currentJobId}/model.glb?t=${Date.now()}`);
-    showingPatternPreview = false;
-    patternBackToModelBtn.hidden = true;
-  } catch (err) {
-    console.error("Failed to reload model GLB", err);
-  }
-});
-
-function renderPatternResult(data) {
-  patternResultCount.textContent = `${data.n_panels_actual} (要求: ${data.n_panels_requested})`;
-  const diskOkCount = data.panels.filter((p) => p.disk_topology).length;
-  patternResultDiskOk.textContent = `${diskOkCount} / ${data.panels.length}`;
-  const flattenOkCount = data.panels.filter((p) => !p.flatten_failed).length;
-  patternResultFlattenOk.textContent = `${flattenOkCount} / ${data.panels.length}`;
-
-  patternPanelList.innerHTML = "";
-  data.panels.forEach((panel) => {
-    const li = document.createElement("li");
-    if (!panel.disk_topology || panel.flatten_failed) li.classList.add("pattern-panel-warn");
-
-    const swatch = document.createElement("span");
-    swatch.className = "pattern-panel-swatch";
-    swatch.style.background = PATTERN_PALETTE_HEX[panel.panel_id % PATTERN_PALETTE_HEX.length];
-
-    const label = document.createElement("span");
-    const areaCm2 = (panel.area_mm2 / 100).toFixed(1);
-    const topologyNote = panel.disk_topology ? "" : " ※穴あり";
-
-    let distortionNote = "";
-    if (panel.flatten_failed) {
-      distortionNote = " ※平坦化失敗";
-    } else if (panel.distortion) {
-      const over10pct = panel.distortion.edge_length_over_10pct_fraction * 100;
-      distortionNote = ` / 辺長歪み±10%超: ${over10pct.toFixed(0)}%`;
-      if (over10pct > 20) li.classList.add("pattern-panel-warn");
-    }
-
-    label.textContent = `#${panel.panel_id}: ${panel.n_faces}面 / ${areaCm2}cm²${topologyNote}${distortionNote}`;
-
-    li.appendChild(swatch);
-    li.appendChild(label);
-    patternPanelList.appendChild(li);
-  });
-
-  const svgUrl = `/api/jobs/${currentJobId}/pattern.svg?t=${Date.now()}`;
-  patternSvgDownloadBtn.href = svgUrl;
-  patternSvgPreview.src = svgUrl;
-
-  patternResult.hidden = false;
-}
 
 // --- ジョブ履歴 -------------------------------------------------------------
 async function refreshJobHistory() {

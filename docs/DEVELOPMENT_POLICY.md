@@ -57,20 +57,6 @@ image-3d/
 └── README.md
 ```
 
-## 3.5 独立可能モジュールの境界規約
-
-将来単体リポジトリへの切り出しを想定するモジュール(現時点: `server/pattern/`)は
-以下を厳守する:
-
-- `server/` 内の他モジュール(config, jobs, generators, colorproc等)を importしない。
-  入出力は標準型+trimesh/numpyのみで完結させる。
-- 依存は numpy / scipy / trimesh に限定(追加依存が必要になったら切り出し時の
-  依存リストを意識して選定し、READMEのOSS一覧に追記する)。
-- アプリ固有の事情(ジョブ保存パス、環境変数、日本語UIメッセージ)は
-  main.py / jobs.py 側のアダプタに置き、モジュール内には持ち込まない。
-- テストもモジュール単体で完結させる(`tests/test_pattern_*.py`、TestClient不要の
-  純粋関数テストを基本とする)。
-
 ## 4. コーディング規約
 
 - Python: 型ヒント必須、`ruff` 準拠スタイル、モジュール間はデータクラス/辞書で疎結合。

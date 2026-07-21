@@ -209,53 +209,6 @@
         <div id="viewer-placeholder">モデルを生成するとここに表示されます</div>
       </div>
 
-      <div id="pattern-bar">
-        <button type="button" id="pattern-toggle-btn" class="secondary-btn" disabled>
-          ぬいぐるみ型紙を生成
-        </button>
-        <button type="button" id="pattern-back-to-model-btn" class="secondary-btn" hidden>
-          モデル表示に戻す
-        </button>
-      </div>
-
-      <div id="pattern-panel" hidden>
-        <h3>ぬいぐるみ型紙(パネル分割+平坦化) <span class="sub-hint">Phase 4a+4b</span></h3>
-        <p class="sub-hint">
-          モデルをパネルに分割し、色分けプレビューを表示します。
-          「型紙を生成」実行後、各パネルを平坦化して実寸SVG型紙(縫い代・合印・布目線付き)を
-          ダウンロードできます。
-        </p>
-        <label class="field">
-          <span>パネル数: <b id="pattern-n-panels-value">6</b></span>
-          <input type="range" id="pattern-n-panels" min="4" max="12" step="1" value="6" />
-        </label>
-        <label class="field checkbox">
-          <input type="checkbox" id="pattern-use-colors" checked />
-          <span>色境界に沿ってパネル分割する(頂点カラーがある場合)</span>
-        </label>
-        <label class="field">
-          <span>縫い代: <b id="pattern-seam-allowance-value">7</b> mm</span>
-          <input type="range" id="pattern-seam-allowance" min="1" max="30" step="0.5" value="7" />
-        </label>
-        <button type="button" id="pattern-run-btn" class="primary-btn">型紙を生成</button>
-        <div class="progress-error" id="pattern-error" hidden></div>
-        <div id="pattern-result" hidden>
-          <p class="sub-hint">
-            実パネル数: <b id="pattern-result-count">-</b>
-            (円盤位相OK: <b id="pattern-result-disk-ok">-</b> /
-            平坦化OK: <b id="pattern-result-flatten-ok">-</b>)
-          </p>
-          <ul id="pattern-panel-list"></ul>
-          <div id="pattern-svg-actions">
-            <a id="pattern-svg-download-btn" class="secondary-btn" download>型紙SVGをダウンロード</a>
-          </div>
-          <details id="pattern-svg-preview-details">
-            <summary>型紙SVGプレビュー</summary>
-            <img id="pattern-svg-preview" alt="型紙SVGプレビュー" />
-          </details>
-        </div>
-      </div>
-
       <div id="export-bar">
         <span class="export-label">エクスポート:</span>
         <button class="export-btn" data-format="stl" disabled>STL</button>
