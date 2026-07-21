@@ -126,6 +126,18 @@ class Job:
         """実寸SVG型紙 (SPEC.md §3.12 / FR-13, Phase 4b)。"""
         return self.dir_path() / "pattern.svg"
 
+    def pattern_parts_json_path(self) -> Path:
+        """パーツ分解の統計・パラメータJSON (SPEC.md §3.12「2段階構成」, Phase 4c)。"""
+        return self.dir_path() / "pattern_parts.json"
+
+    def pattern_parts_preview_glb_path(self) -> Path:
+        """パーツ色分けプレビューGLB (SPEC.md §3.12「2段階構成」, Phase 4c)。"""
+        return self.dir_path() / "pattern_parts_preview.glb"
+
+    def pattern_parts_labels_path(self) -> Path:
+        """パーツ分解の面ラベル(.npy)。patternエンドポイントが再利用する (Phase 4c)。"""
+        return self.dir_path() / "pattern_parts_labels.npy"
+
     def is_color_mode(self) -> bool:
         return self.params.get("color_mode", "none") == "color4"
 

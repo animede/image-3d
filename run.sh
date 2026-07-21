@@ -17,7 +17,7 @@ fi
 # auto: GPU + hy3dgen があれば hunyuan3d、なければ mock(テスト用形状)に自動解決
 export IMAGE3D_GENERATOR="${IMAGE3D_GENERATOR:-auto}"
 export IMAGE3D_HOST="${IMAGE3D_HOST:-127.0.0.1}"
-export IMAGE3D_PORT="${IMAGE3D_PORT:-8000}"
+export IMAGE3D_PORT="${IMAGE3D_PORT:-8100}"
 
 exec "$VENV_DIR/bin/uvicorn" server.main:app \
   --host "$IMAGE3D_HOST" \

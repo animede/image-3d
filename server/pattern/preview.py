@@ -9,8 +9,10 @@ import numpy as np
 import trimesh
 
 # 隣接パネルが似た色にならないよう、色相を大きく飛ばして並べた固定パレット
-# (12色)。パネルIDを巡回インデックスとして使う。
-_PALETTE_HEX = [
+# (20色)。パネルID/パーツIDを巡回インデックスとして使う。暗色(olive以降)は
+# ダーク背景で視認しにくいため末尾に置き、パーツ数が多いときのみ使われる。
+# 公開定数: アダプタ・SVG凡例がビューアの色分けと対応を取るために参照する。
+PALETTE_HEX = [
     "#e6194b",  # red
     "#3cb44b",  # green
     "#4363d8",  # blue
@@ -23,7 +25,18 @@ _PALETTE_HEX = [
     "#469990",  # teal
     "#9a6324",  # brown
     "#ffe119",  # yellow
+    "#dcbeff",  # lavender
+    "#aaffc3",  # mint
+    "#ffd8b1",  # apricot
+    "#fffac8",  # beige
+    "#a9a9a9",  # grey
+    "#808000",  # olive
+    "#800000",  # maroon
+    "#000075",  # navy
 ]
+
+# 後方互換エイリアス(既存の内部参照用)
+_PALETTE_HEX = PALETTE_HEX
 
 
 def _hex_to_rgba(hex_color: str) -> list[int]:

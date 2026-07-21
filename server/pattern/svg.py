@@ -55,6 +55,15 @@ def _ensure_ccw(points: np.ndarray) -> np.ndarray:
     return points.copy()
 
 
+def _ensure_ccw_with_mask(points: np.ndarray, mask: Optional[np.ndarray]) -> tuple[np.ndarray, Optional[np.ndarray]]:
+    """`_ensure_ccw`と同じ巻き方向補正を、対応する真偽値マスク
+    (取付口フラグ等、`points`と同じ順序・長さの配列)にも適用して返す。"""
+    if _polygon_area(points) < 0:
+        reversed_mask = mask[::-1].copy() if mask is not None else None
+        return points[::-1].copy(), reversed_mask
+    return points.copy(), (mask.copy() if mask is not None else None)
+
+
 def _offset_polygon(points: np.ndarray, distance: float, min_edge_len: float = 0.3) -> np.ndarray:
     """境界ポリゴンを外側(反時計回りを前提に法線=左向き90度回転の逆)へ
     `distance` だけオフセットした簡易オフセットポリゴンを返す。
@@ -185,6 +194,15 @@ def _detect_seams(panels: list[dict]) -> list[dict]:
             panel_a = valid_panels[a_idx]
             panel_b = valid_panels[b_idx]
 
+            # パーツグループ化時、異なるパーツ間ではシームを検出しない。
+            # パーツ分解の切断面(取付口)のリム頂点は隣接パーツ間で3D座標が
+            # 一致するため、パーツを跨いだ偽シーム(縫い合わせ指示)が
+            # 出てしまう。パーツ間の接合は取付口ラベルで表現する。
+            part_a = panel_a.get("part_id")
+            part_b = panel_b.get("part_id")
+            if part_a is not None and part_b is not None and part_a != part_b:
+                continue
+
             loop_a_idx = panel_a["boundary_loop_indices"]
             loop_b_idx = panel_b["boundary_loop_indices"]
             verts3d_a = panel_a["vertices_3d"][loop_a_idx]
@@ -295,6 +313,50 @@ def _notch_svg(point: np.ndarray, direction: np.ndarray, seam_id: int, length: f
     )
 
 
+def _attachment_opening_runs(mask: np.ndarray) -> list[list[int]]:
+    """境界ループ(循環リスト)上でTrueが連続する区間(取付口)をインデックス
+    列のリストとして返す。ループ全体がTrueの場合は1本の全周区間として返す。
+    """
+    n = len(mask)
+    if n == 0 or not np.any(mask):
+        return []
+    if np.all(mask):
+        return [list(range(n))]
+
+    runs: list[list[int]] = []
+    current: list[int] = []
+    # 開始点をFalseの直後(=Trueの立ち上がり)に揃えるため、最初のFalseの
+    # インデックスを探して回転させる。
+    first_false = int(np.argmax(~mask))
+    order = [(first_false + i) % n for i in range(n)]
+    for idx in order:
+        if mask[idx]:
+            current.append(idx)
+        else:
+            if current:
+                runs.append(current)
+                current = []
+    if current:
+        runs.append(current)
+    return runs
+
+
+def _attachment_opening_svg(loop_shifted: np.ndarray, run_indices: list[int], label: str) -> str:
+    """取付口(切断面)の境界区間を太線+ラベルで描画する。"""
+    pts = loop_shifted[run_indices]
+    if len(pts) == 0:
+        return ""
+    path = _points_to_path(pts, closed=False)
+    mid = pts[len(pts) // 2]
+    return (
+        f'<g class="attachment-opening">'
+        f'<path d="{path}" fill="none" stroke="#e65100" stroke-width="1.4" stroke-linecap="round" />'
+        f'<text x="{mid[0]:.3f}" y="{mid[1]:.3f}" font-size="2.8" fill="#e65100" '
+        f'text-anchor="middle" dy="-1.5">{_xml_escape(label)}</text>'
+        f"</g>"
+    )
+
+
 def _panel_stats_svg(distortion: Optional[dict], x: float, y: float) -> str:
     if not distortion:
         return ""
@@ -322,8 +384,24 @@ def build_pattern_svg(
         panels_2d: `flatten_panel()` の戻り値に `panel_id` を加えた辞書の
             リスト。`flatten_failed=True` のパネルはスキップし、SVGには
             含めない(呼び出し側が別途警告表示することを想定)。
+            以下のキーを追加すると、パーツ単位のグループ化
+            (SPEC.md §3.12「2段階構成 (4c)」)が有効になる(省略時は
+            全パネルを単一グループとして扱う従来通りの出力):
+                - `part_id` (int): パーツID。同じ`part_id`のパネルは
+                  SVG上で「部位N」の見出し+凡例色でグループ化される。
+                - `part_label` (str): 見出しに使う表示名(省略時は
+                  "部位{part_id+1}")。
+                - `part_color_hex` (str): 凡例の色見本("#rrggbb")。
+                - `panel_no` (int): パーツ内のパネル番号(1始まり)。
+                  ラベルは「部位N-P{panel_no}」形式になる(省略時は
+                  `panel_id + 1`)。
+                - `attachment_mask` ((B,) bool ndarray): `boundary_loop_2d`
+                  と同じ順序・長さの真偽値配列。Trueの区間は蓋(取付口/
+                  詰め口)として太線+ラベルで強調される。
         seam_allowance_mm: 縫い代幅(mm)。
         label_prefix: パネル番号ラベルの接頭辞("P" → "P1", "P2", ...)。
+            パーツグループ化が有効な場合は「部位N-P1」形式になり、
+            この引数は無視される。
         model_name: 凡例に表示するモデル名(任意)。
         model_height_mm: 凡例に表示するモデル高さ(mm、任意)。
 
@@ -331,6 +409,7 @@ def build_pattern_svg(
         SVG文字列(viewBoxはmm単位、width/heightに `mm` 単位を明記)。
     """
     valid_panels = [p for p in panels_2d if not p.get("flatten_failed")]
+    has_parts = any(p.get("part_id") is not None for p in valid_panels)
 
     seams = _detect_seams(valid_panels)
     # パネルごとのシームID一覧(凡例テーブル用)
@@ -343,7 +422,12 @@ def build_pattern_svg(
     # バウンディングボックスサイズを求める。
     prepared = []
     for panel in valid_panels:
-        loop = _ensure_ccw(np.asarray(panel["boundary_loop_2d"], dtype=np.float64))
+        loop_raw = np.asarray(panel["boundary_loop_2d"], dtype=np.float64)
+        attachment_mask_raw = panel.get("attachment_mask")
+        if attachment_mask_raw is not None:
+            attachment_mask_raw = np.asarray(attachment_mask_raw, dtype=bool)
+        loop, attachment_mask = _ensure_ccw_with_mask(loop_raw, attachment_mask_raw)
+
         offset_loop = _offset_polygon(loop, seam_allowance_mm)
         bbox_seam = _polygon_bbox(offset_loop)
         width = bbox_seam[2] - bbox_seam[0]
@@ -351,7 +435,12 @@ def build_pattern_svg(
         prepared.append(
             {
                 "panel_id": panel["panel_id"],
+                "panel_no": panel.get("panel_no"),
+                "part_id": panel.get("part_id"),
+                "part_label": panel.get("part_label"),
+                "part_color_hex": panel.get("part_color_hex"),
                 "loop": loop,
+                "attachment_mask": attachment_mask,
                 "offset_loop": offset_loop,
                 "bbox_seam": bbox_seam,
                 "width": width,
@@ -364,6 +453,7 @@ def build_pattern_svg(
     offsets, total_width, total_height = _shelf_pack(boxes)
 
     body_parts: list[str] = []
+    part_legend: dict[int, dict] = {}
 
     for panel, (ox, oy) in zip(prepared, offsets):
         bx0, by0, _, _ = panel["bbox_seam"]
@@ -379,9 +469,21 @@ def build_pattern_svg(
         )
 
         panel_id = panel["panel_id"]
-        label = f"{label_prefix}{panel_id + 1}"
+        part_id = panel["part_id"]
+        if has_parts and part_id is not None:
+            part_label = panel.get("part_label") or f"部位{int(part_id) + 1}"
+            panel_no = panel.get("panel_no") or (panel_id + 1)
+            label = f"{part_label}-P{panel_no}"
+            part_legend.setdefault(
+                int(part_id), {"label": part_label, "color": panel.get("part_color_hex")}
+            )
+        else:
+            label = f"{label_prefix}{panel_id + 1}"
 
-        group_parts = [f'<g class="panel" data-panel-id="{panel_id}">']
+        group_attrs = f'data-panel-id="{panel_id}"'
+        if part_id is not None:
+            group_attrs += f' data-part-id="{part_id}"'
+        group_parts = [f'<g class="panel" {group_attrs}>']
         group_parts.append(
             f'<path d="{_points_to_path(offset_shifted)}" fill="none" '
             f'stroke="#455a64" stroke-width="0.4" stroke-dasharray="2,1.5" />'
@@ -396,7 +498,7 @@ def build_pattern_svg(
         label_y = bbox_shifted[1] + 5.0
         group_parts.append(
             f'<text x="{label_x:.3f}" y="{label_y:.3f}" font-size="5" '
-            f'font-weight="bold" text-anchor="middle" fill="#000000">{label}</text>'
+            f'font-weight="bold" text-anchor="middle" fill="#000000">{_xml_escape(label)}</text>'
         )
         group_parts.append(_panel_stats_svg(panel["distortion"], label_x, label_y + 4.5))
 
@@ -406,6 +508,13 @@ def build_pattern_svg(
                 f'<text x="{label_x:.3f}" y="{bbox_shifted[3] - 2.0:.3f}" font-size="2.6" '
                 f'text-anchor="middle" fill="#546e7a">seam: {seam_note}</text>'
             )
+
+        # 取付口(パーツの切断面/詰め口): 太線+ラベルで強調する
+        attachment_mask = panel["attachment_mask"]
+        if attachment_mask is not None and len(attachment_mask) == len(loop_shifted):
+            runs = _attachment_opening_runs(attachment_mask)
+            for run in runs:
+                group_parts.append(_attachment_opening_svg(loop_shifted, run, "取付口"))
 
         group_parts.append("</g>")
         panel["_render_shift"] = shift
@@ -459,7 +568,30 @@ def build_pattern_svg(
     legend_svg_parts.append("</g>")
     body_parts.append("".join(legend_svg_parts))
 
-    total_height_with_legend = legend_y + len(legend_lines) * 4.0 + 6.0
+    legend_bottom_y = legend_y + len(legend_lines) * 4.0
+
+    # パーツ凡例(部位名とビューアの色分けとの対応表、SPEC.md §3.12「2段階構成」)
+    if has_parts and part_legend:
+        part_legend_y = legend_bottom_y + 5.0
+        part_legend_svg = ['<g class="part-legend" font-size="3" fill="#212121">']
+        part_legend_svg.append(
+            f'<text x="{legend_x:.3f}" y="{part_legend_y:.3f}" font-weight="bold">パーツ対応表:</text>'
+        )
+        for row, (part_id, info) in enumerate(sorted(part_legend.items())):
+            row_y = part_legend_y + 4.0 + row * 4.0
+            color = info.get("color") or "#9e9e9e"
+            part_legend_svg.append(
+                f'<rect x="{legend_x:.3f}" y="{row_y - 2.6:.3f}" width="3" height="3" fill="{color}" '
+                f'stroke="#212121" stroke-width="0.2" />'
+            )
+            part_legend_svg.append(
+                f'<text x="{legend_x + 5.0:.3f}" y="{row_y:.3f}">{_xml_escape(info["label"])}</text>'
+            )
+        part_legend_svg.append("</g>")
+        body_parts.append("".join(part_legend_svg))
+        legend_bottom_y = part_legend_y + 4.0 + len(part_legend) * 4.0
+
+    total_height_with_legend = legend_bottom_y + 6.0
 
     svg = (
         f'<svg xmlns="{_SVG_NS}" width="{total_width:.3f}mm" height="{total_height_with_legend:.3f}mm" '

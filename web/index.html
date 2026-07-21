@@ -213,46 +213,135 @@
         <button type="button" id="pattern-toggle-btn" class="secondary-btn" disabled>
           ぬいぐるみ型紙を生成
         </button>
-        <button type="button" id="pattern-back-to-model-btn" class="secondary-btn" hidden>
-          モデル表示に戻す
-        </button>
+        <span id="pattern-view-switch" hidden>
+          <button type="button" class="pattern-view-btn active" data-view="model">モデル</button>
+          <button type="button" class="pattern-view-btn" data-view="parts">パーツ分け</button>
+          <button type="button" class="pattern-view-btn" data-view="panels">パネル分割</button>
+        </span>
       </div>
 
       <div id="pattern-panel" hidden>
-        <h3>ぬいぐるみ型紙(パネル分割+平坦化) <span class="sub-hint">Phase 4a+4b</span></h3>
+        <h3>ぬいぐるみ型紙(パーツ分解→パネル分割+平坦化) <span class="sub-hint">Phase 4c</span></h3>
         <p class="sub-hint">
-          モデルをパネルに分割し、色分けプレビューを表示します。
-          「型紙を生成」実行後、各パネルを平坦化して実寸SVG型紙(縫い代・合印・布目線付き)を
-          ダウンロードできます。
+          まずモデルを部位(パーツ)へ分解し、次に各パーツをパネルへ分割・平坦化して
+          実寸SVG型紙(縫い代・合印・布目線付き)をダウンロードできます。
         </p>
-        <label class="field">
-          <span>パネル数: <b id="pattern-n-panels-value">6</b></span>
-          <input type="range" id="pattern-n-panels" min="4" max="12" step="1" value="6" />
-        </label>
-        <label class="field checkbox">
-          <input type="checkbox" id="pattern-use-colors" checked />
-          <span>色境界に沿ってパネル分割する(頂点カラーがある場合)</span>
-        </label>
-        <label class="field">
-          <span>縫い代: <b id="pattern-seam-allowance-value">7</b> mm</span>
-          <input type="range" id="pattern-seam-allowance" min="1" max="30" step="0.5" value="7" />
-        </label>
-        <button type="button" id="pattern-run-btn" class="primary-btn">型紙を生成</button>
-        <div class="progress-error" id="pattern-error" hidden></div>
-        <div id="pattern-result" hidden>
-          <p class="sub-hint">
-            実パネル数: <b id="pattern-result-count">-</b>
-            (円盤位相OK: <b id="pattern-result-disk-ok">-</b> /
-            平坦化OK: <b id="pattern-result-flatten-ok">-</b>)
+
+        <!-- ステップ1: パーツ分解 -->
+        <div class="pattern-step" id="pattern-step1">
+          <h4>ステップ1: パーツ分解</h4>
+
+          <label class="field">
+            <span>パーツ数:</span>
+            <select id="pattern-n-parts">
+              <option value="0" selected>自動</option>
+              <option value="2">2</option>
+              <option value="3">3</option>
+              <option value="4">4</option>
+              <option value="5">5</option>
+              <option value="6">6</option>
+              <option value="7">7</option>
+              <option value="8">8</option>
+              <option value="9">9</option>
+              <option value="10">10</option>
+            </select>
+          </label>
+          <label class="field checkbox">
+            <input type="checkbox" id="pattern-use-image" checked />
+            <span>画像の色境界を使う</span>
+          </label>
+          <label class="field checkbox">
+            <input type="checkbox" id="pattern-use-llm" checked />
+            <span>AI(LLM)で部位を検出する</span>
+          </label>
+          <p class="hint" id="pattern-llm-unavailable-note" hidden>
+            この環境ではLLM誘導は利用できません(IMAGE3D_LLM_ENDPOINT未設定です)。
           </p>
-          <ul id="pattern-panel-list"></ul>
-          <div id="pattern-svg-actions">
-            <a id="pattern-svg-download-btn" class="secondary-btn" download>型紙SVGをダウンロード</a>
+
+          <label class="field checkbox">
+            <input type="checkbox" id="pattern-manual-mode" />
+            <span>手動でパーツ位置を指定する</span>
+          </label>
+
+          <div id="pattern-manual-seed-panel" hidden>
+            <p class="sub-hint">
+              ビューア上のモデルをクリックしてシード点を追加してください
+              (最大48点、パーツ数は2〜20)。同じ名前のシードは同一パーツに
+              統合されます(正面・背面に同名で打つと精度が上がります)。
+            </p>
+            <ul id="pattern-seed-list"></ul>
+            <button type="button" id="pattern-seed-clear-btn" class="secondary-btn">
+              シードをすべてクリア
+            </button>
+
+            <label class="field checkbox">
+              <input type="checkbox" id="pattern-propagate-back" checked />
+              <span>背面へ自動推定(反対側スキンに仮想シードを生成)</span>
+            </label>
+            <label class="field checkbox">
+              <input type="checkbox" id="pattern-planar-boundaries" checked />
+              <span>境界を平面に整える(誘導が弱い区間を平面フィットで補正)</span>
+            </label>
+
+            <datalist id="pattern-seed-name-suggestions">
+              <option value="頭"></option>
+              <option value="胴体"></option>
+              <option value="右腕"></option>
+              <option value="左腕"></option>
+              <option value="右脚"></option>
+              <option value="左脚"></option>
+              <option value="右耳"></option>
+              <option value="左耳"></option>
+              <option value="しっぽ"></option>
+            </datalist>
           </div>
-          <details id="pattern-svg-preview-details">
-            <summary>型紙SVGプレビュー</summary>
-            <img id="pattern-svg-preview" alt="型紙SVGプレビュー" />
-          </details>
+
+          <button type="button" id="pattern-parts-run-btn" class="primary-btn">パーツ分けを実行</button>
+          <div class="progress-error" id="pattern-parts-error" hidden></div>
+
+          <div id="pattern-parts-result" hidden>
+            <p class="sub-hint">
+              誘導方式: <b id="pattern-parts-guidance">-</b> /
+              パーツ数: <b id="pattern-parts-count">-</b>
+            </p>
+            <p class="sub-hint" id="pattern-parts-manual-info" hidden></p>
+            <ul id="pattern-parts-list"></ul>
+          </div>
+        </div>
+
+        <!-- ステップ2: パネル分割・平坦化・SVG出力 -->
+        <div class="pattern-step" id="pattern-step2">
+          <h4>ステップ2: パネル分割・型紙出力</h4>
+
+          <label class="field">
+            <span>パーツあたりパネル数: <b id="pattern-n-panels-value">4</b></span>
+            <input type="range" id="pattern-n-panels" min="2" max="6" step="1" value="4" />
+          </label>
+          <label class="field checkbox">
+            <input type="checkbox" id="pattern-use-colors" checked />
+            <span>色境界に沿ってパネル分割する(頂点カラーがある場合)</span>
+          </label>
+          <label class="field">
+            <span>縫い代: <b id="pattern-seam-allowance-value">7</b> mm</span>
+            <input type="range" id="pattern-seam-allowance" min="1" max="30" step="0.5" value="7" />
+          </label>
+          <button type="button" id="pattern-run-btn" class="primary-btn" disabled>型紙を生成</button>
+          <div class="progress-error" id="pattern-error" hidden></div>
+
+          <div id="pattern-result" hidden>
+            <p class="sub-hint">
+              実パネル数: <b id="pattern-result-count">-</b>
+              (平坦化OK: <b id="pattern-result-flatten-ok">-</b>)
+            </p>
+            <ul id="pattern-panel-list"></ul>
+            <div id="pattern-svg-actions">
+              <a id="pattern-svg-download-btn" class="secondary-btn" download>型紙SVGをダウンロード</a>
+            </div>
+            <details id="pattern-svg-preview-details">
+              <summary>型紙SVGプレビュー</summary>
+              <img id="pattern-svg-preview" alt="型紙SVGプレビュー" />
+            </details>
+          </div>
         </div>
       </div>
 

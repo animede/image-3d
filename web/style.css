@@ -108,6 +108,12 @@ html, body {
   display: flex;
   flex-direction: column;
   min-width: 0;
+  overflow-y: auto;
+  /* 型紙パネル展開でスクロールバーが出現/消失する際に幅がガタつくと、
+     その瞬間のビューア幅を基準にカメラを再フィットしてしまい、キャラの
+     見え方がズレる(直後のウィンドウリサイズで直ることから判明)。
+     スクロールバー分の幅を常に確保しておき、幅の変動自体を無くす。 */
+  scrollbar-gutter: stable;
 }
 
 .panel {
@@ -565,7 +571,7 @@ html, body {
 #viewer-container {
   flex: 1;
   position: relative;
-  min-height: 0;
+  min-height: 320px;
   background: radial-gradient(circle at 50% 40%, #1e222a 0%, #101216 100%);
 }
 
@@ -660,7 +666,8 @@ html, body {
   margin-left: 10px;
 }
 
-#pattern-result ul {
+#pattern-result ul,
+#pattern-parts-list {
   list-style: none;
   margin: 6px 0 0;
   padding: 0;
@@ -669,7 +676,8 @@ html, body {
   gap: 6px;
 }
 
-#pattern-result li {
+#pattern-result li,
+#pattern-parts-list li {
   background: var(--bg-3);
   border: 1px solid var(--border);
   border-radius: 10px;
@@ -678,6 +686,60 @@ html, body {
   display: inline-flex;
   align-items: center;
   gap: 5px;
+}
+
+/* 2ステップ化 (Phase 4c) */
+.pattern-step {
+  margin-top: 12px;
+  padding: 10px 12px;
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.pattern-step h4 {
+  margin: 0 0 6px;
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+#pattern-n-parts {
+  margin: 0 8px;
+  padding: 3px 6px;
+  background: var(--bg-3);
+  color: var(--text-0);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+}
+
+.pattern-part-group {
+  margin-top: 8px;
+}
+
+.pattern-part-heading {
+  margin: 4px 0 2px;
+  font-size: 12px;
+  font-weight: bold;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+#pattern-view-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+#pattern-view-switch[hidden] {
+  display: none;
+}
+
+.pattern-view-btn.active {
+  border-color: var(--accent);
+  color: var(--accent);
 }
 
 .pattern-panel-swatch {
@@ -719,4 +781,52 @@ html, body {
   background: #ffffff;
   border-radius: 6px;
   border: 1px solid var(--border);
+}
+
+/* --- 手動シード誘導 (guidance="manual") -------------------------------------- */
+#pattern-manual-seed-panel {
+  margin-top: 8px;
+  padding: 8px 10px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+#pattern-manual-seed-panel[hidden] {
+  display: none;
+}
+
+#pattern-seed-list {
+  list-style: none;
+  margin: 8px 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.pattern-seed-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 8px;
+}
+
+.pattern-seed-name-input {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg-1);
+  color: var(--text-0);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 3px 6px;
+  font-size: 12px;
+}
+
+.pattern-seed-remove-btn {
+  padding: 3px 8px;
+  font-size: 11px;
 }

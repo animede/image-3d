@@ -35,7 +35,22 @@ export class Viewer {
     // メッシュごとの元マテリアル・元頂点カラー属性を退避しておく (Map<mesh, {material, color}>)
     this._overhangBackup = new Map();
 
+    // 手動シードピッキング (パーツ分けの手動シード誘導、SPEC.md §3.12) の状態
+    this._seedPickingEnabled = false;
+    this._onSeedPick = null;
+    this._raycaster = new THREE.Raycaster();
+    this._seedMarkers = new Map(); // Map<id, THREE.Mesh>
+    this._seedMarkerGroup = new THREE.Group();
+    this._pointerDownPos = null;
+
+    // window の resize イベントだけでは、サイドパネルの開閉など
+    // ウィンドウサイズ自体は変わらないレイアウト変化(型紙パネル表示等)で
+    // ビューアコンテナの寸法だけが変わるケースを検知できず、レンダラーの
+    // アスペクト比が古いまま残って表示が縦横比崩れ(縦が潰れる)になる。
+    // ResizeObserver でコンテナ自身のサイズ変化を直接監視する。
     window.addEventListener("resize", () => this._onResize());
+    this._resizeObserver = new ResizeObserver(() => this._onResize());
+    this._resizeObserver.observe(this.canvas.parentElement);
     this._onResize();
     this._animate();
   }
@@ -71,9 +86,53 @@ export class Viewer {
     const parent = this.canvas.parentElement;
     const width = parent.clientWidth;
     const height = parent.clientHeight;
+    if (width <= 0 || height <= 0) return;
     this.renderer.setSize(width, height, false);
     this.camera.aspect = width / height;
     this.camera.updateProjectionMatrix();
+    // 型紙パネルの開閉などでビューア領域の縦横比が変わった際、カメラ距離を
+    // 据え置いたままアスペクトだけ更新すると、キャラクターの上下(または
+    // 左右)がフレーム外に切れて縦横比が崩れて見える。距離を現在の視線
+    // 方向を保ったまま新アスペクトに合わせて再計算し、常にモデル全体が
+    // 収まるようにする(ユーザーの回転操作は保持、ズームは再フィットされる)。
+    if (this.currentModel) {
+      this._refitDistanceToAspect(this.currentModel);
+    }
+    // スクロールバーの出現/消失など、この時点ではまだ確定していない
+    // 追加のレイアウト変化が1フレーム遅れて反映されることがある
+    // (`scrollbar-gutter: stable` で大半は防いでいるが保険として残す)。
+    // 次フレームでサイズが変わっていれば、静かに再測定・再フィットする。
+    requestAnimationFrame(() => {
+      const w2 = parent.clientWidth;
+      const h2 = parent.clientHeight;
+      if (w2 > 0 && h2 > 0 && (w2 !== width || h2 !== height)) {
+        this._onResize();
+      }
+    });
+  }
+
+  _refitDistanceToAspect(object3d) {
+    const box = new THREE.Box3().setFromObject(object3d);
+    const size = new THREE.Vector3();
+    box.getSize(size);
+    const center = new THREE.Vector3();
+    box.getCenter(center);
+    const radius = Math.max(size.length() / 2, 1e-3);
+
+    const vFov = THREE.MathUtils.degToRad(this.camera.fov);
+    const hFov = 2 * Math.atan(Math.tan(vFov / 2) * this.camera.aspect);
+    const dist = Math.max(radius / Math.sin(vFov / 2), radius / Math.sin(hFov / 2)) * 1.15;
+
+    let dir = this.camera.position.clone().sub(this.controls.target);
+    if (dir.lengthSq() < 1e-9) dir.set(0.7, 0.6, 0.9);
+    dir.normalize();
+
+    this.camera.position.copy(center).addScaledVector(dir, dist);
+    this.controls.target.copy(center);
+    this.camera.near = Math.max(dist / 100, 0.01);
+    this.camera.far = dist * 50;
+    this.camera.updateProjectionMatrix();
+    this.controls.update();
   }
 
   _animate = () => {
@@ -110,12 +169,16 @@ export class Viewer {
 
     this._overhangBackup.clear();
     this.overhangMode = false;
+    this.clearSeedMarkers();
 
     // Three.jsのY-up座標系に合わせ、生成メッシュ(Z-up, 床=z0)をX軸-90度回転して
     // Y軸を高さ方向にする。
     const wrapper = new THREE.Group();
     wrapper.add(object3d);
     wrapper.rotation.x = -Math.PI / 2;
+    // シードマーカーはラッパー内に置くことで、メッシュと同じZ-upローカル座標
+    // (=サーバに渡す座標系)をそのまま position に使える。
+    wrapper.add(this._seedMarkerGroup);
 
     this.currentModel = wrapper;
     this.setWireframe(this.wireframe);
@@ -159,6 +222,7 @@ export class Viewer {
     }
     this._overhangBackup.clear();
     this.overhangMode = false;
+    this._seedMarkers.clear();
   }
 
   // --- オーバーハングヒートマップ (FR-12) --------------------------------------
@@ -322,5 +386,120 @@ export class Viewer {
       mesh.material = backup.material;
     });
     this._overhangBackup.clear();
+  }
+
+  // --- 手動シードピッキング (パーツ分けの手動シード誘導、SPEC.md §3.12) -------
+  //
+  // モデルはZ-up(GLB読込直後)をラッパーGroupで-90度X回転してY-up表示している
+  // (`_replaceModel` 参照)。ピック交点はワールド座標→ラッパーのローカル座標
+  // (=元のZ-up・mm単位のメッシュ座標系)へ`worldToLocal`で逆変換して呼び出し側へ
+  // 渡す(サーバ側のprepared meshと同一座標系。`prepare_mesh`は平行移動・
+  // スケールを行わないため、model.glbの座標をそのまま使ってよい)。
+
+  enableSeedPicking(onPick) {
+    this._onSeedPick = onPick;
+    if (this._seedPickingEnabled) return;
+    this._seedPickingEnabled = true;
+    this.canvas.addEventListener("pointerdown", this._onSeedPointerDown);
+    this.canvas.addEventListener("pointerup", this._onSeedPointerUp);
+  }
+
+  disableSeedPicking() {
+    if (!this._seedPickingEnabled) return;
+    this._seedPickingEnabled = false;
+    this._onSeedPick = null;
+    this.canvas.removeEventListener("pointerdown", this._onSeedPointerDown);
+    this.canvas.removeEventListener("pointerup", this._onSeedPointerUp);
+  }
+
+  _onSeedPointerDown = (event) => {
+    this._pointerDownPos = { x: event.clientX, y: event.clientY, t: performance.now() };
+  };
+
+  _onSeedPointerUp = (event) => {
+    if (!this._pointerDownPos) return;
+    const dx = event.clientX - this._pointerDownPos.x;
+    const dy = event.clientY - this._pointerDownPos.y;
+    const dt = performance.now() - this._pointerDownPos.t;
+    this._pointerDownPos = null;
+    // OrbitControlsのドラッグ回転とクリックを区別する。実際のマウス/
+    // トラックパッド操作では静止クリックのつもりでも数px動くことが多く、
+    // 距離だけで5px閾値を取ると実機で「クリックしても反応しない」体感に
+    // なる(2026-07-16のユーザー報告で判明)。距離が緩め(12px)の閾値内、
+    // または素早い操作(300ms未満、ドラッグ回転は通常もっと長く続く)なら
+    // クリックとして扱う。
+    if (Math.hypot(dx, dy) >= 12 && dt >= 300) return;
+    this._pickSeedAt(event);
+  };
+
+  _pickSeedAt(event) {
+    if (!this.currentModel || !this._onSeedPick) return;
+
+    const rect = this.canvas.getBoundingClientRect();
+    const ndc = new THREE.Vector2(
+      ((event.clientX - rect.left) / rect.width) * 2 - 1,
+      -((event.clientY - rect.top) / rect.height) * 2 + 1
+    );
+    this._raycaster.setFromCamera(ndc, this.camera);
+
+    const targets = [];
+    this.currentModel.traverse((child) => {
+      if (child.isMesh && child.geometry) targets.push(child);
+    });
+    const hits = this._raycaster.intersectObjects(targets, false);
+    if (hits.length === 0) return;
+
+    const hit = hits[0];
+    // ワールド座標 → ラッパーGroupのローカル座標(元のZ-up・mm座標系)へ変換。
+    this.currentModel.updateMatrixWorld(true);
+    const localPos = this.currentModel.worldToLocal(hit.point.clone());
+
+    this._onSeedPick({ x: localPos.x, y: localPos.y, z: localPos.z });
+  }
+
+  addSeedMarker(id, localPos, color = 0xffffff) {
+    this.removeSeedMarker(id);
+    if (!this.currentModel) return;
+
+    // マーカー半径はモデルサイズの目安(バウンディングボックス最大辺の1.5%程度、
+    // 最小2mm)にする。
+    this.currentModel.updateMatrixWorld(true);
+    const box = new THREE.Box3().setFromObject(this.currentModel);
+    const size = new THREE.Vector3();
+    box.getSize(size);
+    const maxDim = Math.max(size.x, size.y, size.z, 1);
+    const radius = Math.max(maxDim * 0.015, 2);
+
+    const geom = new THREE.SphereGeometry(radius, 16, 12);
+    const mat = new THREE.MeshBasicMaterial({ color });
+    const marker = new THREE.Mesh(geom, mat);
+    marker.position.set(localPos.x, localPos.y, localPos.z);
+    marker.raycast = () => {}; // Raycast対象から除外(シード自身がピックの邪魔をしないように)
+
+    this._seedMarkerGroup.add(marker);
+    this._seedMarkers.set(id, marker);
+  }
+
+  removeSeedMarker(id) {
+    const marker = this._seedMarkers.get(id);
+    if (!marker) return;
+    this._seedMarkerGroup.remove(marker);
+    marker.geometry.dispose();
+    marker.material.dispose();
+    this._seedMarkers.delete(id);
+  }
+
+  // マーカーの色だけを変更する(部位名の変更で同名グループの色が変わったとき、
+  // ジオメトリを作り直さずに反映するため)。
+  setSeedMarkerColor(id, color) {
+    const marker = this._seedMarkers.get(id);
+    if (!marker) return;
+    marker.material.color.set(color);
+  }
+
+  clearSeedMarkers() {
+    for (const id of Array.from(this._seedMarkers.keys())) {
+      this.removeSeedMarker(id);
+    }
   }
 }

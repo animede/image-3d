@@ -16,7 +16,7 @@ WEB_DIR = Path(os.environ.get("IMAGE3D_WEB_DIR", BASE_DIR / "web"))
 
 # --- サーバ ---------------------------------------------------------------
 HOST = os.environ.get("IMAGE3D_HOST", "127.0.0.1")
-PORT = int(os.environ.get("IMAGE3D_PORT", "8000"))
+PORT = int(os.environ.get("IMAGE3D_PORT", "8100"))
 
 # --- ジェネレータ選択 (SPEC.md §3.3) --------------------------------------
 # "auto": GPU + hy3dgen が利用可能なら hunyuan3d、なければ mock に自動解決
@@ -97,6 +97,14 @@ if PIXAL3D_RASTERIZER not in _PIXAL3D_RASTERIZER_CHOICES:
         f"IMAGE3D_PIXAL3D_RASTERIZER は {sorted(_PIXAL3D_RASTERIZER_CHOICES)} のいずれかを"
         f"指定してください (got: {PIXAL3D_RASTERIZER!r})。"
     )
+
+
+# --- マルチモーダルLLMによるパーツ検出 (SPEC.md §3.12 / FR-13 第3層誘導) --------
+# OpenAI互換チャットAPI(例: llama.cpp + vision対応モデル)のベースURL。
+# 既定は空文字列(=無効)。公開リポジトリのためユーザー固有のIPをデフォルトに
+# 設定しない(ユーザー環境では例えば IMAGE3D_LLM_ENDPOINT=http://<host>:<port> を指定)。
+IMAGE3D_LLM_ENDPOINT = os.environ.get("IMAGE3D_LLM_ENDPOINT", "")
+IMAGE3D_LLM_TIMEOUT = float(os.environ.get("IMAGE3D_LLM_TIMEOUT", "60"))
 
 
 def ensure_dirs() -> None:

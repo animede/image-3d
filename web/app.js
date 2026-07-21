@@ -58,8 +58,30 @@ const presetSelect = document.getElementById("preset-select");
 const exportButtons = document.querySelectorAll(".export-btn");
 
 const patternToggleBtn = document.getElementById("pattern-toggle-btn");
-const patternBackToModelBtn = document.getElementById("pattern-back-to-model-btn");
+const patternViewSwitch = document.getElementById("pattern-view-switch");
+const patternViewBtns = document.querySelectorAll(".pattern-view-btn");
 const patternPanel = document.getElementById("pattern-panel");
+
+// ステップ1: パーツ分解
+const patternNPartsSelect = document.getElementById("pattern-n-parts");
+const patternUseImageCheckbox = document.getElementById("pattern-use-image");
+const patternUseLlmCheckbox = document.getElementById("pattern-use-llm");
+const patternLlmUnavailableNote = document.getElementById("pattern-llm-unavailable-note");
+const patternManualModeCheckbox = document.getElementById("pattern-manual-mode");
+const patternManualSeedPanel = document.getElementById("pattern-manual-seed-panel");
+const patternSeedList = document.getElementById("pattern-seed-list");
+const patternSeedClearBtn = document.getElementById("pattern-seed-clear-btn");
+const patternPropagateBackCheckbox = document.getElementById("pattern-propagate-back");
+const patternPlanarBoundariesCheckbox = document.getElementById("pattern-planar-boundaries");
+const patternPartsRunBtn = document.getElementById("pattern-parts-run-btn");
+const patternPartsError = document.getElementById("pattern-parts-error");
+const patternPartsResult = document.getElementById("pattern-parts-result");
+const patternPartsGuidance = document.getElementById("pattern-parts-guidance");
+const patternPartsCount = document.getElementById("pattern-parts-count");
+const patternPartsManualInfo = document.getElementById("pattern-parts-manual-info");
+const patternPartsList = document.getElementById("pattern-parts-list");
+
+// ステップ2: パネル分割・SVG出力
 const patternNPanelsInput = document.getElementById("pattern-n-panels");
 const patternNPanelsValue = document.getElementById("pattern-n-panels-value");
 const patternUseColorsCheckbox = document.getElementById("pattern-use-colors");
@@ -69,18 +91,24 @@ const patternRunBtn = document.getElementById("pattern-run-btn");
 const patternError = document.getElementById("pattern-error");
 const patternResult = document.getElementById("pattern-result");
 const patternResultCount = document.getElementById("pattern-result-count");
-const patternResultDiskOk = document.getElementById("pattern-result-disk-ok");
 const patternResultFlattenOk = document.getElementById("pattern-result-flatten-ok");
 const patternPanelList = document.getElementById("pattern-panel-list");
 const patternSvgDownloadBtn = document.getElementById("pattern-svg-download-btn");
 const patternSvgPreview = document.getElementById("pattern-svg-preview");
 
-// server/pattern/preview.py の _PALETTE_HEX と同じ並び(隣接パネルが
-//似た色にならないよう色相を大きく飛ばした固定パレット)。
+// server/pattern/preview.py の PALETTE_HEX と同じ並び(隣接パネルが
+// 似た色にならないよう色相を大きく飛ばした固定パレット、20色)。
 const PATTERN_PALETTE_HEX = [
   "#e6194b", "#3cb44b", "#4363d8", "#f58231",
   "#911eb4", "#42d4f4", "#f032e6", "#bfef45",
   "#fabed4", "#469990", "#9a6324", "#ffe119",
+  "#dcbeff", "#aaffc3", "#ffd8b1", "#fffac8",
+  "#a9a9a9", "#808000", "#800000", "#000075",
+];
+
+// 手動シードの名前入力欄の候補(datalistと同じ並び)
+const PATTERN_SEED_NAME_SUGGESTIONS = [
+  "頭", "胴体", "右腕", "左腕", "右脚", "左脚", "右耳", "左耳", "しっぽ",
 ];
 
 const STATUS_LABELS = {
@@ -103,8 +131,19 @@ const STATUS_PROGRESS = {
 
 let selectedFile = null;
 let currentJobId = null;
-let showingPatternPreview = false;
 let pollTimer = null;
+
+// 型紙(Phase 4c): 現在ビューアに表示中のプレビュー種別
+// ("model" | "parts" | "panels")
+let patternCurrentView = "model";
+// 手動シード誘導の状態管理。各要素 {id, x, y, z, name}
+let manualSeeds = [];
+let manualSeedNextId = 1;
+// パーツ分解(ステップ1)が完了しているか(ステップ2の有効化に使う)
+let patternPartsCompleted = false;
+// LLM誘導が環境的に使えない(/api/health の llm_parts_available=false)場合、
+// 手動モードのON/OFFに関わらずチェックボックスは常に無効のままにする。
+let patternLlmForceDisabled = false;
 
 // 追加ビュー(back/left/right)の選択中File(未選択はnull)
 const extraViewFiles = { back: null, left: null, right: null };
@@ -334,6 +373,8 @@ colorModeCheckbox.addEventListener("change", () => {
 // /api/health の texgen_available=false ならチェックボックスを無効化し、
 // 「この環境では利用できません」を表示する(フォールバック、3c-3)。
 // あわせて使用中ジェネレータをヘッダに表示し、mock時は警告バナーを出す。
+// 型紙のLLM誘導 (llm_parts_available) が使えない場合はチェックボックスも
+// 無効化する(SPEC.md §3.12 第3層誘導)。
 async function checkHealth() {
   try {
     const res = await fetch("/api/health");
@@ -354,6 +395,12 @@ async function checkHealth() {
     // として "Built with DINOv3" の表示が求められている(README「ライセンス」節参照)。
     if (data.generator === "pixal3d") {
       document.getElementById("dinov3-credit").hidden = false;
+    }
+    if (!data.llm_parts_available) {
+      patternLlmForceDisabled = true;
+      patternUseLlmCheckbox.checked = false;
+      patternUseLlmCheckbox.disabled = true;
+      patternLlmUnavailableNote.hidden = false;
     }
   } catch (err) {
     console.error(err);
@@ -524,13 +571,20 @@ async function loadJobIntoViewer(job) {
   updateModelInfo(job.stats);
   exportButtons.forEach((btn) => (btn.disabled = false));
 
-  // 型紙(Phase 4a): 新しいジョブに切り替わったら状態をリセットする
+  // 型紙(Phase 4a〜4c): 新しいジョブに切り替わったら状態をリセットする
   patternToggleBtn.disabled = false;
   patternPanel.hidden = true;
-  patternBackToModelBtn.hidden = true;
+  patternViewSwitch.hidden = true;
+  setPatternView("model");
+  patternPartsCompleted = false;
+  patternPartsResult.hidden = true;
+  patternPartsError.hidden = true;
   patternResult.hidden = true;
   patternError.hidden = true;
-  showingPatternPreview = false;
+  patternRunBtn.disabled = true;
+  patternManualModeCheckbox.checked = false;
+  setManualMode(false);
+  clearManualSeeds();
 }
 
 function updateModelInfo(stats) {
@@ -611,17 +665,302 @@ exportButtons.forEach((btn) => {
   });
 });
 
-// --- ぬいぐるみ型紙生成 (SPEC.md §3.12 / FR-13, Phase 4a+4b) ----------------
+// --- ぬいぐるみ型紙生成 (SPEC.md §3.12 / FR-13, Phase 4a〜4c) ----------------
+//
+// 2段階構成:
+//   ステップ1 POST /api/jobs/{id}/pattern/parts — パーツ自動分解
+//     (誘導方式は 手動シード > LLM > 画像色領域 > ジオメトリ の優先順位)
+//   ステップ2 POST /api/jobs/{id}/pattern       — パーツ単位のパネル分割→
+//     平坦化→SVG出力(ステップ1が未実行なら内部で自動実行される)
+
+patternToggleBtn.addEventListener("click", () => {
+  patternPanel.hidden = !patternPanel.hidden;
+  patternViewSwitch.hidden = patternPanel.hidden;
+});
+
+// --- ビューア表示切替(モデル / パーツ分け / パネル分割) ---------------------
+patternViewBtns.forEach((btn) => {
+  btn.addEventListener("click", () => setPatternView(btn.dataset.view));
+});
+
+async function setPatternView(view) {
+  patternCurrentView = view;
+  patternViewBtns.forEach((btn) => btn.classList.toggle("active", btn.dataset.view === view));
+  if (!currentJobId) return;
+
+  let url;
+  if (view === "parts") {
+    url = `/api/jobs/${currentJobId}/pattern_parts_preview.glb?t=${Date.now()}`;
+  } else if (view === "panels") {
+    url = `/api/jobs/${currentJobId}/pattern_preview.glb?t=${Date.now()}`;
+  } else {
+    url = `/api/jobs/${currentJobId}/model.glb?t=${Date.now()}`;
+  }
+
+  try {
+    await viewer.loadGLB(url);
+    viewerPlaceholder.hidden = true;
+  } catch (err) {
+    console.error(`Failed to load ${view} preview GLB`, err);
+  }
+
+  // 手動シードのピッキングはモデル表示中のみ有効(パーツ/パネルプレビューは
+  // 別メッシュのため座標系が一致しない可能性があるうえ、意味的にも不要)。
+  if (patternManualModeCheckbox.checked && view === "model") {
+    viewer.enableSeedPicking(onSeedPick);
+  } else {
+    viewer.disableSeedPicking();
+  }
+}
+
+// --- ステップ1: パーツ数/画像/LLM誘導のUI -----------------------------------
+patternManualModeCheckbox.addEventListener("change", () => {
+  setManualMode(patternManualModeCheckbox.checked);
+});
+
+function setManualMode(enabled) {
+  patternManualSeedPanel.hidden = !enabled;
+  patternNPartsSelect.disabled = enabled;
+  patternUseImageCheckbox.disabled = enabled;
+  patternUseLlmCheckbox.disabled = enabled || patternLlmForceDisabled;
+
+  if (enabled) {
+    // 手動シード指定はビューア上のクリックで行うため、表示を強制的に
+    // 「モデル」にしてシードピッキングを有効化する。
+    setPatternView("model");
+    viewer.enableSeedPicking(onSeedPick);
+  } else {
+    viewer.disableSeedPicking();
+  }
+  updatePartsRunBtnState();
+}
+
+// --- 手動シード管理 -----------------------------------------------------------
+function onSeedPick(localPos) {
+  const seed = {
+    id: manualSeedNextId++,
+    x: localPos.x,
+    y: localPos.y,
+    z: localPos.z,
+    name: "",
+  };
+  manualSeeds.push(seed);
+  renderManualSeeds();
+}
+
+// シードの色分け: 同じ名前(トリム後、空文字は個別扱い)ごとにグループ化し、
+// グループの初出順でパレットを巡回させる。
+function computeSeedColors() {
+  const groupKeyOf = (s) => (s.name && s.name.trim() ? s.name.trim() : `__unnamed_${s.id}`);
+  const order = [];
+  for (const s of manualSeeds) {
+    const key = groupKeyOf(s);
+    if (!order.includes(key)) order.push(key);
+  }
+  const colorByKey = new Map();
+  order.forEach((key, idx) => {
+    colorByKey.set(key, PATTERN_PALETTE_HEX[idx % PATTERN_PALETTE_HEX.length]);
+  });
+  const result = new Map();
+  for (const s of manualSeeds) {
+    result.set(s.id, colorByKey.get(groupKeyOf(s)));
+  }
+  return result;
+}
+
+function renderManualSeeds() {
+  const colors = computeSeedColors();
+
+  patternSeedList.innerHTML = "";
+  for (const seed of manualSeeds) {
+    const li = document.createElement("li");
+    li.className = "pattern-seed-item";
+
+    const swatch = document.createElement("span");
+    swatch.className = "pattern-panel-swatch";
+    swatch.style.background = colors.get(seed.id);
+
+    const nameInput = document.createElement("input");
+    nameInput.type = "text";
+    nameInput.className = "pattern-seed-name-input";
+    nameInput.value = seed.name;
+    nameInput.placeholder = "部位名(例: 頭)";
+    nameInput.setAttribute("list", "pattern-seed-name-suggestions");
+    nameInput.addEventListener("input", () => {
+      seed.name = nameInput.value;
+      renderManualSeeds();
+    });
+
+    const removeBtn = document.createElement("button");
+    removeBtn.type = "button";
+    removeBtn.className = "secondary-btn pattern-seed-remove-btn";
+    removeBtn.textContent = "削除";
+    removeBtn.addEventListener("click", () => {
+      manualSeeds = manualSeeds.filter((s) => s.id !== seed.id);
+      viewer.removeSeedMarker(seed.id);
+      renderManualSeeds();
+    });
+
+    li.appendChild(swatch);
+    li.appendChild(nameInput);
+    li.appendChild(removeBtn);
+    patternSeedList.appendChild(li);
+
+    const colorInt = Number.parseInt(colors.get(seed.id).slice(1), 16);
+    if (viewer._seedMarkers && viewer._seedMarkers.has(seed.id)) {
+      viewer.setSeedMarkerColor(seed.id, colorInt);
+    } else {
+      viewer.addSeedMarker(seed.id, seed, colorInt);
+    }
+  }
+
+  updatePartsRunBtnState();
+}
+
+patternSeedClearBtn.addEventListener("click", () => {
+  clearManualSeeds();
+});
+
+function clearManualSeeds() {
+  manualSeeds = [];
+  patternSeedList.innerHTML = "";
+  viewer.clearSeedMarkers();
+  updatePartsRunBtnState();
+  // パーツ分け実行後はビューアが「パーツ分け」表示に切り替わり、それに伴い
+  // シードピッキングも無効化されている(setPatternView参照)。クリア後に
+  // 再度クリックで指定し直せるよう、手動モード中は「モデル」表示へ戻して
+  // ピッキングを復帰させる(戻さないと「クリアしたのに再指定できない」状態になる)。
+  if (patternManualModeCheckbox.checked) {
+    setPatternView("model");
+  }
+}
+
+function updatePartsRunBtnState() {
+  if (!patternManualModeCheckbox.checked) {
+    patternPartsRunBtn.disabled = false;
+    return;
+  }
+  const total = manualSeeds.length;
+  // 名前未入力のシードは server/main.py 側で `part_{index+1}` という
+  // (インデックス由来で必ずユニークな)名前が自動で振られ、1シード=1パーツ
+  // として扱われる。ボタンの有効化判定もこれに合わせて未入力を許容する
+  // (全シードへの命名必須にすると、命名前にクリックしただけでボタンが
+  // 押せなくなり「常に禁止」に見えるバグになっていた)。
+  const effectiveNames = manualSeeds.map((s, i) => s.name.trim() || `part_${i + 1}`);
+  const uniqueNames = new Set(effectiveNames);
+  patternPartsRunBtn.disabled = !(
+    total >= 2 &&
+    total <= 48 &&
+    uniqueNames.size >= 2 &&
+    uniqueNames.size <= 20
+  );
+}
+
+// --- ステップ1実行: パーツ分けを実行 -----------------------------------------
+patternPartsRunBtn.addEventListener("click", async () => {
+  if (!currentJobId) return;
+
+  patternPartsRunBtn.disabled = true;
+  patternPartsError.hidden = true;
+  patternPartsResult.hidden = true;
+
+  try {
+    const body = {};
+    if (patternManualModeCheckbox.checked) {
+      body.seeds = manualSeeds.map((s) => ({ x: s.x, y: s.y, z: s.z, name: s.name.trim() }));
+      body.propagate_back = patternPropagateBackCheckbox.checked;
+      body.planar_boundaries = patternPlanarBoundariesCheckbox.checked;
+    } else {
+      body.n_parts = Number(patternNPartsSelect.value);
+      body.use_image = patternUseImageCheckbox.checked;
+      body.use_llm = patternUseLlmCheckbox.checked;
+    }
+
+    const res = await fetch(`/api/jobs/${currentJobId}/pattern/parts`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({}));
+      throw new Error(errBody.detail || `パーツ分けに失敗しました(status=${res.status})`);
+    }
+
+    const data = await res.json();
+    renderPatternPartsResult(data);
+
+    await viewer.loadGLB(`/api/jobs/${currentJobId}/pattern_parts_preview.glb?t=${Date.now()}`);
+    viewerPlaceholder.hidden = true;
+    setPatternView("parts");
+    viewer.disableSeedPicking();
+
+    patternPartsCompleted = true;
+    patternRunBtn.disabled = false;
+  } catch (err) {
+    console.error(err);
+    patternPartsError.textContent = err.message || String(err);
+    patternPartsError.hidden = false;
+  } finally {
+    updatePartsRunBtnState();
+  }
+});
+
+const GUIDANCE_LABELS_JA = {
+  manual: "手動シード",
+  llm: "AI(LLM)検出",
+  color: "画像の色境界",
+  geometry: "ジオメトリのみ",
+};
+
+function renderPatternPartsResult(data) {
+  patternPartsGuidance.textContent = GUIDANCE_LABELS_JA[data.guidance] || data.guidance;
+
+  if (data.guidance === "manual") {
+    patternPartsCount.textContent = `${data.n_parts_actual} (指定: ${data.n_parts_requested})`;
+    const infoParts = [];
+    infoParts.push(`背面仮想シード${data.n_virtual_seeds}個`);
+    if (Array.isArray(data.planar_fit) && data.planar_fit.length > 0) {
+      const applied = data.planar_fit.filter((p) => p.applied).length;
+      infoParts.push(`境界平面化: ${applied}/${data.planar_fit.length}ペア適用`);
+    }
+    patternPartsManualInfo.textContent = infoParts.join(" / ");
+    patternPartsManualInfo.hidden = false;
+  } else {
+    const auto = data.n_parts_requested === 0 ? "自動" : String(data.n_parts_requested);
+    patternPartsCount.textContent = `${data.n_parts_actual} (要求: ${auto})`;
+    patternPartsManualInfo.hidden = true;
+  }
+
+  patternPartsList.innerHTML = "";
+  const totalFaces = data.parts.reduce((sum, p) => sum + p.n_faces, 0) || 1;
+  data.parts.forEach((part) => {
+    const li = document.createElement("li");
+
+    const swatch = document.createElement("span");
+    swatch.className = "pattern-panel-swatch";
+    swatch.style.background = PATTERN_PALETTE_HEX[part.part_id % PATTERN_PALETTE_HEX.length];
+
+    const label = document.createElement("span");
+    const nameLabel = part.name ? `${part.name}` : `部位${part.part_id + 1}`;
+    const faceRatio = ((part.n_faces / totalFaces) * 100).toFixed(0);
+    label.textContent = `${nameLabel}: ${part.n_faces}面 (${faceRatio}%)`;
+
+    li.appendChild(swatch);
+    li.appendChild(label);
+    patternPartsList.appendChild(li);
+  });
+
+  patternPartsResult.hidden = false;
+}
+
+// --- ステップ2: パネル分割・平坦化・SVG出力 ----------------------------------
 patternNPanelsInput.addEventListener("input", () => {
   patternNPanelsValue.textContent = patternNPanelsInput.value;
 });
 
 patternSeamAllowanceInput.addEventListener("input", () => {
   patternSeamAllowanceValue.textContent = patternSeamAllowanceInput.value;
-});
-
-patternToggleBtn.addEventListener("click", () => {
-  patternPanel.hidden = !patternPanel.hidden;
 });
 
 patternRunBtn.addEventListener("click", async () => {
@@ -652,8 +991,7 @@ patternRunBtn.addEventListener("click", async () => {
 
     await viewer.loadGLB(`/api/jobs/${currentJobId}/pattern_preview.glb?t=${Date.now()}`);
     viewerPlaceholder.hidden = true;
-    showingPatternPreview = true;
-    patternBackToModelBtn.hidden = false;
+    setPatternView("panels");
   } catch (err) {
     console.error(err);
     patternError.textContent = err.message || String(err);
@@ -663,51 +1001,39 @@ patternRunBtn.addEventListener("click", async () => {
   }
 });
 
-patternBackToModelBtn.addEventListener("click", async () => {
-  if (!currentJobId) return;
-  try {
-    await viewer.loadGLB(`/api/jobs/${currentJobId}/model.glb?t=${Date.now()}`);
-    showingPatternPreview = false;
-    patternBackToModelBtn.hidden = true;
-  } catch (err) {
-    console.error("Failed to reload model GLB", err);
-  }
-});
-
 function renderPatternResult(data) {
-  patternResultCount.textContent = `${data.n_panels_actual} (要求: ${data.n_panels_requested})`;
-  const diskOkCount = data.panels.filter((p) => p.disk_topology).length;
-  patternResultDiskOk.textContent = `${diskOkCount} / ${data.panels.length}`;
-  const flattenOkCount = data.panels.filter((p) => !p.flatten_failed).length;
-  patternResultFlattenOk.textContent = `${flattenOkCount} / ${data.panels.length}`;
+  patternResultCount.textContent = `${data.n_panels_total} (要求上限: ${data.n_panels_max_per_part}/パーツ)`;
+  patternResultFlattenOk.textContent = `${data.n_panels_flattened} / ${data.n_panels_total}`;
 
   patternPanelList.innerHTML = "";
-  data.panels.forEach((panel) => {
-    const li = document.createElement("li");
-    if (!panel.disk_topology || panel.flatten_failed) li.classList.add("pattern-panel-warn");
+  data.parts.forEach((part) => {
+    part.panels.forEach((panel) => {
+      const li = document.createElement("li");
+      if (!panel.disk_topology || panel.flatten_failed) li.classList.add("pattern-panel-warn");
 
-    const swatch = document.createElement("span");
-    swatch.className = "pattern-panel-swatch";
-    swatch.style.background = PATTERN_PALETTE_HEX[panel.panel_id % PATTERN_PALETTE_HEX.length];
+      const swatch = document.createElement("span");
+      swatch.className = "pattern-panel-swatch";
+      swatch.style.background = part.color_hex;
 
-    const label = document.createElement("span");
-    const areaCm2 = (panel.area_mm2 / 100).toFixed(1);
-    const topologyNote = panel.disk_topology ? "" : " ※穴あり";
+      const label = document.createElement("span");
+      const areaCm2 = (panel.area_mm2 / 100).toFixed(1);
+      const topologyNote = panel.disk_topology ? "" : " ※穴あり";
 
-    let distortionNote = "";
-    if (panel.flatten_failed) {
-      distortionNote = " ※平坦化失敗";
-    } else if (panel.distortion) {
-      const over10pct = panel.distortion.edge_length_over_10pct_fraction * 100;
-      distortionNote = ` / 辺長歪み±10%超: ${over10pct.toFixed(0)}%`;
-      if (over10pct > 20) li.classList.add("pattern-panel-warn");
-    }
+      let distortionNote = "";
+      if (panel.flatten_failed) {
+        distortionNote = " ※平坦化失敗";
+      } else if (panel.distortion) {
+        const over10pct = panel.distortion.edge_length_over_10pct_fraction * 100;
+        distortionNote = ` / 辺長歪み±10%超: ${over10pct.toFixed(0)}%`;
+        if (over10pct > 20) li.classList.add("pattern-panel-warn");
+      }
 
-    label.textContent = `#${panel.panel_id}: ${panel.n_faces}面 / ${areaCm2}cm²${topologyNote}${distortionNote}`;
+      label.textContent = `${part.part_label} #${panel.panel_no}: ${panel.n_faces}面 / ${areaCm2}cm²${topologyNote}${distortionNote}`;
 
-    li.appendChild(swatch);
-    li.appendChild(label);
-    patternPanelList.appendChild(li);
+      li.appendChild(swatch);
+      li.appendChild(label);
+      patternPanelList.appendChild(li);
+    });
   });
 
   const svgUrl = `/api/jobs/${currentJobId}/pattern.svg?t=${Date.now()}`;

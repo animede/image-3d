@@ -14,6 +14,12 @@
       "port": 8021
     },
     {
+      "name": "image3d-server-frontend-check",
+      "runtimeExecutable": "env",
+      "runtimeArgs": ["IMAGE3D_GENERATOR=mock", ".venv/bin/uvicorn", "server.main:app", "--host", "127.0.0.1", "--port", "8099"],
+      "port": 8099
+    },
+    {
       "name": "image3d-server-pixal3d",
       "runtimeExecutable": "env",
       "runtimeArgs": [

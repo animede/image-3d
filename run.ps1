@@ -33,7 +33,7 @@ if (-not $env:IMAGE3D_HOST) {
     $env:IMAGE3D_HOST = "127.0.0.1"
 }
 if (-not $env:IMAGE3D_PORT) {
-    $env:IMAGE3D_PORT = "8000"
+    $env:IMAGE3D_PORT = "8100"
 }
 
 & $Uvicorn server.main:app --host $env:IMAGE3D_HOST --port $env:IMAGE3D_PORT @args

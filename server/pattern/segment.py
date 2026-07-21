@@ -427,8 +427,22 @@ def _absorb_enclosed_holes(
             continue
         total_outer = sum(outer_labels.values())
         target_share = outer_labels.get(target_label, 0) / total_outer
-        # 8割以上がtarget_labelに囲まれていれば「穴」とみなし吸収する
+        # 8割以上がtarget_labelに囲まれていれば「穴」とみなし吸収する。
+        # ただし、componentがそのラベルの全面(=パネル丸ごと)であり、かつ
+        # target_labelに対して十分小さくない場合は吸収しない。パネル数が
+        # 2枚のとき(閉曲面を2分割した場合等)は互いに「相手に完全に
+        # 囲まれている」状態になるため、無条件に吸収するとパネル同士が
+        # 併合されて分割自体が消えてしまう(mockのトーラス結び目
+        # n_panels=2 で全パネルが1枚に潰れる退行を実際に確認)。
+        # 穴を塞ぐ小パッチ(本来吸収したい対象)は面積が小さいので
+        # 面積比でガードする。
         if target_share >= 0.8 and target_label in outer_labels:
+            comp_is_whole_label = len(comp) == int(np.sum(labels == label))
+            if comp_is_whole_label:
+                comp_area = float(np.sum(face_areas[comp]))
+                target_area = float(np.sum(face_areas[labels == target_label]))
+                if comp_area > 0.25 * max(target_area, 1e-12):
+                    continue
             for cf in comp:
                 labels[cf] = target_label
 

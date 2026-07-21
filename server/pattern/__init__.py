@@ -10,6 +10,17 @@ from .segment import panel_stats, segment_panels
 from .preview import build_preview_mesh
 from .flatten import flatten_panel
 from .svg import build_pattern_svg
+from .parts import (
+    cap_part,
+    compute_local_thickness,
+    decompose_parts,
+    extract_image_regions,
+    labels_from_bboxes,
+    labels_from_seeds,
+    part_stats,
+    project_labels_to_faces,
+    segment_part_panels,
+)
 
 __all__ = [
     "prepare_mesh",
@@ -18,4 +29,13 @@ __all__ = [
     "build_preview_mesh",
     "flatten_panel",
     "build_pattern_svg",
+    "decompose_parts",
+    "cap_part",
+    "part_stats",
+    "compute_local_thickness",
+    "segment_part_panels",
+    "extract_image_regions",
+    "labels_from_bboxes",
+    "labels_from_seeds",
+    "project_labels_to_faces",
 ]
