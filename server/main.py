@@ -429,4 +429,23 @@ async def health():
 
 
 # --- 静的フロントエンド配信 (SPEC.md §5 `GET /`) -----------------------------
-app.mount("/", StaticFiles(directory=str(config.WEB_DIR), html=True), name="web")
+class RevalidatingStaticFiles(StaticFiles):
+    """静的ファイルに `Cache-Control: no-cache` を付けて必ず再検証させる。
+
+    Starlette の StaticFiles は ETag / Last-Modified は返すが Cache-Control を
+    付けない。するとブラウザは**ヒューリスティックキャッシュ**(最終更新からの
+    経過時間の約10%)を使い、その間はサーバに問い合わせずに古いファイルを
+    使い続ける。コードを直したのに画面が変わらない、という混乱の原因になる。
+
+    `no-cache` は「保存してよいが使う前に必ず再検証せよ」の意味なので、
+    毎回 ETag による条件付きGETが走り、変更が無ければ 304 で終わる
+    (転送量はほとんど増えない)。
+    """
+
+    def file_response(self, *args, **kwargs):
+        response = super().file_response(*args, **kwargs)
+        response.headers.setdefault("Cache-Control", "no-cache")
+        return response
+
+
+app.mount("/", RevalidatingStaticFiles(directory=str(config.WEB_DIR), html=True), name="web")
