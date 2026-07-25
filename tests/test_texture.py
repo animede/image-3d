@@ -72,3 +72,76 @@ def test_is_available_returns_bool():
     # 環境に依存するが、常にbool型であることは保証される(実ロードはしない)。
     result = texture.is_available()
     assert isinstance(result, bool)
+
+
+# --- 材質の金属度 (glTF metallicFactor) ---------------------------------------
+
+
+def _textured_box():
+    """テクスチャ付きメッシュ(paint出力相当)を作る。"""
+    import numpy as np
+    import trimesh
+    from PIL import Image
+    from trimesh.visual.material import PBRMaterial
+
+    mesh = trimesh.creation.box()
+    mesh.visual = trimesh.visual.TextureVisuals(
+        uv=np.zeros((len(mesh.vertices), 2)),
+        material=PBRMaterial(baseColorTexture=Image.new("RGB", (4, 4), (200, 150, 100))),
+    )
+    return mesh
+
+
+def test_glb_without_metallic_factor_defaults_to_metal():
+    """前提の確認: 未指定だと trimesh は metallicFactor を書き出さない。
+
+    glTF 2.0 の既定値は 1.0(完全な金属)なので、書き出さない = 金属になる。
+    """
+    import json
+    import struct
+
+    data = _textured_box().export(file_type="glb")
+    length = struct.unpack("<I", data[12:16])[0]
+    gltf = json.loads(data[20 : 20 + length])
+    assert "metallicFactor" not in gltf["materials"][0]["pbrMetallicRoughness"]
+
+
+def test_ensure_non_metallic_sets_zero():
+    from server import texture
+
+    mesh = _textured_box()
+    assert texture.ensure_non_metallic(mesh) is True
+    assert mesh.visual.material.metallicFactor == 0.0
+
+
+def test_ensure_non_metallic_is_written_to_glb():
+    """暗く沈む原因だった metallicFactor が GLB に 0 として入ること。"""
+    import json
+    import struct
+
+    from server import texture
+
+    mesh = _textured_box()
+    texture.ensure_non_metallic(mesh)
+    data = mesh.export(file_type="glb")
+    length = struct.unpack("<I", data[12:16])[0]
+    gltf = json.loads(data[20 : 20 + length])
+    assert gltf["materials"][0]["pbrMetallicRoughness"]["metallicFactor"] == 0.0
+
+
+def test_ensure_non_metallic_keeps_explicit_value():
+    """明示的に指定された金属度は尊重する(勝手に上書きしない)。"""
+    from server import texture
+
+    mesh = _textured_box()
+    mesh.visual.material.metallicFactor = 1.0
+    assert texture.ensure_non_metallic(mesh) is False
+    assert mesh.visual.material.metallicFactor == 1.0
+
+
+def test_ensure_non_metallic_ignores_meshes_without_material():
+    import trimesh
+
+    from server import texture
+
+    assert texture.ensure_non_metallic(trimesh.creation.box()) is False

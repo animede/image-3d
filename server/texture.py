@@ -139,7 +139,31 @@ class TexturePipelineWrapper:
             raise RuntimeError(
                 f"texgen の出力をtrimesh.Trimeshとして認識できませんでした(型: {type(textured)!r})。"
             )
+        ensure_non_metallic(textured)
         return textured
+
+
+def ensure_non_metallic(mesh: trimesh.Trimesh) -> bool:
+    """テクスチャ付きメッシュの材質に `metallicFactor = 0` を明示する。
+
+    **glTF 2.0 の `metallicFactor` 既定値は 1.0(完全な金属)**であり、
+    trimesh は値が未設定だとこのフィールドを書き出さない。結果、生成した
+    キャラクターが「金属」として解釈される。金属は拡散反射を持たず環境の
+    映り込みしか返さないため、環境マップを持たないビューア(Godot、
+    three.jsの素のセットアップ、多くのglTFビューア)では**色が暗く沈む**。
+
+    キャラクターは布・肌・毛といった非金属なので 0.0 を明示する。
+
+    Returns:
+        値を設定したら True(既に設定済み、または材質が無ければ False)。
+    """
+    material = getattr(getattr(mesh, "visual", None), "material", None)
+    if material is None or not hasattr(material, "metallicFactor"):
+        return False
+    if material.metallicFactor is not None:
+        return False
+    material.metallicFactor = 0.0
+    return True
 
 
 def sample_vertex_colors_from_texture(mesh: trimesh.Trimesh) -> np.ndarray:
