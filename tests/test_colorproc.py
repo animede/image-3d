@@ -229,3 +229,217 @@ def test_transfer_vertex_colors_nearest_length_mismatch_raises():
     dst_vertices = np.zeros((1, 3))
     with pytest.raises(ValueError):
         colorproc.transfer_vertex_colors_nearest(src_vertices, src_colors, dst_vertices)
+
+
+# --- 左右側面ビューの投影 (4面図対応) -----------------------------------------
+
+
+def _sphere():
+    """法線が全方向へ均等に向く球。ビュー割当の検証に使う。
+
+    箱は頂点が角にしか無く、法線が隣接3面の平均になって全ビューと同点になる
+    ため、割当のテストには使えない。
+    """
+    import trimesh
+
+    return trimesh.creation.icosphere(subdivisions=3, radius=1.0)
+
+
+def _solid_image(color, size=32):
+    from PIL import Image
+
+    return Image.new("RGBA", (size, size), (*color, 255))
+
+
+def test_view_masks_split_all_four_directions():
+    """4ビューを渡すと、各面が対応するビューに割り当てられること。"""
+    mesh = _sphere()
+    masks = colorproc._view_vertex_masks(mesh, list(colorproc.VIEW_NAMES))
+
+    # 箱の頂点は角にあり法線が斜めなので、割当先が重複しないことを確かめる
+    stacked = np.stack([masks[v] for v in colorproc.VIEW_NAMES])
+    assert stacked.sum(axis=0).max() <= 1, "1頂点が複数ビューに割り当てられている"
+
+
+def test_view_masks_are_backward_compatible_with_front_back():
+    """正面/背面だけを渡した場合は従来の法線しきい値判定と一致すること。"""
+    mesh = _sphere()
+    normals = colorproc._vertex_normals(mesh)
+    threshold = colorproc._VIEW_NORMAL_THRESHOLD
+
+    masks = colorproc._view_vertex_masks(mesh, ["front", "back"])
+    assert np.array_equal(masks["front"], normals[:, 1] < -threshold)
+    assert np.array_equal(masks["back"], normals[:, 1] > threshold)
+
+
+def test_side_images_colour_the_side_vertices():
+    """左右画像を渡すと、側面の頂点がその画像の色になる。"""
+    mesh = _sphere()
+    front = _solid_image((255, 0, 0))
+    back = _solid_image((0, 255, 0))
+    left = _solid_image((0, 0, 255))
+    right = _solid_image((255, 255, 0))
+
+    colors = colorproc.project_multiview_colors(
+        mesh, front, back_image=back, left_image=left, right_image=right
+    )
+
+    masks = colorproc._view_vertex_masks(mesh, list(colorproc.VIEW_NAMES))
+    for view, expected in (("left", (0, 0, 255)), ("right", (255, 255, 0))):
+        mask = masks[view]
+        assert mask.any(), f"{view} に割り当てられた頂点が無い"
+        assert (colors[mask, :3] == expected).all(), f"{view} 画像の色になっていない"
+
+
+def test_side_images_reduce_base_coloured_vertices():
+    """側面画像はベース色のままだった頂点を実際に減らす。
+
+    正面/背面だけだと、真横を向いた頂点はどちらのしきい値も超えず
+    一律のベース色になる(実生成モデルで約9%)。
+    """
+    mesh = _sphere()
+    front = _solid_image((255, 0, 0))
+    back = _solid_image((0, 255, 0))
+
+    def base_count(colors):
+        return int((colors[:, :3] == colorproc._DEFAULT_BASE_COLOR).all(axis=1).sum())
+
+    without_sides = colorproc.project_multiview_colors(mesh, front, back_image=back)
+    with_sides = colorproc.project_multiview_colors(
+        mesh,
+        front,
+        back_image=back,
+        left_image=_solid_image((0, 0, 255)),
+        right_image=_solid_image((255, 255, 0)),
+    )
+
+    assert base_count(without_sides) > 0, "前提: 側面画像が無いとベース色の頂点がある"
+    assert base_count(with_sides) < base_count(without_sides)
+
+
+def test_left_and_right_use_opposite_horizontal_direction():
+    """左右のビューはカメラが反対側にあるため、u→メッシュY の向きが逆になる。"""
+    left_axis, left_sign = colorproc._view_u_axis("left")
+    right_axis, right_sign = colorproc._view_u_axis("right")
+    assert left_axis == right_axis == 1, "左右側面はメッシュY軸へ投影する"
+    assert left_sign == -right_sign
+
+
+def test_front_and_back_still_use_x_axis():
+    front_axis, front_sign = colorproc._view_u_axis("front")
+    back_axis, back_sign = colorproc._view_u_axis("back")
+    assert front_axis == back_axis == 0
+    assert front_sign == -back_sign
+
+
+def test_project_image_colors_rejects_unknown_view():
+    mesh = _sphere()
+    with pytest.raises(ValueError, match="view"):
+        colorproc._project_image_colors(mesh, _solid_image((1, 2, 3)), view="top")
+
+
+# --- 見切れ画像のシルエット自動位置合わせ -------------------------------------
+
+
+def _stepped_tower():
+    """高さごとに幅が変わる、シルエットに特徴のあるメッシュ。"""
+    import trimesh
+
+    parts = [
+        trimesh.creation.box(extents=(2.0, 1.0, 1.0), transform=_translate(0, 0, 0.5)),
+        trimesh.creation.box(extents=(0.6, 1.0, 1.0), transform=_translate(0, 0, 1.5)),
+        trimesh.creation.box(extents=(1.4, 1.0, 1.0), transform=_translate(0, 0, 2.5)),
+    ]
+    # 頂点が角にしか無い箱のままだとシルエットの段が疎になるため細分する
+    return trimesh.util.concatenate(parts).subdivide().subdivide()
+
+
+def _translate(x, y, z):
+    matrix = np.eye(4)
+    matrix[:3, 3] = (x, y, z)
+    return matrix
+
+
+def _render_silhouette(mesh, axis, height_px, top_px, canvas):
+    """メッシュのシルエットを、指定の倍率・位置で画像に焼く(テスト用)。"""
+    from PIL import Image
+
+    width_px, canvas_h = canvas
+    image = Image.new("RGBA", (width_px, canvas_h), (0, 0, 0, 0))
+    pixels = image.load()
+
+    vertices = mesh.vertices
+    z_min, z_max = vertices[:, 2].min(), vertices[:, 2].max()
+    profile = colorproc._mesh_silhouette_profile(mesh, axis)
+    mesh_width = vertices[:, axis].max() - vertices[:, axis].min()
+    scale = height_px / (z_max - z_min)
+
+    for row in range(canvas_h):
+        t = (row - top_px) / height_px  # 0=メッシュ上端, 1=下端
+        if not (0.0 <= t < 1.0):
+            continue
+        bin_index = min(int((1.0 - t) * len(profile)), len(profile) - 1)
+        half = profile[bin_index] * scale / 2
+        if half <= 0:
+            continue
+        centre = width_px / 2
+        for col in range(max(int(centre - half), 0), min(int(centre + half), width_px)):
+            pixels[col, row] = (200, 120, 60, 255)
+    return image
+
+
+def test_silhouette_alignment_recovers_a_cropped_subject():
+    """被写体が枠からはみ出していても、メッシュ上下端の対応行を当てられること。
+
+    実測の側面図は縦占有 767/768 で上下とも見切れており、被写体bboxに
+    メッシュ全高を合わせる従来方式では色が縦に大きくずれる。
+    """
+    mesh = _stepped_tower()
+    canvas = (256, 200)
+    height_px, top_px = 300, -40  # 画像より背が高く、上が枠外へはみ出す
+    image = _render_silhouette(mesh, axis=0, height_px=height_px, top_px=top_px, canvas=canvas)
+
+    assert colorproc._subject_touches_vertical_edges(image), "前提: 見切れている画像"
+
+    aligned = colorproc._align_vertical_by_silhouette(mesh, image, axis=0)
+    assert aligned is not None, "照合に失敗した"
+
+    v_top, v_bottom = aligned
+    canvas_h = canvas[1]
+    assert abs(v_top * canvas_h - top_px) < 12
+    assert abs(v_bottom * canvas_h - (top_px + height_px)) < 12
+
+
+def test_silhouette_alignment_beats_bbox_fit_when_cropped():
+    """見切れ時、従来の被写体bbox方式より真値に近いこと。"""
+    mesh = _stepped_tower()
+    canvas = (256, 200)
+    height_px, top_px = 300, -40
+    image = _render_silhouette(mesh, axis=0, height_px=height_px, top_px=top_px, canvas=canvas)
+
+    _, _, bbox_top, bbox_bottom = colorproc._subject_bbox_uv(image)
+    aligned_top, aligned_bottom = colorproc._align_vertical_by_silhouette(mesh, image, axis=0)
+
+    truth_top, truth_bottom = top_px / canvas[1], (top_px + height_px) / canvas[1]
+    bbox_error = abs(bbox_top - truth_top) + abs(bbox_bottom - truth_bottom)
+    aligned_error = abs(aligned_top - truth_top) + abs(aligned_bottom - truth_bottom)
+    assert aligned_error < bbox_error / 4
+
+
+def test_silhouette_alignment_is_skipped_when_not_cropped():
+    """枠内に収まっている画像では従来の被写体bbox方式のままにする。"""
+    mesh = _stepped_tower()
+    canvas = (256, 200)
+    image = _render_silhouette(mesh, axis=0, height_px=150, top_px=25, canvas=canvas)
+
+    assert colorproc._subject_touches_vertical_edges(image) is False
+
+
+def test_alignment_gives_up_on_a_featureless_silhouette():
+    """一様な矩形など手がかりの無いシルエットでは None を返して従来方式に戻す。"""
+    import trimesh
+    from PIL import Image
+
+    mesh = trimesh.creation.box(extents=(1.0, 1.0, 3.0))
+    image = Image.new("RGBA", (64, 64), (255, 0, 0, 255))
+    assert colorproc._align_vertical_by_silhouette(mesh, image, axis=0) is None

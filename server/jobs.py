@@ -388,6 +388,8 @@ class JobManager:
                     mesh=processed_mesh,
                     image=processed,
                     back_image=extra_views.get("back"),
+                    left_image=extra_views.get("left"),
+                    right_image=extra_views.get("right"),
                     n_colors=params.n_colors,
                     tex_mesh=textured_mesh,
                     gen_colors=generator_vertex_colors,
@@ -402,7 +404,11 @@ class JobManager:
                         vertex_colors = gen_colors
                     else:
                         vertex_colors = colorproc.project_multiview_colors(
-                            mesh, image, back_image=back_image
+                            mesh,
+                            image,
+                            back_image=back_image,
+                            left_image=left_image,
+                            right_image=right_image,
                         )
                     palette, labels = colorproc.quantize(vertex_colors, n_colors)
                     stats_data = colorproc.palette_stats(labels, palette, mesh)

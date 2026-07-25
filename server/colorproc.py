@@ -45,8 +45,33 @@ from scipy.spatial import cKDTree
 # 逆に見える場合はここを -1 に反転する。
 _U_TO_X_SIGN = 1.0
 
-# 正面/背面判定に使う頂点法線Y成分のしきい値。
-# 正面は -Y 方向を向くため normal_y < -threshold、背面は normal_y > threshold。
+# 画像u(横, 0=左..1=右)からメッシュY座標への符号(左右側面ビュー用)。
+# カメラの右手方向から決まる: 左側面(カメラ +X 側)は u が +Y、
+# 右側面(カメラ -X 側)は u が -Y に対応する。逆に見える場合はここを反転する。
+_U_TO_Y_SIGN = 1.0
+
+# 各ビューで見える頂点の法線方向(=そのビューのカメラがある側)。
+# メッシュは Z-up、正面が -Y、キャラクターの左が +X。
+# したがって「左側面図」はキャラの左側 (+X) から見た画像を指す。
+_VIEW_NORMALS = {
+    "front": (0.0, -1.0, 0.0),
+    "back": (0.0, 1.0, 0.0),
+    "left": (1.0, 0.0, 0.0),
+    "right": (-1.0, 0.0, 0.0),
+}
+
+# 画像の横方向 u が対応するメッシュ軸 (0=X, 1=Y) と向き。
+_VIEW_U_AXIS = {
+    "front": (0, 1.0),
+    "back": (0, -1.0),
+    "left": (1, 1.0),
+    "right": (1, -1.0),
+}
+
+VIEW_NAMES = tuple(_VIEW_NORMALS)
+
+# ビュー判定に使う法線しきい値。どのビューにも十分向いていない頂点
+# (真上・真下を向く面など)はベース色にする。
 _VIEW_NORMAL_THRESHOLD = 0.10
 
 # 背面画像が無い場合や側面/上下など明確に正面・背面でない頂点へ使うベース色。
@@ -71,39 +96,158 @@ def _subject_bbox_uv(image: Image.Image) -> tuple[float, float, float, float]:
     return (0.0, 1.0, 0.0, 1.0)
 
 
-def _project_image_colors(mesh: trimesh.Trimesh, image: Image.Image, *, view: str) -> np.ndarray:
-    """単一ビュー画像をメッシュXZへ直交投影し、全頂点分のRGBAカラーを返す。
+def _view_u_axis(view: str) -> tuple[int, float]:
+    """ビューに対する (画像uが対応するメッシュ軸, 向き) を返す。"""
+    axis, sign = _VIEW_U_AXIS[view]
+    return axis, sign * (_U_TO_X_SIGN if axis == 0 else _U_TO_Y_SIGN)
 
-    `view="front"` は -Y 側から見た画像、`view="back"` は +Y 側から見た画像として
-    扱う。背面ビューはカメラ方向が反対になるため、X→u の対応を反転する。
+
+# シルエット照合に使う分割数と、採用に必要な相関の下限。
+_SILHOUETTE_BINS = 96
+_SILHOUETTE_MIN_CORRELATION = 0.5
+
+
+def _subject_touches_vertical_edges(image: Image.Image) -> bool:
+    """被写体が画像の上端または下端に接しているか(=見切れの疑い)。"""
+    alpha = np.asarray(image.getchannel("A"), dtype=np.uint8) > 0
+    if not alpha.any():
+        return False
+    return bool(alpha[0].any() or alpha[-1].any())
+
+
+def _mesh_silhouette_profile(
+    mesh: trimesh.Trimesh, axis: int, bins: int = _SILHOUETTE_BINS
+) -> np.ndarray:
+    """メッシュを高さ方向に等分し、各段の横幅(指定軸の広がり)を返す。"""
+    vertices = mesh.vertices
+    z = vertices[:, 2]
+    z_min, z_max = float(z.min()), float(z.max())
+    edges = np.linspace(z_min, z_max, bins + 1)
+    index = np.clip(np.searchsorted(edges, z, side="right") - 1, 0, bins - 1)
+
+    widths = np.zeros(bins)
+    filled = np.flatnonzero(np.bincount(index, minlength=bins))
+    for i in filled:
+        values = vertices[index == i, axis]
+        widths[i] = float(values.max() - values.min())
+
+    # 頂点が疎なメッシュでは空の段ができ、そこが幅0の切れ込みに見えてしまう。
+    # 実在する段から補間して埋める。
+    if len(filled) >= 2 and len(filled) < bins:
+        widths = np.interp(np.arange(bins), filled, widths[filled])
+    return widths
+
+
+def _image_silhouette_profile(image: Image.Image) -> np.ndarray:
+    """画像の各行について、不透明画素の横方向の広がりを返す。"""
+    alpha = np.asarray(image.getchannel("A"), dtype=np.uint8) > 0
+    widths = np.zeros(alpha.shape[0])
+    rows = np.flatnonzero(alpha.any(axis=1))
+    for y in rows:
+        xs = np.flatnonzero(alpha[y])
+        widths[y] = float(xs[-1] - xs[0])
+    return widths
+
+
+def _align_vertical_by_silhouette(
+    mesh: trimesh.Trimesh, image: Image.Image, axis: int
+) -> Optional[tuple[float, float]]:
+    """メッシュ上端・下端が画像のどの行に対応するかをシルエット照合で求める。
+
+    被写体が枠からはみ出している(見切れている)画像では、被写体バウンディング
+    ボックスにメッシュ全高を合わせる従来の方法が破綻する。実測: 側面図の
+    縦占有が 767/768 で上下とも見切れており、そのまま使うと色が縦に約4割ずれる。
+
+    横方向は見切れていないことが多いので、**横幅から倍率を決め、縦のオフセット
+    だけを探索する**。メッシュの段ごとの横幅と画像の行ごとの横幅を相関で
+    突き合わせ、最も一致する位置を採る。
+
+    Returns:
+        (上端の行, 下端の行) を画像高さで正規化した値。決められなければ None。
     """
-    if view not in ("front", "back"):
-        raise ValueError(f"viewは'front'または'back'である必要があります(got {view})。")
+    alpha = np.asarray(image.getchannel("A"), dtype=np.uint8) > 0
+    if not alpha.any():
+        return None
+    height, width = alpha.shape
+
+    columns = np.flatnonzero(alpha.any(axis=0))
+    subject_width = float(columns[-1] - columns[0])
+    mesh_width = float(mesh.vertices[:, axis].max() - mesh.vertices[:, axis].min())
+    if subject_width <= 0 or mesh_width <= 0:
+        return None
+
+    pixels_per_unit = subject_width / mesh_width
+    mesh_height_px = float(
+        mesh.vertices[:, 2].max() - mesh.vertices[:, 2].min()
+    ) * pixels_per_unit
+    if not np.isfinite(mesh_height_px) or mesh_height_px < 8:
+        return None
+
+    mesh_profile = _mesh_silhouette_profile(mesh, axis)
+    image_profile = _image_silhouette_profile(image)
+
+    # メッシュ側プロファイルを画像の行ピッチへ引き伸ばす(上端=最大Z)
+    sample_count = int(round(mesh_height_px))
+    positions = np.linspace(0, len(mesh_profile) - 1, sample_count)
+    stretched = np.interp(positions, np.arange(len(mesh_profile)), mesh_profile[::-1])
+
+    best_score, best_top = -np.inf, None
+    for top in range(-sample_count + 8, height - 8):
+        lo, hi = max(top, 0), min(top + sample_count, height)
+        if hi - lo < max(16, sample_count * 0.3):
+            continue
+        a = stretched[lo - top : hi - top]
+        b = image_profile[lo:hi]
+        if a.std() < 1e-9 or b.std() < 1e-9:
+            continue
+        score = float(np.corrcoef(a, b)[0, 1])
+        if score > best_score:
+            best_score, best_top = score, top
+
+    if best_top is None or best_score < _SILHOUETTE_MIN_CORRELATION:
+        return None
+    return best_top / height, (best_top + sample_count) / height
+
+
+def _project_image_colors(mesh: trimesh.Trimesh, image: Image.Image, *, view: str) -> np.ndarray:
+    """単一ビュー画像を直交投影し、全頂点分のRGBAカラーを返す。
+
+    正面(-Y側)/背面(+Y側)は メッシュXZ 平面へ、左側面(+X側)/右側面(-X側)は
+    メッシュYZ 平面へ投影する。カメラの右手方向が変わるので、ビューごとに
+    横方向の対応軸と符号が変わる(`_VIEW_U_AXIS`)。
+    """
+    if view not in _VIEW_U_AXIS:
+        raise ValueError(f"viewは{sorted(_VIEW_U_AXIS)}のいずれかである必要があります(got {view})。")
     if image.mode != "RGBA":
         image = image.convert("RGBA")
 
     w, h = image.size
     rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)  # (h, w, 3)
     alpha = np.asarray(image.getchannel("A"), dtype=np.uint8)  # (h, w)
+    axis, u_sign = _view_u_axis(view)
 
     u_min, u_max, v_min, v_max = _subject_bbox_uv(image)
 
+    # 被写体が枠の上下に接している=見切れている可能性がある。その場合は
+    # 被写体bboxに全高を合わせると縦がずれるため、シルエット照合で
+    # メッシュ上端・下端に対応する行を求め直す。
+    if _subject_touches_vertical_edges(image):
+        aligned = _align_vertical_by_silhouette(mesh, image, axis)
+        if aligned is not None:
+            v_min, v_max = aligned
+
     vertices = mesh.vertices
     bounds = mesh.bounds
-    x_min, x_max = bounds[0][0], bounds[1][0]
+    a_min, a_max = bounds[0][axis], bounds[1][axis]
     z_min, z_max = bounds[0][2], bounds[1][2]
-    x_extent = max(x_max - x_min, 1e-9)
+    a_extent = max(a_max - a_min, 1e-9)
     z_extent = max(z_max - z_min, 1e-9)
 
-    # メッシュX -> 正規化u (被写体bbox基準)。
-    # front: _U_TO_X_SIGN=+1 (実生成検証済み): u=0(左端)が-X側、u=1(右端)が+X側。
-    # back: カメラが反対側(+Y)のため、左右対応を反転する。
-    x_norm = (vertices[:, 0] - x_min) / x_extent  # 0..1, 0=-X側, 1=+X側
-    u_sign = _U_TO_X_SIGN if view == "front" else -_U_TO_X_SIGN
-    if u_sign < 0:
-        u_norm = 1.0 - x_norm  # +X側(x_norm=1) -> u=0(画像左端) (反転版)
-    else:
-        u_norm = x_norm  # -X側(x_norm=0) -> u=0(画像左端)
+    # 横方向の軸 -> 正規化u (被写体bbox基準)。
+    # 例) front は _U_TO_X_SIGN=+1 (実生成検証済み) で u=0(左端)が-X側、
+    #     back はカメラが反対側(+Y)にあるため左右対応が反転する。
+    a_norm = (vertices[:, axis] - a_min) / a_extent  # 0..1
+    u_norm = a_norm if u_sign > 0 else 1.0 - a_norm
     u = u_min + u_norm * (u_max - u_min)
 
     # メッシュZ -> 正規化v (上下反転: Z最大=画像上端 v=0)
@@ -150,32 +294,55 @@ def project_colors(mesh: trimesh.Trimesh, image: Image.Image) -> np.ndarray:
     return _project_image_colors(mesh, image, view="front")
 
 
-def _front_back_vertex_masks(mesh: trimesh.Trimesh) -> tuple[np.ndarray, np.ndarray]:
-    """頂点法線から正面側・背面側の頂点マスクを返す。"""
+def _vertex_normals(mesh: trimesh.Trimesh) -> np.ndarray:
     normals = np.asarray(mesh.vertex_normals)
     if normals.shape != (len(mesh.vertices), 3):
         mesh = mesh.copy()
         mesh.fix_normals()
         normals = np.asarray(mesh.vertex_normals)
-    y = normals[:, 1]
-    front_mask = y < -_VIEW_NORMAL_THRESHOLD
-    back_mask = y > _VIEW_NORMAL_THRESHOLD
-    return front_mask, back_mask
+    return normals
+
+
+def _view_vertex_masks(
+    mesh: trimesh.Trimesh, views: list[str]
+) -> dict[str, np.ndarray]:
+    """各頂点を、法線が最もよく向いているビューへ割り当てる。
+
+    どのビューにも `_VIEW_NORMAL_THRESHOLD` を超えて向いていない頂点
+    (真上・真下を向く面など)はどのマスクにも入らず、ベース色のままになる。
+
+    正面・背面だけを渡した場合は従来の
+    `normal_y < -threshold` / `normal_y > threshold` と同じ結果になる。
+    """
+    normals = _vertex_normals(mesh)
+    scores = np.stack([normals @ np.asarray(_VIEW_NORMALS[v]) for v in views])
+    best = scores.argmax(axis=0)
+    visible = scores.max(axis=0) > _VIEW_NORMAL_THRESHOLD
+    return {view: (best == i) & visible for i, view in enumerate(views)}
+
+
+def _front_back_vertex_masks(mesh: trimesh.Trimesh) -> tuple[np.ndarray, np.ndarray]:
+    """頂点法線から正面側・背面側の頂点マスクを返す(後方互換用)。"""
+    masks = _view_vertex_masks(mesh, ["front", "back"])
+    return masks["front"], masks["back"]
 
 
 def project_multiview_colors(
     mesh: trimesh.Trimesh,
     front_image: Image.Image,
     back_image: Optional[Image.Image] = None,
+    left_image: Optional[Image.Image] = None,
+    right_image: Optional[Image.Image] = None,
     base_color: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    """正面/背面を分けて頂点カラーを投影する。
+    """複数ビューの画像を頂点法線で振り分けて投影する。
 
-    - 正面側の頂点: 正面画像を投影する。
-    - 背面側の頂点: 背面画像があれば背面画像を投影し、無ければベース色にする。
-    - 側面/上下など正面・背面判定が曖昧な頂点: ベース色にする。
+    - 各頂点は、法線が最もよく向いているビューの画像から色を取る。
+    - どのビューにも十分向いていない頂点(真上・真下など)はベース色にする。
 
-    これにより、正面画像が背面全面へ薄く回り込む従来の簡易投影を避ける。
+    これにより、正面画像が背面や側面へ薄く回り込む簡易投影を避ける。
+    左右画像を与えると、正面/背面だけでは一律ベース色になっていた側面の頂点
+    (実測でモデル全体の約9%)にも実際の色が付く。
     """
     if base_color is None:
         base_rgb = _DEFAULT_BASE_COLOR
@@ -186,14 +353,18 @@ def project_multiview_colors(
     colors[:, :3] = base_rgb
     colors[:, 3] = 255
 
-    front_mask, back_mask = _front_back_vertex_masks(mesh)
+    images = {
+        "front": front_image,
+        "back": back_image,
+        "left": left_image,
+        "right": right_image,
+    }
+    available = [view for view in VIEW_NAMES if images[view] is not None]
+    masks = _view_vertex_masks(mesh, available)
 
-    front_colors = _project_image_colors(mesh, front_image, view="front")
-    colors[front_mask] = front_colors[front_mask]
-
-    if back_image is not None:
-        back_colors = _project_image_colors(mesh, back_image, view="back")
-        colors[back_mask] = back_colors[back_mask]
+    for view in available:
+        view_colors = _project_image_colors(mesh, images[view], view=view)
+        colors[masks[view]] = view_colors[masks[view]]
 
     return colors
 
