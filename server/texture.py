@@ -139,7 +139,13 @@ class TexturePipelineWrapper:
             raise RuntimeError(
                 f"texgen の出力をtrimesh.Trimeshとして認識できませんでした(型: {type(textured)!r})。"
             )
-        ensure_non_metallic(textured)
+        if not ensure_non_metallic(textured):
+            # 効かないまま出すと「金属扱いで暗い」成果物になるので気づけるようにする
+            logger.warning(
+                "Could not force metallicFactor=0 on the painted material (%s); "
+                "the model may render dark in PBR viewers.",
+                type(getattr(getattr(textured, "visual", None), "material", None)).__name__,
+            )
         return textured
 
 
@@ -157,9 +163,21 @@ def ensure_non_metallic(mesh: trimesh.Trimesh) -> bool:
     Returns:
         値を設定したら True(既に設定済み、または材質が無ければ False)。
     """
-    material = getattr(getattr(mesh, "visual", None), "material", None)
-    if material is None or not hasattr(material, "metallicFactor"):
+    visual = getattr(mesh, "visual", None)
+    material = getattr(visual, "material", None)
+    if material is None:
         return False
+
+    if not hasattr(material, "metallicFactor"):
+        # texgen が返すのは `SimpleMaterial` で、metallicFactor を持たない。
+        # GLB書き出し時に trimesh が PBR へ変換するものの、そのとき
+        # baseColorFactor と roughnessFactor は書かれるのに metallicFactor は
+        # 落ちる。先に PBR へ変換しておかないと値を指定できない。
+        if not hasattr(material, "to_pbr"):
+            return False
+        material = material.to_pbr()
+        visual.material = material
+
     if material.metallicFactor is not None:
         return False
     material.metallicFactor = 0.0

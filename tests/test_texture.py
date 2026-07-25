@@ -145,3 +145,37 @@ def test_ensure_non_metallic_ignores_meshes_without_material():
     from server import texture
 
     assert texture.ensure_non_metallic(trimesh.creation.box()) is False
+
+
+def test_ensure_non_metallic_converts_simple_material():
+    """texgen が返す SimpleMaterial は metallicFactor を持たない。
+
+    そのまま GLB にすると baseColorFactor と roughnessFactor は書かれるのに
+    metallicFactor だけ落ち、glTF既定の 1.0(金属)が適用されて暗くなる。
+    """
+    import json
+    import struct
+
+    import numpy as np
+    import trimesh
+    from PIL import Image
+    from trimesh.visual.material import SimpleMaterial
+
+    from server import texture
+
+    mesh = trimesh.creation.box()
+    mesh.visual = trimesh.visual.TextureVisuals(
+        uv=np.zeros((len(mesh.vertices), 2)),
+        material=SimpleMaterial(image=Image.new("RGB", (4, 4), (200, 150, 100))),
+    )
+    assert not hasattr(mesh.visual.material, "metallicFactor")
+
+    assert texture.ensure_non_metallic(mesh) is True
+
+    data = mesh.export(file_type="glb")
+    length = struct.unpack("<I", data[12:16])[0]
+    gltf = json.loads(data[20 : 20 + length])
+    pbr = gltf["materials"][0]["pbrMetallicRoughness"]
+    assert pbr["metallicFactor"] == 0.0
+    assert "baseColorTexture" in pbr, "テクスチャが失われた"
+    assert gltf["images"], "テクスチャ画像が失われた"
