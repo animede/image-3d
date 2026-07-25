@@ -35,6 +35,7 @@
       "runtimeExecutable": "env",
       "runtimeArgs": [
         "IMAGE3D_GENERATOR=pixal3d",
+        "IMAGE3D_RIGSVC_URL=http://127.0.0.1:8100",
         "ATTN_BACKEND=sdpa",
         "SPARSE_ATTN_BACKEND=sdpa",
         "CUDA_HOME=/usr/local/cuda-12.8",

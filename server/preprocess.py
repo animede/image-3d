@@ -9,6 +9,7 @@ from __future__ import annotations
 import io
 import logging
 
+import numpy as np
 from PIL import Image, UnidentifiedImageError
 
 logger = logging.getLogger(__name__)
@@ -74,6 +75,24 @@ def remove_background(image: Image.Image) -> tuple[Image.Image, bool]:
         return image, False
 
 
+# 既に背景が抜かれていると判断する透明画素の割合。ふちの薄いアンチエイリアス
+# だけで誤判定しないよう、ある程度まとまった透明領域を要求する。
+TRANSPARENT_PIXEL_RATIO = 0.05
+
+
+def has_removed_background(image: Image.Image) -> bool:
+    """入力が既に背景除去済み(実質的な透明領域を持つ)かどうか。
+
+    透明PNGにさらに rembg をかけても得るものは無く、**前景を削るだけ**になる
+    (実測: 背景除去済み画像に再適用して前景の1.8%が消失)。特に背景と同系色の
+    細い部位は丸ごと欠落しうる。
+    """
+    if image.mode not in ("RGBA", "LA", "PA") and "transparency" not in image.info:
+        return False
+    alpha = np.asarray(image.convert("RGBA").getchannel("A"))
+    return float((alpha < 128).mean()) >= TRANSPARENT_PIXEL_RATIO
+
+
 def preprocess_image(
     data: bytes,
     max_bytes: int,
@@ -86,7 +105,11 @@ def preprocess_image(
     processed = original
     bg_removed = False
     if remove_bg:
-        processed, bg_removed = remove_background(original)
+        if has_removed_background(original):
+            # 既に抜けている画像に rembg をかけると前景を削るだけになる
+            logger.info("Input already has a transparent background; skipping rembg.")
+        else:
+            processed, bg_removed = remove_background(original)
 
     processed = resize_to_square(processed, size=size)
     return original, processed, bg_removed

@@ -667,3 +667,79 @@ def test_rig_endpoint_rejects_malformed_params(client, monkeypatch):
     job_id = _completed_job_id(client)
     res = client.post(f"/api/jobs/{job_id}/rig", data={"params": "{not json"})
     assert res.status_code == 400
+
+
+# --- 背景除去のスキップ判定 ---------------------------------------------------
+
+
+def _rgba_png(alpha_ratio: float, size: int = 64) -> bytes:
+    """指定割合が透明なRGBA PNGを作る。"""
+    arr = np.zeros((size, size, 4), dtype=np.uint8)
+    arr[..., :3] = 180
+    arr[..., 3] = 255
+    transparent_rows = int(size * alpha_ratio)
+    arr[:transparent_rows, :, 3] = 0
+    buf = io.BytesIO()
+    Image.fromarray(arr, "RGBA").save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def test_detects_already_removed_background():
+    from server.preprocess import has_removed_background
+
+    assert has_removed_background(Image.open(io.BytesIO(_rgba_png(0.5)))) is True
+
+
+def test_opaque_rgba_is_not_treated_as_removed():
+    """アルファはあるが全て不透明なら、まだ背景は抜けていない。"""
+    from server.preprocess import has_removed_background
+
+    assert has_removed_background(Image.open(io.BytesIO(_rgba_png(0.0)))) is False
+
+
+def test_rgb_without_alpha_is_not_treated_as_removed():
+    from server.preprocess import has_removed_background
+
+    assert has_removed_background(Image.new("RGB", (32, 32), (10, 20, 30))) is False
+
+
+def test_thin_antialias_edge_is_not_treated_as_removed():
+    """ふちのわずかな透明だけでは背景除去済みと見なさない。"""
+    from server.preprocess import has_removed_background
+
+    assert has_removed_background(Image.open(io.BytesIO(_rgba_png(0.01)))) is False
+
+
+def test_preprocess_skips_rembg_for_transparent_input(monkeypatch):
+    """既に透明な入力に rembg を再適用しない(前景を削るだけのため)。"""
+    from server import preprocess
+
+    called = []
+
+    def spy(image):
+        called.append(image)
+        return image, True
+
+    monkeypatch.setattr(preprocess, "remove_background", spy)
+    _, _, bg_removed = preprocess.preprocess_image(_rgba_png(0.5), 10_000_000, remove_bg=True)
+
+    assert called == [], "透明な入力に rembg が呼ばれている"
+    assert bg_removed is False
+
+
+def test_preprocess_still_removes_background_for_opaque_input(monkeypatch):
+    from server import preprocess
+
+    called = []
+
+    def spy(image):
+        called.append(image)
+        return image.convert("RGBA"), True
+
+    monkeypatch.setattr(preprocess, "remove_background", spy)
+    _, _, bg_removed = preprocess.preprocess_image(
+        make_test_png_bytes(), 10_000_000, remove_bg=True
+    )
+
+    assert len(called) == 1, "不透明な入力に rembg が呼ばれていない"
+    assert bg_removed is True
