@@ -37,6 +37,9 @@ import numpy as np
 import trimesh
 from PIL import Image
 from scipy.cluster.vq import kmeans2
+from scipy.ndimage import binary_erosion
+from scipy.sparse import coo_matrix
+from scipy.sparse.linalg import spsolve
 from scipy.spatial import cKDTree
 
 # 画像u(横, 0=左..1=右)からメッシュX座標への符号。
@@ -89,8 +92,24 @@ _PRIMARY_VIEW_MIN_DOT_WITH_SIDES = 0.5
 # (真上・真下を向く面など)はベース色にする。
 _VIEW_NORMAL_THRESHOLD = 0.10
 
+# 前後2面のみのとき、投影を信用せずメッシュ表面拡散に回す法線しきい値。
+# dot < 0.35 (視線から約70°以上ずれた面)は浅い角度でのフチ引き伸ばしの
+# 影響が大きく、投影色をそのまま使うと側面に黒い筋や色ズレが残る。
+# 「顔=正対領域(dotが高い)の色は従来と一致」させるため、正面向きに近い
+# 領域(dotが高い大部分)は据え置き、真横寄りの一部だけを拡散対象にする。
+_LOW_CONFIDENCE_DOT_THRESHOLD = 0.35
+
 # 背面画像が無い場合や側面/上下など明確に正面・背面でない頂点へ使うベース色。
 _DEFAULT_BASE_COLOR = np.array([220, 220, 220], dtype=np.uint8)
+
+# rembg後のシルエット境界は背景と混ざって暗く汚れており(実測: 1024px幅の入力で
+# 数px幅の黒ずんだフチができる)、視線に対し浅い角度の面(側面付近)がこのフチ
+# 画素を引き伸ばしてサンプリングすると側面に黒い筋として現れる。信頼できる画素を
+# 「アルファ>0領域を数px収縮した内側」に限定し、フチはサンプリング対象から外して
+# 最近傍の信頼できる画素で埋め直す。収縮量は画像幅の0.5%を起点に実データ
+# (c3fb46dd...の側面レンダ)で黒筋が消えるまで調整した。
+_ALPHA_ERODE_MIN_PX = 2
+_ALPHA_ERODE_WIDTH_FRACTION = 0.005
 
 
 def _subject_bbox_uv(image: Image.Image) -> tuple[float, float, float, float]:
@@ -224,6 +243,23 @@ def _align_vertical_by_silhouette(
     return best_top / height, (best_top + sample_count) / height
 
 
+def _trusted_pixel_mask(alpha: np.ndarray) -> np.ndarray:
+    """フチを除いた「信頼できる」不透明画素のマスクを返す。
+
+    rembg後のシルエット境界は背景と混ざって暗く汚れているため、境界の数px
+    帯をサンプリング対象から除外する(`_ALPHA_ERODE_MIN_PX` / 幅参照)。
+    収縮で前景が全滅する極小前景では、収縮なしの元マスクにフォールバックする。
+    """
+    opaque = alpha > 0
+    if not opaque.any():
+        return opaque
+    erode_px = max(_ALPHA_ERODE_MIN_PX, round(alpha.shape[1] * _ALPHA_ERODE_WIDTH_FRACTION))
+    eroded = binary_erosion(opaque, iterations=erode_px)
+    if not eroded.any():
+        return opaque
+    return eroded
+
+
 def _project_image_colors(mesh: trimesh.Trimesh, image: Image.Image, *, view: str) -> np.ndarray:
     """単一ビュー画像を直交投影し、全頂点分のRGBAカラーを返す。
 
@@ -239,6 +275,7 @@ def _project_image_colors(mesh: trimesh.Trimesh, image: Image.Image, *, view: st
     w, h = image.size
     rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)  # (h, w, 3)
     alpha = np.asarray(image.getchannel("A"), dtype=np.uint8)  # (h, w)
+    trusted = _trusted_pixel_mask(alpha)  # (h, w) フチを除いた信頼できる画素
     axis, u_sign = _view_u_axis(view)
 
     u_min, u_max, v_min, v_max = _subject_bbox_uv(image)
@@ -273,17 +310,19 @@ def _project_image_colors(mesh: trimesh.Trimesh, image: Image.Image, *, view: st
     py = np.clip((v * h).astype(np.int64), 0, h - 1)
 
     sampled_rgb = rgb[py, px]  # (N, 3)
-    sampled_alpha = alpha[py, px]  # (N,)
+    sampled_trusted = trusted[py, px]  # (N,) フチ・透明画素はFalse
 
-    # 透明画素に投影された頂点は最近傍の不透明画素の色で埋める
-    opaque_mask = sampled_alpha > 0
-    if opaque_mask.any() and not opaque_mask.all():
-        opaque_ys, opaque_xs = np.where(alpha > 0)
-        tree = cKDTree(np.column_stack([opaque_ys, opaque_xs]))
-        missing_idx = np.where(~opaque_mask)[0]
+    # フチ・透明画素に投影された頂点は、最近傍の信頼できる画素の色で埋める。
+    # 視線に対し浅い角度の面(側面付近)ほどフチ画素を引き伸ばしてサンプリング
+    # しがちで、これを放置すると黒ずんだフチ色が側面に筋として現れる。
+    trusted_mask = sampled_trusted
+    if trusted_mask.any() and not trusted_mask.all():
+        trusted_ys, trusted_xs = np.where(trusted)
+        tree = cKDTree(np.column_stack([trusted_ys, trusted_xs]))
+        missing_idx = np.where(~trusted_mask)[0]
         _, nn_idx = tree.query(np.column_stack([py[missing_idx], px[missing_idx]]))
-        sampled_rgb[missing_idx] = rgb[opaque_ys[nn_idx], opaque_xs[nn_idx]]
-    elif not opaque_mask.any():
+        sampled_rgb[missing_idx] = rgb[trusted_ys[nn_idx], trusted_xs[nn_idx]]
+    elif not trusted_mask.any():
         # 完全に透明(アルファ情報が無い画像等)な場合は投影色をそのまま使う
         pass
 
@@ -344,6 +383,70 @@ def _front_back_vertex_masks(mesh: trimesh.Trimesh) -> tuple[np.ndarray, np.ndar
     return masks["front"], masks["back"]
 
 
+def _diffuse_unknown_vertex_colors(
+    mesh: trimesh.Trimesh,
+    colors: np.ndarray,
+    known_mask: np.ndarray,
+    base_rgb: np.ndarray,
+) -> np.ndarray:
+    """未知頂点の色を、メッシュ表面のグラフ調和補間で埋める。
+
+    どのビューにも十分向いていない頂点や、投影を信用できない浅い角度の
+    頂点(`_LOW_CONFIDENCE_DOT_THRESHOLD`参照)は一律のベース色になり、
+    側面に灰色帯として現れる(実測: 前後2面のみの実生成モデルで全頂点の
+    9.1%がベース色)。既知頂点をディリクレ境界とし、mesh.edges_unique の
+    一様重みグラフラプラシアンで未知頂点の色を線形補間すると、隣接する
+    既知色の中間色が自然に埋まる。
+
+    既知頂点が無い連結成分・退化ケース(既知頂点が0など)は
+    `_DEFAULT_BASE_COLOR` フォールバックのままにする。
+    """
+    n = len(mesh.vertices)
+    colors = colors.copy()
+    unknown_mask = ~known_mask
+    if not unknown_mask.any() or not known_mask.any():
+        return colors
+
+    edges = np.asarray(mesh.edges_unique)
+    if len(edges) == 0:
+        return colors
+
+    # 一様重みグラフラプラシアン L = D - A (対称)
+    rows = np.concatenate([edges[:, 0], edges[:, 1]])
+    cols = np.concatenate([edges[:, 1], edges[:, 0]])
+    data = np.ones(len(rows), dtype=np.float64)
+    adjacency = coo_matrix((data, (rows, cols)), shape=(n, n)).tocsr()
+    degree = np.asarray(adjacency.sum(axis=1)).ravel()
+
+    unknown_idx = np.where(unknown_mask)[0]
+    # 既知頂点と全くつながっていない未知頂点(孤立成分)は解けないので
+    # ベース色フォールバックのまま外す。
+    reachable = degree[unknown_idx] > 0
+    solvable_idx = unknown_idx[reachable]
+    if len(solvable_idx) == 0:
+        return colors
+
+    sub = adjacency[solvable_idx][:, solvable_idx]
+    sub_degree = degree[solvable_idx]
+    laplacian = coo_matrix(
+        (sub_degree, (np.arange(len(solvable_idx)), np.arange(len(solvable_idx)))),
+        shape=(len(solvable_idx), len(solvable_idx)),
+    ).tocsr() - sub
+
+    # 既知色からの寄与(ディリクレ境界条件)
+    known_contrib = adjacency[solvable_idx][:, known_mask]
+    known_rgb = colors[known_mask, :3].astype(np.float64)
+
+    solved_rgb = np.empty((len(solvable_idx), 3), dtype=np.float64)
+    for channel in range(3):
+        rhs = known_contrib @ known_rgb[:, channel]
+        solved_rgb[:, channel] = spsolve(laplacian.tocsc(), rhs)
+
+    colors[solvable_idx, :3] = np.clip(np.round(solved_rgb), 0, 255).astype(np.uint8)
+    colors[solvable_idx, 3] = 255
+    return colors
+
+
 def project_multiview_colors(
     mesh: trimesh.Trimesh,
     front_image: Image.Image,
@@ -357,7 +460,10 @@ def project_multiview_colors(
     - まず正面・背面のうち、正対して向いている頂点へそれぞれの画像を当てる。
     - 残りを左右側面の画像で埋める。
     - それでも残る頂点は、ゆるいしきい値で再度前後に拾わせる。
-    - どこにも当てはまらない頂点(真上・真下など)はベース色にする。
+    - どこにも当てはまらない頂点(真上・真下など)や、投影を信用できない
+      浅い角度の頂点は、メッシュ表面の調和補間(拡散)で周囲の色から埋める
+      (`_diffuse_unknown_vertex_colors`)。孤立成分などで拡散もできない
+      場合だけベース色になる。
 
     左右を正面・背面と同格に扱うと丸い顔が側面画像に置き換わって崩れるため、
     側面はあくまで補完に使う(`_SECONDARY_VIEWS` / `_PRIMARY_VIEW_MIN_DOT_WITH_SIDES`)。
@@ -395,10 +501,30 @@ def project_multiview_colors(
         # 側面でも埋まらなかった分は、当初のゆるいしきい値で前後に拾わせる
         for view, mask in _view_vertex_masks(mesh, primary).items():
             masks[view] |= mask & ~claimed
+            claimed |= masks[view]
 
     for view in available:
         view_colors = _project_image_colors(mesh, images[view], view=view)
         colors[masks[view]] = view_colors[masks[view]]
+
+    # 割当はされたが法線の食い違いが大きく投影が信用できない頂点は、
+    # 色を捨てて拡散に回す。side画像が無い(front/backのみの)ケースでは、
+    # 前後の担当しきい値が緩い(_VIEW_NORMAL_THRESHOLD=0.10)ため、視線から
+    # 70°以上ずれた面まで前後の色が浅い角度で引き伸ばされ側面に筋が出る。
+    # 顔などの正対領域(dotが高い)は従来と一致させたいので、side画像が
+    # 既に狭いしきい値(0.5)で前後を絞っているケースでは適用しない。
+    low_confidence = np.zeros(len(mesh.vertices), dtype=bool)
+    if primary and not secondary:
+        normals = _vertex_normals(mesh)
+        primary_scores = np.stack(
+            [normals @ np.asarray(_VIEW_NORMALS[v]) for v in primary]
+        )
+        best_dot = primary_scores.max(axis=0)
+        low_confidence = claimed & (best_dot < _LOW_CONFIDENCE_DOT_THRESHOLD)
+        claimed = claimed & ~low_confidence
+
+    known_mask = claimed
+    colors = _diffuse_unknown_vertex_colors(mesh, colors, known_mask, base_rgb)
 
     return colors
 

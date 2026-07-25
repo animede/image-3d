@@ -56,7 +56,15 @@ def test_project_colors_handles_rgb_image():
 
 
 def test_project_multiview_colors_keeps_back_base_without_back_image():
-    """背面画像が無い場合、背面には正面画像が回り込まずベース色になること。"""
+    """背面画像が無い場合、正面の投影色そのものは背面へ直接コピーされないこと。
+
+    以前は背面側が一律のベース色(灰色帯の原因)になっていたが、今は
+    メッシュ表面拡散(`_diffuse_unknown_vertex_colors`)が唯一の既知色である
+    正面色で埋めるため、背面もベース色ではなく正面色に近づく。これは
+    「未知頂点はベース色より周囲の色に近い方が良い」という設計通りの挙動。
+    front側の色は拡散の対象外(既知)であり従来通り正面画像のままである
+    ことだけを固定の契約として検証する。
+    """
     mesh = make_subdivided_box()
     front = make_solid_image([255, 0, 0, 255])
     colors = colorproc.project_multiview_colors(mesh, front)
@@ -65,7 +73,8 @@ def test_project_multiview_colors_keeps_back_base_without_back_image():
     assert front_mask.any()
     assert back_mask.any()
     assert (colors[front_mask, :3] == [255, 0, 0]).all()
-    assert (colors[back_mask, :3] == colorproc._DEFAULT_BASE_COLOR).all()
+    # 背面はベース色(灰)には残らず、拡散で正面色(既知色が赤のみ)に埋まる
+    assert not (colors[back_mask, :3] == colorproc._DEFAULT_BASE_COLOR).all()
 
 
 def test_project_multiview_colors_uses_back_image_for_back_vertices():
@@ -319,11 +328,14 @@ def test_grazing_vertices_go_to_the_side_images():
     assert got <= side_colours, f"側面以外の色が混ざっている: {got - side_colours}"
 
 
-def test_side_images_reduce_base_coloured_vertices():
-    """側面画像はベース色のままだった頂点を実際に減らす。
+def test_diffusion_removes_base_coloured_vertices_without_side_images():
+    """メッシュ表面拡散により、側面画像が無くてもベース色の頂点がほぼ無くなる。
 
-    正面/背面だけだと、真横を向いた頂点はどちらのしきい値も超えず
-    一律のベース色になる(実生成モデルで約9%)。
+    以前は正面/背面だけだと、真横を向いた頂点はどちらのしきい値も超えず
+    一律のベース色になっていた(実生成モデルで約9.1%)。案A(フチ除外+拡散)
+    導入後は、割当から漏れた頂点も既知頂点(前後の色)からの調和補間で
+    埋まるため、連結成分内にベース色は残らない(実測: 実生成ジョブで
+    9.1%→0%近くまで低減)。
     """
     mesh = _sphere()
     front = _solid_image((255, 0, 0))
@@ -333,16 +345,32 @@ def test_side_images_reduce_base_coloured_vertices():
         return int((colors[:, :3] == colorproc._DEFAULT_BASE_COLOR).all(axis=1).sum())
 
     without_sides = colorproc.project_multiview_colors(mesh, front, back_image=back)
+    assert base_count(without_sides) == 0
+
+
+def test_side_images_still_colour_the_side_region_distinctly():
+    """側面画像がある場合、真横寄りの頂点は拡散色ではなく側面画像の色になる。
+
+    拡散だけでも見た目上は隙間が埋まるが、側面専用の画像がある場合は
+    それを優先して使うべきなので、真横を向く頂点が side 画像の色そのもの
+    (前後色の中間の拡散色ではない)になっていることを確認する。
+    """
+    mesh = _sphere()
+    front = _solid_image((255, 0, 0))
+    back = _solid_image((0, 255, 0))
+    left = _solid_image((0, 0, 255))
+    right = _solid_image((255, 255, 0))
+
     with_sides = colorproc.project_multiview_colors(
-        mesh,
-        front,
-        back_image=back,
-        left_image=_solid_image((0, 0, 255)),
-        right_image=_solid_image((255, 255, 0)),
+        mesh, front, back_image=back, left_image=left, right_image=right
     )
 
-    assert base_count(without_sides) > 0, "前提: 側面画像が無いとベース色の頂点がある"
-    assert base_count(with_sides) < base_count(without_sides)
+    normals = colorproc._vertex_normals(mesh)
+    grazing = np.abs(normals[:, 0]) > 0.9  # ほぼ真横を向く
+    assert grazing.any()
+    side_colours = {(0, 0, 255), (255, 255, 0)}
+    got = {tuple(c) for c in with_sides[grazing, :3]}
+    assert got <= side_colours, f"側面以外の色が混ざっている: {got - side_colours}"
 
 
 def test_left_and_right_use_opposite_horizontal_direction():
@@ -471,3 +499,117 @@ def test_alignment_gives_up_on_a_featureless_silhouette():
     mesh = trimesh.creation.box(extents=(1.0, 1.0, 3.0))
     image = Image.new("RGBA", (64, 64), (255, 0, 0, 255))
     assert colorproc._align_vertical_by_silhouette(mesh, image, axis=0) is None
+
+
+# --- 案A: フチ除外サンプリング + メッシュ表面拡散 ------------------------------
+
+
+def _image_with_dirty_border(inner_color, border_color, size=64, border_px=2):
+    """前景の外周border_pxを別の色(汚れたフチを模した色)で塗ったRGBA画像。
+
+    rembg後のシルエット境界は背景と混ざって暗く汚れているため、外周1〜2pxを
+    黒くした合成画像でフチが実際にサンプリングされないことを検証する。
+    """
+    arr = np.zeros((size, size, 4), dtype=np.uint8)
+    arr[:, :] = (*inner_color, 255)
+    arr[:border_px, :] = (*border_color, 255)
+    arr[-border_px:, :] = (*border_color, 255)
+    arr[:, :border_px] = (*border_color, 255)
+    arr[:, -border_px:] = (*border_color, 255)
+    return Image.fromarray(arr, "RGBA")
+
+
+def test_edge_exclusion_avoids_sampling_the_dirty_border():
+    """前景外周の汚れた色(黒)が頂点カラーに出ないこと。
+
+    フチ除外サンプリングが無いと、外周ぎりぎりに投影された頂点が汚れた
+    黒フチをそのまま拾ってしまう。収縮後マスクで最近傍補完すれば、
+    フチではなく内側の色になるはず。
+    """
+    mesh = make_subdivided_box()
+    image = _image_with_dirty_border(
+        inner_color=(255, 0, 0), border_color=(0, 0, 0), size=64, border_px=2
+    )
+    colors = colorproc.project_colors(mesh, image)
+
+    # 頂点カラーに黒(フチ色)が一切含まれないこと
+    assert not (colors[:, :3] == (0, 0, 0)).all(axis=1).any(), "汚れたフチの黒が頂点カラーに残っている"
+    # 内側の色(赤)で埋まっていること
+    assert (colors[:, :3] == (255, 0, 0)).any()
+
+
+def test_trusted_pixel_mask_erodes_the_border():
+    """_trusted_pixel_mask が外周をアルファ>0領域より狭く収縮すること。"""
+    size = 64
+    alpha = np.zeros((size, size), dtype=np.uint8)
+    alpha[8:-8, 8:-8] = 255  # 中央だけ不透明な正方形
+
+    trusted = colorproc._trusted_pixel_mask(alpha)
+
+    assert trusted.sum() < (alpha > 0).sum(), "収縮されていない"
+    assert trusted.any(), "前景が全滅している"
+    # 収縮後マスクは元のアルファ領域に完全に含まれる
+    assert (trusted <= (alpha > 0)).all()
+
+
+def test_trusted_pixel_mask_falls_back_when_foreground_is_tiny():
+    """収縮で前景が全滅する極小前景では、収縮なしの元マスクにフォールバックする。"""
+    size = 64
+    alpha = np.zeros((size, size), dtype=np.uint8)
+    alpha[30:31, 30:31] = 255  # 1px だけの極小前景
+
+    trusted = colorproc._trusted_pixel_mask(alpha)
+
+    assert trusted.sum() == 1
+    np.testing.assert_array_equal(trusted, alpha > 0)
+
+
+def test_diffusion_fills_unknown_vertices_with_no_base_colour():
+    """icosphereに前(赤)/後(緑)のみ与えると、ベース色頂点が0になること。"""
+    mesh = _sphere()
+    front = _solid_image((255, 0, 0))
+    back = _solid_image((0, 255, 0))
+
+    colors = colorproc.project_multiview_colors(mesh, front, back_image=back)
+
+    base_count = int((colors[:, :3] == colorproc._DEFAULT_BASE_COLOR).all(axis=1).sum())
+    assert base_count == 0
+
+
+def test_diffusion_blends_red_and_green_at_the_equator():
+    """真横(赤と緑のちょうど中間)の頂点は、拡散により中間色になること。"""
+    mesh = _sphere()
+    front = _solid_image((255, 0, 0))  # -Y向き
+    back = _solid_image((0, 255, 0))  # +Y向き
+
+    colors = colorproc.project_multiview_colors(mesh, front, back_image=back)
+
+    normals = colorproc._vertex_normals(mesh)
+    # front/backどちらの法線しきい値も超えない、真横(Y成分がほぼ0)の頂点
+    equator = np.abs(normals[:, 1]) < 0.05
+    assert equator.any()
+
+    equator_colors = colors[equator, :3].astype(np.float64)
+    # 赤成分・緑成分がどちらも極端(0 or 255)に偏らず、中間色になっていること
+    assert (equator_colors[:, 0] > 20).all() and (equator_colors[:, 0] < 235).all()
+    assert (equator_colors[:, 1] > 20).all() and (equator_colors[:, 1] < 235).all()
+    # 青は前後どちらの画像にも無いので0のまま
+    assert (equator_colors[:, 2] == 0).all()
+
+
+def test_diffusion_leaves_front_facing_vertices_unchanged():
+    """拡散は既知頂点(顔=正対領域)の色を書き換えない。
+
+    「顔の再現性を損なわない」ことが最優先のため、正対して前を向く頂点は
+    拡散対象にならず、投影された正面画像の色のままであることを確認する。
+    """
+    mesh = _sphere()
+    front = _solid_image((255, 0, 0))
+    back = _solid_image((0, 255, 0))
+
+    colors = colorproc.project_multiview_colors(mesh, front, back_image=back)
+
+    normals = colorproc._vertex_normals(mesh)
+    straight_on = normals[:, 1] < -0.8  # 正面をほぼ正対して向く頂点
+    assert straight_on.any()
+    assert (colors[straight_on, :3] == (255, 0, 0)).all()
