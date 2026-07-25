@@ -6,6 +6,7 @@ watertight・高さ(mm)を機械検証する(DEVELOPMENT_POLICY.md §5)。
 """
 import base64
 import io
+import json
 import time
 
 import numpy as np
@@ -570,7 +571,7 @@ def test_rig_endpoint_forwards_glb_and_returns_preview_url(client, monkeypatch):
     }
     # 実際に生成済みGLBが送られていること
     assert sent["glb"].startswith(b"glTF")
-    assert sent["params"] == '{"height_m":1.2}'
+    assert json.loads(sent["params"])["height_m"] == 1.2
     # VRMのタイトルが元画像名から決まるよう、拡張子だけglbに替えて渡す
     assert sent["filename"] == "t.glb"
 
@@ -610,3 +611,59 @@ def test_rig_endpoint_unknown_job(client, monkeypatch):
 
     monkeypatch.setattr(config, "RIGSVC_URL", "http://rigsvc.test")
     assert client.post("/api/jobs/does-not-exist/rig").status_code == 404
+
+
+def test_rig_endpoint_declares_image3d_coordinate_conventions(client, monkeypatch):
+    """image-3d は自分の出力規約を知っているので、rig-service に推測させない。
+
+    正面の自動判定は生成物77体で86〜91%しか当たらず、特に pixal3d の出力では
+    足の手がかりが機能しない(3/8)。座標系は生成側が宣言するのが確実。
+    """
+    from server import config, main as main_module
+
+    monkeypatch.setattr(config, "RIGSVC_URL", "http://rigsvc.test")
+    sent = {}
+
+    async def fake_post(filename, glb_bytes, params):
+        sent["params"] = json.loads(params)
+        return {"job_id": "rig-1"}
+
+    monkeypatch.setattr(main_module, "_post_to_rig_service", fake_post)
+
+    job_id = _completed_job_id(client)
+    assert client.post(f"/api/jobs/{job_id}/rig").status_code == 200
+    assert sent["params"]["up_axis"] == "z"
+    assert sent["params"]["facing"] == "-y"
+
+
+def test_rig_endpoint_lets_caller_override_conventions(client, monkeypatch):
+    """検証用に上書きできること(宣言はあくまで既定値)。"""
+    from server import config, main as main_module
+
+    monkeypatch.setattr(config, "RIGSVC_URL", "http://rigsvc.test")
+    sent = {}
+
+    async def fake_post(filename, glb_bytes, params):
+        sent["params"] = json.loads(params)
+        return {"job_id": "rig-1"}
+
+    monkeypatch.setattr(main_module, "_post_to_rig_service", fake_post)
+
+    job_id = _completed_job_id(client)
+    res = client.post(
+        f"/api/jobs/{job_id}/rig",
+        data={"params": json.dumps({"facing": "auto", "height_m": 1.2})},
+    )
+    assert res.status_code == 200
+    assert sent["params"]["facing"] == "auto"
+    assert sent["params"]["height_m"] == 1.2
+    assert sent["params"]["up_axis"] == "z"
+
+
+def test_rig_endpoint_rejects_malformed_params(client, monkeypatch):
+    from server import config
+
+    monkeypatch.setattr(config, "RIGSVC_URL", "http://rigsvc.test")
+    job_id = _completed_job_id(client)
+    res = client.post(f"/api/jobs/{job_id}/rig", data={"params": "{not json"})
+    assert res.status_code == 400

@@ -309,6 +309,35 @@ async def _post_to_rig_service(filename: str, glb_bytes: bytes, params: Optional
     return response.json()
 
 
+def _rig_params_with_image3d_conventions(params: Optional[str]) -> str:
+    """rig-service へ渡す params に image-3d の座標系規約を明示する。
+
+    rig-service は未知のGLBも受け取るため上方向・正面を推定できるが、推定は
+    完璧ではない(実測: 正面判定は生成物77体に対して86〜91%)。**image-3d は
+    自分の出力規約を確実に知っている**ので、推測させずに宣言する:
+
+    - 上方向は Z(`server/generators/*` が全ジェネレータの出力をZ-upへ変換する)
+    - 正面は -Y(同上。hunyuan3d は X軸+90°、pixal3d は X軸180°回転で揃える)
+
+    呼び出し側が明示した値はそのまま尊重する(検証用に上書きできるように)。
+    """
+    data: dict = {}
+    if params:
+        try:
+            data = json.loads(params)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(
+                status_code=400, detail=f"paramsのJSONが不正です: {exc}"
+            ) from exc
+        if not isinstance(data, dict):
+            raise HTTPException(
+                status_code=400, detail="paramsはJSONオブジェクトである必要があります。"
+            )
+    data.setdefault("up_axis", "z")
+    data.setdefault("facing", "-y")
+    return json.dumps(data)
+
+
 @app.post("/api/jobs/{job_id}/rig")
 async def send_job_to_rig_service(job_id: str, params: Optional[str] = Form(None)):
     """完了ジョブの model.glb を rig-service へ送る (別リポジトリ rig-service の計画書 §7 R4-1)。
@@ -339,7 +368,9 @@ async def send_job_to_rig_service(job_id: str, params: Optional[str] = Form(None
     filename = f"{filename.rsplit('.', 1)[0]}.glb"
 
     try:
-        result = await _post_to_rig_service(filename, glb_bytes, params)
+        result = await _post_to_rig_service(
+            filename, glb_bytes, _rig_params_with_image3d_conventions(params)
+        )
     except HTTPException:
         raise
     except Exception as exc:
