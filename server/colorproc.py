@@ -70,6 +70,21 @@ _VIEW_U_AXIS = {
 
 VIEW_NAMES = tuple(_VIEW_NORMALS)
 
+# 正面・背面を優先し、左右側面は補完に使う。
+#
+# 4ビューを同格に扱うと、丸い顔は頬の法線が横を向くため**顔まわりの55%が側面画像に
+# 置き換わり**、目や口元がぼやけて崩れた(実測: 顔まわり28857頂点のうち front は30%
+# だけ)。側面画像は見切れをシルエット照合で外挿しており位置精度も落ちる。
+_PRIMARY_VIEWS = ("front", "back")
+_SECONDARY_VIEWS = ("left", "right")
+
+# 側面画像がある場合に、正面・背面が担当する範囲を狭めるしきい値。
+# 既定の 0.10 は法線が視線から84°ずれていても前面扱いにするため、ほぼ真横の面まで
+# 前後の色が浅い角度で引き伸ばされ、側面に黒い継ぎ目ができる(実測: ほぼ真横を向く
+# 18100頂点のうち79%が前後担当のままだった)。0.5(=60°以内)なら真横の98%が側面へ
+# 回り、正面を正対して向く顔は前面のまま残る。
+_PRIMARY_VIEW_MIN_DOT_WITH_SIDES = 0.5
+
 # ビュー判定に使う法線しきい値。どのビューにも十分向いていない頂点
 # (真上・真下を向く面など)はベース色にする。
 _VIEW_NORMAL_THRESHOLD = 0.10
@@ -304,7 +319,9 @@ def _vertex_normals(mesh: trimesh.Trimesh) -> np.ndarray:
 
 
 def _view_vertex_masks(
-    mesh: trimesh.Trimesh, views: list[str]
+    mesh: trimesh.Trimesh,
+    views: list[str],
+    threshold: float = _VIEW_NORMAL_THRESHOLD,
 ) -> dict[str, np.ndarray]:
     """各頂点を、法線が最もよく向いているビューへ割り当てる。
 
@@ -317,7 +334,7 @@ def _view_vertex_masks(
     normals = _vertex_normals(mesh)
     scores = np.stack([normals @ np.asarray(_VIEW_NORMALS[v]) for v in views])
     best = scores.argmax(axis=0)
-    visible = scores.max(axis=0) > _VIEW_NORMAL_THRESHOLD
+    visible = scores.max(axis=0) > threshold
     return {view: (best == i) & visible for i, view in enumerate(views)}
 
 
@@ -337,12 +354,13 @@ def project_multiview_colors(
 ) -> np.ndarray:
     """複数ビューの画像を頂点法線で振り分けて投影する。
 
-    - 各頂点は、法線が最もよく向いているビューの画像から色を取る。
-    - どのビューにも十分向いていない頂点(真上・真下など)はベース色にする。
+    - まず正面・背面のうち、正対して向いている頂点へそれぞれの画像を当てる。
+    - 残りを左右側面の画像で埋める。
+    - それでも残る頂点は、ゆるいしきい値で再度前後に拾わせる。
+    - どこにも当てはまらない頂点(真上・真下など)はベース色にする。
 
-    これにより、正面画像が背面や側面へ薄く回り込む簡易投影を避ける。
-    左右画像を与えると、正面/背面だけでは一律ベース色になっていた側面の頂点
-    (実測でモデル全体の約9%)にも実際の色が付く。
+    左右を正面・背面と同格に扱うと丸い顔が側面画像に置き換わって崩れるため、
+    側面はあくまで補完に使う(`_SECONDARY_VIEWS` / `_PRIMARY_VIEW_MIN_DOT_WITH_SIDES`)。
     """
     if base_color is None:
         base_rgb = _DEFAULT_BASE_COLOR
@@ -360,7 +378,23 @@ def project_multiview_colors(
         "right": right_image,
     }
     available = [view for view in VIEW_NAMES if images[view] is not None]
-    masks = _view_vertex_masks(mesh, available)
+    primary = [view for view in available if view in _PRIMARY_VIEWS]
+    secondary = [view for view in available if view in _SECONDARY_VIEWS]
+
+    # 側面で補完できるなら、前後は正対している面だけを担当する
+    threshold = _PRIMARY_VIEW_MIN_DOT_WITH_SIDES if secondary else _VIEW_NORMAL_THRESHOLD
+    masks = _view_vertex_masks(mesh, primary, threshold) if primary else {}
+    claimed = np.zeros(len(mesh.vertices), dtype=bool)
+    for mask in masks.values():
+        claimed |= mask
+
+    if secondary:
+        for view, mask in _view_vertex_masks(mesh, secondary).items():
+            masks[view] = mask & ~claimed
+            claimed |= masks[view]
+        # 側面でも埋まらなかった分は、当初のゆるいしきい値で前後に拾わせる
+        for view, mask in _view_vertex_masks(mesh, primary).items():
+            masks[view] |= mask & ~claimed
 
     for view in available:
         view_colors = _project_image_colors(mesh, images[view], view=view)

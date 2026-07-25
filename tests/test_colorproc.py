@@ -272,23 +272,51 @@ def test_view_masks_are_backward_compatible_with_front_back():
     assert np.array_equal(masks["back"], normals[:, 1] > threshold)
 
 
-def test_side_images_colour_the_side_vertices():
-    """左右画像を渡すと、側面の頂点がその画像の色になる。"""
+def test_front_facing_vertices_keep_the_front_image():
+    """正面をまっすぐ向いた頂点は、側面画像を足しても正面画像のままであること。
+
+    4ビューを同格に扱うと、丸い顔の頬が側面画像に置き換わって顔が崩れた
+    (実機で顔まわりの55%が側面画像になった)。
+    """
     mesh = _sphere()
     front = _solid_image((255, 0, 0))
     back = _solid_image((0, 255, 0))
-    left = _solid_image((0, 0, 255))
-    right = _solid_image((255, 255, 0))
 
-    colors = colorproc.project_multiview_colors(
-        mesh, front, back_image=back, left_image=left, right_image=right
+    four_view = colorproc.project_multiview_colors(
+        mesh,
+        front,
+        back_image=back,
+        left_image=_solid_image((0, 0, 255)),
+        right_image=_solid_image((255, 255, 0)),
     )
 
-    masks = colorproc._view_vertex_masks(mesh, list(colorproc.VIEW_NAMES))
-    for view, expected in (("left", (0, 0, 255)), ("right", (255, 255, 0))):
-        mask = masks[view]
-        assert mask.any(), f"{view} に割り当てられた頂点が無い"
-        assert (colors[mask, :3] == expected).all(), f"{view} 画像の色になっていない"
+    normals = colorproc._vertex_normals(mesh)
+    straight_on = normals[:, 1] < -0.8  # 正面をほぼ正対して向く頂点
+    assert straight_on.any()
+    assert (four_view[straight_on, :3] == (255, 0, 0)).all()
+
+
+def test_grazing_vertices_go_to_the_side_images():
+    """ほぼ真横を向いた面は、前後の引き伸ばしではなく側面画像から色を取る。
+
+    しきい値が緩いと視線から84°ずれた面まで前後担当になり、浅い角度で
+    引き伸ばされた色が側面でぶつかって黒い継ぎ目になる。
+    """
+    mesh = _sphere()
+    four_view = colorproc.project_multiview_colors(
+        mesh,
+        _solid_image((255, 0, 0)),
+        back_image=_solid_image((0, 255, 0)),
+        left_image=_solid_image((0, 0, 255)),
+        right_image=_solid_image((255, 255, 0)),
+    )
+
+    normals = colorproc._vertex_normals(mesh)
+    grazing = np.abs(normals[:, 0]) > 0.9  # ほぼ真横を向く
+    assert grazing.any()
+    side_colours = {(0, 0, 255), (255, 255, 0)}
+    got = {tuple(c) for c in four_view[grazing, :3]}
+    assert got <= side_colours, f"側面以外の色が混ざっている: {got - side_colours}"
 
 
 def test_side_images_reduce_base_coloured_vertices():
