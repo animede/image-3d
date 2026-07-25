@@ -99,6 +99,14 @@ if PIXAL3D_RASTERIZER not in _PIXAL3D_RASTERIZER_CHOICES:
     )
 
 
+# --- rig-service 連携 (別リポジトリ rig-service の docs/RIG_SERVICE_PLAN.md §7 R4) ---
+# 生成済みモデルにボーンを付けてVRM化する独立サービスのベースURL
+# (例: http://127.0.0.1:8100)。**未設定ならUIに「リグ/VRM化」ボタンを出さない**。
+# image-3d はGLBをPOSTして返ってきたジョブのURLを開くだけの疎結合を保つ。
+RIGSVC_URL = os.environ.get("IMAGE3D_RIGSVC_URL", "").rstrip("/") or None
+RIGSVC_TIMEOUT_SEC = float(os.environ.get("IMAGE3D_RIGSVC_TIMEOUT_SEC", "60"))
+
+
 def ensure_dirs() -> None:
     """必要なディレクトリを作成する。"""
     JOBS_DIR.mkdir(parents=True, exist_ok=True)

@@ -6,9 +6,8 @@ Web UIの使い方は [`docs/USAGE.md`](docs/USAGE.md)、詳細仕様は
 [`docs/SPEC.md`](docs/SPEC.md)、開発方針は
 [`docs/DEVELOPMENT_POLICY.md`](docs/DEVELOPMENT_POLICY.md)、実装計画は
 [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md) を参照。
-
-バグ報告・機能要望は [Issues](https://github.com/animede/image-3d/issues)、
-コントリビューションは [CONTRIBUTING.md](CONTRIBUTING.md) を参照してください。
+自動リグ+VRM化サービス **rig-service は別リポジトリ**(`../rig-service/`)。
+設計・実装計画はそちらの `docs/RIG_SERVICE_PLAN.md` を参照。
 
 ## 現在の状態(Phase 1〜3b)
 
@@ -27,9 +26,11 @@ Web UIの使い方は [`docs/USAGE.md`](docs/USAGE.md)、詳細仕様は
   「Phase 3c: テクスチャ生成 (texgen)」参照)。custom_rasterizer CUDA拡張の
   ビルドが必要で、未導入環境では `/api/health` の `texgen_available=false` に
   応じてUI上で無効表示し、正面/背面投影方式(FR-8)にフォールバックする。
-- 3つ目のジェネレータとして **Pixal3D**(MITライセンス、PBRテクスチャ付き出力)を
-  統合(下記「Pixal3Dジェネレータ」参照)。専用venv `.venv-pixal3d` +
-  `IMAGE3D_GENERATOR=pixal3d` の明示指定で使用する。
+- Phase R4 で **自動リグ+VRM化サービス(rig-service、別リポジトリ)
+  との連携**に対応(下記「Phase R4: リグ/VRM化サービス連携」参照)。
+  `IMAGE3D_RIGSVC_URL` を設定すると完了ジョブに「リグ/VRM化」ボタンが出る。
+  **Tポーズの立ち絵から生成したモデル**を送ると、21ボーンのリグ済みGLBと
+  VRM 1.0 が得られる。
 
 ## セットアップ
 
@@ -130,23 +131,12 @@ $env:IMAGE3D_PORT = "8000"
 
 | 変数 | デフォルト | 説明 |
 |---|---|---|
-| `IMAGE3D_GENERATOR` | `auto` | `auto` \| `mock` \| `hunyuan3d` \| `pixal3d`。`auto` はGPU+hy3dgenが利用可能なら `hunyuan3d`、なければ `mock` に自動解決(`pixal3d` は専用venvでの明示指定のみ。「Pixal3Dジェネレータ」の節を参照) |
+| `IMAGE3D_GENERATOR` | `mock` | `mock` \| `hunyuan3d` |
 | `IMAGE3D_HOST` | `127.0.0.1` | バインドアドレス |
 | `IMAGE3D_PORT` | `8000` | ポート |
 | `IMAGE3D_MAX_UPLOAD_BYTES` | `20971520`(20MB) | アップロード上限 |
 | `IMAGE3D_DEFAULT_TARGET_HEIGHT_MM` | `100` | 後処理のデフォルト目標高さ |
 | `IMAGE3D_DEFAULT_MAX_FACES` | `200000` | 後処理のデフォルト面数上限 |
-
-### アップロード画像と無関係なテスト形状が生成されるとき
-
-mockジェネレータで動作している(画像を反映しない開発用の固定形状を返す)。
-UIヘッダ右上の「生成エンジン」バッジ、または `GET /api/health` の `generator` で
-確認できる。mock時はUI上部に警告バナーも表示される。対処:
-
-1. GPU導入手順(後述のPhase 2節)を完了させる。`IMAGE3D_GENERATOR` 未指定
-   (= `auto`)なら、GPU+hy3dgenが使える環境では自動的に `hunyuan3d` が選ばれる。
-2. autoでmockになってしまう場合は `IMAGE3D_GENERATOR=hunyuan3d ./run.sh` で
-   明示起動し、起動ログのエラー(torch/hy3dgen未導入、CUDA不可等)を確認する。
 
 ## API例
 
@@ -680,197 +670,69 @@ curl -s -X POST http://127.0.0.1:8000/api/jobs \
   追加するパッチが必要(上記セットアップ参照)。third_party ディレクトリを
   再取得(git clone)した場合は再適用が必要。
 
-## Pixal3Dジェネレータ(MITライセンス、実機検証済み)
+## Phase R4: リグ/VRM化サービス連携 (rig-service)
 
-[Pixal3D](https://github.com/TencentARC/Pixal3D)(TencentARC、SIGGRAPH 2026、
-TRELLIS.2基盤)を3つ目のジェネレータとして統合している。単一画像から
-PBRテクスチャ付きの3Dメッシュを生成し、本アプリではテクスチャの
-baseColorを頂点カラーとしてサンプリングして活用する(GLBは頂点カラー付きで
-保存、`color_mode=color4` ではそのカラーから量子化・色分割3MFを出力)。
+生成した3Dモデルに**ヒューマノイドボーンを自動で付与**し、VRM 1.0 として
+書き出す**別リポジトリのサービス** rig-service と連携できる。
+image-3d は生成済みGLBをPOSTしてジョブURLを開くだけの疎結合で、
+リグ結果は保持しない(コードの相互参照は無く、繋がりはHTTPのみ)。
 
-### ライセンス上の利点
+### ワークフロー: Tポーズ画像で生成 → リグ化
 
-Hunyuan3D-2 が独自のコミュニティライセンス(地域制限・MAU制限)なのに対し、
-**Pixal3D はコードもモデル重みもMITライセンス**であり、ライセンス面での制約が
-大幅に少ない。
+1. **Tポーズの立ち絵を用意する**(腕を左右へ水平に広げた姿勢)。
+   これがリグ品質を決める最重要ポイント。rig-service は腕の張り出しから
+   肩の高さを実測するため、腕を下ろした画像だと関節位置を推定できず
+   人体標準比での代用になり精度が大きく落ちる(その旨が警告として返る)。
+   頭身の低いデフォルメ体型・動物型キャラでも、Tポーズでさえあれば
+   股下・肩・首・脚幅はメッシュから実測されるので問題ない。
+2. 通常どおり image-3d で3Dモデルを生成する。
+3. rig-service を起動する(別ターミナル)。rig-service は別リポジトリなので、
+   未取得なら先に clone してセットアップする(手順はそちらの README 参照)。
 
-GLB化のテクスチャベイク(`o_voxel.postprocess.to_glb`)には UV空間での平面
-ラスタライズが必要で、upstream実装は nvdiffrast(NVIDIA Source Code License、
-**非商用限定**)に依存している。本アプリはこの依存を除去するため、
-`server/generators/pixal3d_raster.py` に **drtk(Meta製、MIT、
-https://github.com/facebookresearch/drtk)** で同じ呼び出し規約
-(`RasterizeCudaContext` / `rasterize` / `interpolate`)を再現したシムを実装し、
-`to_glb` 呼び出し前に `o_voxel.postprocess.dr` をこのシムへ差し替える
-(`IMAGE3D_PIXAL3D_RASTERIZER`、既定 `auto`。詳細は次節)。
-これにより既定構成では nvdiffrast を一切使用せず、GLB化経路もMITライセンス
-クリーンになる。nvdiffrastは drtk が利用できない環境向けの明示的フォールバック
-としてのみ残している。
+   ```bash
+   cd ../rig-service
+   ./run.sh                       # http://127.0.0.1:8100
+   ```
 
-ただし、画像条件付けに使う **DINOv3 の重み**(`camenduru/dinov3-vitl16-pretrain-lvd1689m`、
-Metaの `facebook/dinov3-vit7b16-pretrain-lvd1689m` からの蒸留モデル)は
-Meta独自の **DINOv3 License** であり、完全なMITではない点に注意
-(商用利用自体は許可されているが、attribution表示等の付帯義務がある。
-詳細は「利用しているOSS」節の別表を参照)。以上より、Pixal3D構成は
-「コード全体がMIT」ではあるが、**DINOv3重みを含めた構成全体としては
-完全MITとは言えない**(重み・ライセンス面での完全クリーンではない)。
+4. image-3d を `IMAGE3D_RIGSVC_URL` 付きで起動する。
 
-### 隔離venvのセットアップ
+   ```bash
+   IMAGE3D_RIGSVC_URL=http://127.0.0.1:8100 ./run.sh
+   ```
 
-Pixal3D は Python 3.10 と独自の依存ピン(trimesh==4.10.1 等)を要求するため、
-既存の `.venv`(Python 3.12)とは**完全に分離した専用venv `.venv-pixal3d`** を使う。
-既存venvには1パッケージも追加しない。手順の詳細・注意点は
-`requirements-pixal3d.txt` のコメントに集約してある。要約:
+5. 完了したジョブを選び、エクスポート欄の **「リグ/VRM化」** ボタンを押す。
+   別タブで rig-service が開き、リグ結果(ボーン数・ウェイト付与率・
+   Tポーズ判定・警告)とダウンロードリンクが表示される。
+
+**`IMAGE3D_RIGSVC_URL` が未設定ならボタンは表示されない**(`/api/health` の
+`rigsvc_url` で判定)。rig-service を使わない運用に影響はない。
+
+### API
 
 ```bash
-# 1. venv作成 + torch (Blackwell対応 cu128)
-uv venv .venv-pixal3d --python 3.10
-uv pip install --python .venv-pixal3d/bin/python torch torchvision \
-    --index-url https://download.pytorch.org/whl/cu128
-
-# 2. pip依存
-uv pip install --python .venv-pixal3d/bin/python -r requirements-pixal3d.txt
-
-# 3. リポジトリclone(pipインストールせずsys.path経由でimportする)
-git clone https://github.com/TencentARC/Pixal3D third_party/Pixal3D
-git clone -b main --recursive https://github.com/microsoft/TRELLIS.2.git third_party/TRELLIS.2
-
-# 4. CUDA拡張ビルド(CUDA 12.8ツールチェーンを明示。CUDACXXの明示が重要 —
-#    cmakeがシステム既定の /usr/bin/nvcc (CUDA 13.0) を拾うとglibcヘッダ非互換で失敗する)
-export CUDA_HOME=/usr/local/cuda-12.8
-export CUDACXX=/usr/local/cuda-12.8/bin/nvcc
-export PATH="$CUDA_HOME/bin:$PATH"
-export TORCH_CUDA_ARCH_LIST="12.0"
-
-uv pip install --python .venv-pixal3d/bin/python --no-build-isolation third_party/TRELLIS.2/o-voxel
-
-# ラスタライザ: drtk (MIT) を優先導入する。git経由のソースビルド (実測: sm_120で約3分40秒)。
-uv pip install --python .venv-pixal3d/bin/python --no-build-isolation \
-    "git+https://github.com/facebookresearch/drtk.git"
-# nvdiffrast はdrtkが使えない場合のフォールバックのみ (非商用ライセンス、下記参照)。
-# drtkのみ導入していれば省略可。
-uv pip install --python .venv-pixal3d/bin/python --no-build-isolation \
-    "git+https://github.com/NVlabs/nvdiffrast.git@v0.4.0"
-
-# 5. NATTEN(NAF特徴アップサンプラの必須依存。sm_120ソースビルド、実測9分強)
-NATTEN_CUDA_ARCH="12.0" NATTEN_N_WORKERS=8 uv pip install \
-    --python .venv-pixal3d/bin/python natten==0.21.0 --no-build-isolation
+# 完了ジョブのGLBを rig-service へ送る(paramsは任意、rig-serviceにそのまま渡る)
+curl -s -X POST http://127.0.0.1:8000/api/jobs/<job_id>/rig \
+  -F 'params={"height_m":1.6,"vrm_meta":{"authors":["yourname"]}}'
+# => {"rig_job_id": "...", "url": "http://127.0.0.1:8100/?job=..."}
 ```
 
-flash_attn は導入せず、**SDPAバックエンド**(`ATTN_BACKEND=sdpa` /
-`SPARSE_ATTN_BACKEND=sdpa`)を使う(Blackwellでflash_attnのプリビルドが
-torch ABI不一致のため)。モデル重みは初回生成時にHuggingFaceから自動DLされる
-(TencentARC/Pixal3D 約23GB + DINOv3 約1.2GB + NAF重み約2.5MB)。
+数十MBのGLBをブラウザに往復させないため、また rig-service 側にCORS設定を
+強いないため、**サーバ経由で転送する**(ブラウザから直接POSTしない)。
 
-### 起動
+| 状態 | 応答 |
+|---|---|
+| `IMAGE3D_RIGSVC_URL` 未設定 | 503 |
+| ジョブが未完了 | 409 |
+| rig-service に接続できない / エラー応答 | 502(image-3d 側は落ちない) |
 
-```bash
-env IMAGE3D_GENERATOR=pixal3d ATTN_BACKEND=sdpa SPARSE_ATTN_BACKEND=sdpa \
-    CUDA_HOME=/usr/local/cuda-12.8 \
-    .venv-pixal3d/bin/uvicorn server.main:app --host 127.0.0.1 --port 8022
-```
+### 出力
 
-`.claude/launch.json` の `image3d-server-pixal3d`(ポート8022)にも同じ構成を
-定義済み。`IMAGE3D_GENERATOR=auto` では解決されない(明示指定のみ)。
+rig-service からは以下が得られる(詳細は rig-service の README):
 
-主な環境変数(`server/config.py`):
-
-| 変数 | デフォルト | 説明 |
-|---|---|---|
-| `IMAGE3D_PIXAL3D_LOW_VRAM` | `true` | 低VRAMモード(モデルCPU常駐、ステージごとにGPUへ) |
-| `IMAGE3D_PIXAL3D_RESOLUTION` | `1024` | パイプライン解像度(1024 / 1536) |
-| `IMAGE3D_PIXAL3D_FOV` | `0.6` | カメラ水平FOV(ラジアン)。MoGe自動推定は不使用 |
-| `IMAGE3D_PIXAL3D_TEXTURE_SIZE` | `2048` | GLB化時のテクスチャベイクサイズ |
-| `IMAGE3D_PIXAL3D_MODEL_PATH` | `TencentARC/Pixal3D` | HFリポジトリID |
-| `IMAGE3D_PIXAL3D_RASTERIZER` | `auto` | `auto` \| `drtk` \| `nvdiffrast`。GLB化のUVテクスチャベイクに使うラスタライザ。`auto` はdrtk (MIT) がimport可能ならdrtkを使い、無ければnvdiffrast (非商用ライセンス) にフォールバックしてログ出力する。`drtk`/`nvdiffrast` を明示指定した場合、それが利用不可だとエラーになる |
-
-### ラスタライザ切替(drtk / nvdiffrast)
-
-`o_voxel.postprocess.to_glb` はUVアトラスへのテクスチャベイクに
-`RasterizeCudaContext` / `rasterize` / `interpolate` の3 APIを使う。upstream
-実装はこれを nvdiffrast (NVIDIA Source Code License、非商用限定) で呼んでいるが、
-本アプリは `server/generators/pixal3d_raster.py` に **drtk (Meta製、MIT)** で
-同じ呼び出し規約・戻り値規約を再現したシムを実装し、`Pixal3DGenerator` が
-`to_glb` 呼び出し直前に `o_voxel.postprocess.dr` をこのシムに差し替える
-(`select_rasterizer_module` / `_inject_rasterizer`、`server/generators/pixal3d.py`)。
-
-- 座標系の差(nvdiffrastはOpenGL式でrow0=画像下端、drtkはピクセル座標で
-  row0=画像上端)はシム内でY軸反転により吸収し、シムの入出力はnvdiffrast
-  互換のまま維持している。
-- 重心座標の頂点対応(nvdiffrastの `u`/`v` がどの頂点の重みに対応するか)は
-  実機でのA/B検証(one-hot頂点属性を`interpolate`に通し、出力との相関を確認)
-  で確定させた(`u`=頂点0の重み、`v`=頂点1の重み)。
-- 実機A/B検証(ランダムなUVメッシュ、数百面、nvdiffrastとdrtkシムの両方で
-  ラスタライズし比較): face IDマップの一致率99.9%以上(不一致は三角形境界の
-  1px差のみ)、一致した画素でのバリセントリック座標・interpolate結果は
-  浮動小数点誤差程度(最大差 ~1e-6)で一致することを確認済み。
-- drtk・nvdiffrastのどちらも未導入の場合は `RuntimeError`(明示的なエラー)
-  になる。
-
-### Hunyuan3D-2との比較実測値(RTX PRO 6000 Blackwell、momo.png、seed=42)
-
-| 項目 | Hunyuan3D-2(形状のみ) | Hunyuan3D-2(+texgen) | Pixal3D(1024・低VRAM・steps=30) |
-|---|---|---|---|
-| 生成時間(モデル常駐後) | 22〜35秒 | 60〜90秒 | 約97秒(生成+GLB化)+後処理21秒 |
-| 初回追加(モデルロード) | 数十秒 | 数十秒 | 約50〜60秒(23GB) |
-| プロセスVRAMピーク | 約12GB | 約25GB | **約18.7GB** |
-| テクスチャ/色 | なし(投影方式で色付け) | 全周テクスチャ | **全周PBRテクスチャ→頂点カラー** |
-| watertight | true(体積計算可) | true | **false**(ボクセルリメッシュ由来、体積は0表示) |
-| メッシュ統計(momo.png) | 約109cm³ / watertight | 同左 | 98,107頂点 / 200,000面 / bbox 67.4×48.3×100.0mm |
-| パレット(color4) | 投影ベース | テクスチャサンプル | テクスチャサンプル(白70% / 紺21% / 灰5% / 赤4%) |
-| ライセンス | 独自(地域・MAU制限) | 同左 | **MIT(重みまで)** ※DINOv3重みは別ライセンス、下記OSS一覧参照 |
-
-- Pixal3D の生成時間は初回ジョブでさらに +2〜4分かかることがある
-  (FlexGEMMカーネルautotune・ラスタライザのJITコンパイルが初回のみ走るため。
-  2回目以降はディスクキャッシュで高速化)。
-- 低VRAMモード(既定)はステージごとにモデルをGPUへ載せ替えるため遅いが
-  ピークVRAMを抑える。96GB環境では `IMAGE3D_PIXAL3D_LOW_VRAM=false` +
-  `IMAGE3D_PIXAL3D_RESOLUTION=1536` で品質・速度を上げられる(未計測)。
-
-**drtkバックエンドでのE2E再検証(2026-07-09、ポート8022、
-`IMAGE3D_PIXAL3D_RASTERIZER=drtk`明示指定、momo.png、seed=42、color_mode=color4)**:
-
-| 項目 | nvdiffrastバックエンド(ジョブ58d8e1d0) | drtkバックエンド(ジョブb716c24a、本検証) |
-|---|---|---|
-| 総所要時間(モデルロード込み) | — | 121秒(モデルロード含む初回実行) |
-| 頂点数 | 98,107 | 98,105 |
-| 面数 | 200,000 | 200,000 |
-| bbox (mm) | 67.37 × 48.30 × 100.02 | 67.38 × 48.35 × 100.03 |
-| watertight | false | false |
-| パレット(color4) | 白70% / 紺21% / 灰5% / 赤4% | 白系44% / 水色系28% / 紺系23% / 灰系5%(構成比) |
-
-頂点数・面数・bboxはほぼ完全に一致しており、drtkベースのラスタライズが
-nvdiffrast版と幾何学的に等価な結果を生成することを確認した(GLBの頂点カラーも
-正常にサンプリング・保存されていることを確認済み)。パレットの正確な色相・
-構成比はジョブ間で差があるが、これは拡散サンプリングそのものの実行間非決定性
-(torch/CUDAのattentionカーネル等)によるもので、ラスタライザ差とは無関係
-(頂点/面数/bboxのメッシュ形状自体は同一シードで再現しているため)。
-
-### 制限・実装メモ
-
-- **マルチビュー入力(FR-9)非対応**: `image_back` 等を指定するとジョブは
-  明示的なエラーで失敗する。単一画像専用。
-- **texture_mode=paint 非対応**: texgen は hy3dgen 依存のため `.venv-pixal3d`
-  では利用不可(paint指定時は警告を記録して投影方式にフォールバック)。
-  そもそも Pixal3D 自体が全周テクスチャを生成するため不要。
-- **パラメータは steps / seed のみ接続**: guidance_scale / octree_resolution は
-  Pixal3D のステージごとに調整済みの既定値と互換性が無いため無視される。
-  steps はデフォルト30だが、Pixal3D 公式デフォルトは12(30でも動作するが
-  サンプリングが遅くなる。速度優先なら steps=12 を指定)。
-- **背景除去必須**: Pixal3D 公式の背景除去モデル(briaai/RMBG-2.0)はHFの
-  ゲート付きリポジトリのためロードせず、本アプリの背景除去(rembg CPU)の
-  結果を渡す。`remove_bg=false` でアルファ無し画像を送るとエラーになる。
-- **watertightにならない**: ボクセルリメッシュ出力は閉じたソリッドではなく、
-  体積は0と表示される。スライサーでの印刷は通常問題ないが、体積ベースの
-  見積りはできない。確実なwatertightが必要なら hunyuan3d を使う。
-- **UVシーム由来の頂点分断は自動修復**: `o_voxel` のGLB出力はUVアトラス境界で
-  頂点が複製され数万個の連結成分に分断されているため、ジェネレータ内で
-  頂点溶接(`merge_vertices`)してから後処理に渡す(これを外すと
-  浮遊小部品除去が本体表面を削除してしまう。server/generators/pixal3d.py参照)。
-- **座標系**: Pixal3D のGLB出力は 上=-Z / 正面=+Y(実測確認)。X軸まわり
-  180°回転で本アプリの Z-up / 正面=-Y に変換している。
-- **カメラFOVは固定値**: 公式の MoGe による自動FOV推定は導入していない
-  (`IMAGE3D_PIXAL3D_FOV`、既定0.6rad ≈ 34°)。入力画像の遠近感が強い場合は
-  調整の余地がある。
+- **リグ済みGLB** — glTF仕様準拠(Y-up・原点=足元・メートル系)、21ボーン。
+  Godot 4 はそのままインポートでき、`SkeletonProfileHumanoid` の BoneMap が
+  自動で埋まる(Godot 4.4.1 で検証済み)。
+- **VRM 1.0** — 上記に `VRMC_vrm` 拡張(meta + humanoid 21ボーン)を足したもの。
 
 ## リポジトリ構成
 
@@ -884,8 +746,7 @@ image-3d/
 │   ├── generators/
 │   │   ├── base.py           # Generator抽象基底
 │   │   ├── mock.py           # mockジェネレータ
-│   │   ├── hunyuan3d.py      # Hunyuan3D-2ラッパ(Phase 2、Phase 3aでmvパイプライン追加)
-│   │   └── pixal3d.py        # Pixal3Dラッパ(MITライセンス、専用venv .venv-pixal3d で使用)
+│   │   └── hunyuan3d.py      # Hunyuan3D-2ラッパ(Phase 2、Phase 3aでmvパイプライン追加)
 │   ├── preprocess.py         # 画像前処理(背景除去・リサイズ)
 │   ├── meshproc.py           # メッシュ後処理
 │   ├── colorproc.py          # 4色カラープリント対応(Phase 2.5、頂点カラー投影・量子化・分割)
@@ -895,102 +756,11 @@ image-3d/
 ├── tests/                    # pytest
 ├── data/jobs/                # 生成物(gitignore対象)
 ├── third_party/Hunyuan3D-2/  # hy3dgen本体(git clone、Phase 2、gitignore対象)
-├── third_party/Pixal3D/      # Pixal3D本体(git clone、gitignore対象)
-├── third_party/TRELLIS.2/    # o-voxelビルド用(git clone、gitignore対象)
 ├── requirements.txt          # base依存
 ├── requirements-gpu.txt      # Phase 2用追加依存
-├── requirements-pixal3d.txt  # Pixal3D用隔離venv (.venv-pixal3d) の依存(セットアップ手順込み)
 ├── run.sh
 └── README.md
 ```
-
-## よくある質問(FAQ)
-
-### Q. アップロードした画像と関係ないテスト形状(同じ形)ばかり生成される
-
-mockジェネレータで動作しています。UIヘッダ右上の「生成エンジン」バッジが
-`mock` になっていないか確認してください(mock時は画面上部に警告バナーも出ます)。
-対処は「[アップロード画像と無関係なテスト形状が生成されるとき](#アップロード画像と無関係なテスト形状が生成されるとき)」を参照。
-旧バージョンのアプリでは `IMAGE3D_GENERATOR=hunyuan3d` を明示指定してください
-(`auto` は新バージョンのみ対応)。
-
-### Q. GPUなしでも使えますか?
-
-UIやAPIの動作確認はmockジェネレータでGPU不要で行えます。ただし実際の画像から
-3Dを生成するにはNVIDIA GPUが必須です(形状生成のみ VRAM 16GB以上、テクスチャ
-生成併用は 32GB以上。実測値は「VRAM最小要件」の表を参照)。CPUのみでの実生成は
-サポートしていません。
-
-### Q. 生成にどれくらい時間がかかりますか?
-
-本README記載の実測環境(RTX PRO 6000)で、形状のみ約20〜40秒、テクスチャ生成
-併用で約60〜90秒です。**初回だけ**はモデルのダウンロード(単一ビュー約9.2GB、
-マルチビュー約9.2GB、テクスチャ用モデル数GB)とロード(十数秒〜)が加わるため、
-数分〜数十分かかることがあります。2回目以降はモデルが常駐するため速くなります。
-
-### Q. 初回生成時のモデルはどこに保存されますか? オフラインで使えますか?
-
-HuggingFaceのキャッシュ(既定 `~/.cache/huggingface`)に保存されます。
-一度ダウンロードすれば、以降の生成はインターネット接続なしで動作します。
-
-### Q. 「watertight: NG」と表示されました。印刷できませんか?
-
-多くの場合そのまま印刷できます。後処理で穴埋めを試みても閉じきらなかった
-ことを示す表示で、最近のスライサー(Bambu Studio / PrusaSlicer 等)は読み込み時に
-自動修復します。気になる場合は `octree_resolution` を1段下げる、`seed` を変えて
-再生成する、スライサーの修復機能(またはWindowsの3D Builder等)を使う、の
-いずれかで解消できることが多いです。
-
-### Q. 4色の3MFをスライサーでどう使えばいいですか?
-
-カラーモードで出力した3MFには `color_1`〜`color_4` の最大4オブジェクトが
-入っています。Bambu Studio / PrusaSlicer で開き、オブジェクトごとに
-AMS / MMU のフィラメント(スロット)を割り当ててスライスしてください。
-アプリの「パレット」表示(色チップ+比率)が各オブジェクトの色の目安です。
-
-### Q. 4色以外(2色・3色、あるいは5色以上)にできますか?
-
-`n_colors` パラメータで2〜4色を指定できます。5色以上は対応していません
-(4スロットのAMSを想定した仕様です)。
-
-### Q. キャラクターシートのパネルがうまく検出されません
-
-自動分割はパネル同士が離れていて背景とのコントラストがある構図を前提とした
-簡易解析です。検出に失敗する場合は、シートを画像編集ソフトで切り分けて、
-正面/背面/側面の各アップロード欄に個別に登録してください(生成品質は同じです)。
-
-### Q. 「テクスチャ生成(実験的)」のチェックボックスが押せません
-
-その環境でtexgen(CUDA拡張)が利用できないことを示します(`/api/health` の
-`texgen_available` が `false`)。「Phase 3c」節のビルド手順(torchのCUDAバージョンと
-一致するCUDAツールチェーンが必要)を実施してください。ビルドしなくても、
-正面投影方式の4色カラー出力(FR-8)は利用できます。
-
-### Q. 生成物のサイズ(高さ)を変えたい / 印刷に適したポリゴン数は?
-
-「目標高さ(mm)」で出力サイズを指定できます(既定100mm、Z軸高さ基準で
-スケーリング+接地済み)。面数は既定20万面で一般的なFDM印刷には十分です。
-プリセット(フィギュア/小型フィギュア/ペンダント/高精細)を使うと、
-高さ・解像度・面数をまとめて切り替えられます。
-
-### Q. スライス(Gコード生成)やサポート材の生成はできますか?
-
-できません。本アプリはプリント可能なメッシュデータ(STL/3MF)の生成までを担当し、
-スライスはスライサー(Bambu Studio / PrusaSlicer / Cura 等)の役割です(SPEC.md §7)。
-ビューアの「オーバーハング」表示で、サポートが必要になりそうな箇所(既定45°超)を
-事前に確認できます。
-
-### Q. 商用利用できますか?
-
-本プロジェクトのコードは [Polyform Small Business License](LICENSE)(小規模事業者
-まで商用可)ですが、**生成に使うHunyuan3D-2モデルはTencentのコミュニティ
-ライセンスに別途従う必要があります**(利用地域・規模の制限あり)。
-詳細は「ライセンス」節を参照してください。
-
-### Q. `third_party/Hunyuan3D-2` を入れ直したらテクスチャ生成が壊れました
-
-再clone時はvendoredパッチ(`hy3dgen/texgen/utils/multiview_utils.py` の
-`trust_remote_code=True`)の再適用が必要です。「Phase 3c」節の手順を参照してください。
 
 ## 既知の制限
 
@@ -1029,10 +799,7 @@ AMS / MMU のフィラメント(スロット)を割り当ててスライスし�
 このリポジトリ(`server/`・`web/`・`docs/`・`tests/` 等、本プロジェクトのオリジナル
 コード)は [Polyform Small Business License 1.0.0](LICENSE) の下で提供されます。
 
-要約(法的拘束力があるのは[LICENSE](LICENSE)本文のみです)。Hunyuan3D-2 /
-Pixal3D(DINOv3)を有効にする場合の所定の謝辞・Notice文言は
-[NOTICE](NOTICE) にまとめてあります(UIにも `IMAGE3D_GENERATOR=pixal3d` 時に
-"Built with DINOv3" を表示します):
+要約(法的拘束力があるのは[LICENSE](LICENSE)本文のみです):
 
 - **非商用利用**は誰でも自由に可能。
 - **商用利用**も、利用者の所属組織が
@@ -1050,37 +817,6 @@ Pixal3D(DINOv3)を有効にする場合の所定の謝辞・Notice文言は
 (`third_party/Hunyuan3D-2/LICENSE`)など、それぞれの配布元のライセンス条件に
 従ってください(利用地域制限・利用者数に応じた追加許諾要件などが定められて
 います)。
-
-### Hunyuan3D-2構成での主な利用条件と、配布・サービス提供時の付帯義務
-
-`third_party/Hunyuan3D-2/LICENSE`(2026-07時点の原文)に基づく要約。
-法的拘束力があるのは原文のみであり、本節は法的助言ではありません。
-
-**利用条件(使うだけの場合も適用)**:
-
-- **地域**: EU・英国・韓国では利用不可(Territory外)。生成物(Output)を
-  Territory外で使用・表示することも許諾されない。
-- **規模**: 全製品・サービス合計の月間アクティブユーザーが**100万人**を超える
-  事業者は、Tencentへの別途ライセンス申請が必要。
-
-**本アプリ(Hunyuan3D-2構成)を第三者に配布、またはサービスとして提供する場合の
-付帯義務**(同ライセンス §3):
-
-1. 受領者にTencentライセンス本文の写しを提供すること(§3(a))
-2. Hunyuan3D-2側のファイルを変更した場合は、変更した旨の告知を目立つ形で
-   付すこと(§3(b))
-3. ホステッドサービス以外の配布物には、所定の文言のNoticeテキストファイルを
-   同梱すること(§3(d)。文言はライセンス原文参照)
-4. サービス・製品の実際の提供者(法人名等)を明示し、**Tencentが提携・後援して
-   いると誤認させる表示をしない**こと(§3(e))
-5. 「Powered by Tencent Hunyuan」表示と技術紹介記事の公開は推奨(encouraged)で
-   あり義務ではない(§3(c))
-
-なお、Pixal3D構成の場合は上記のTencentライセンスは適用されません。
-既定のラスタライザ構成(drtk、MIT)では nvdiffrast(非商用ライセンス)への
-依存も無くなりましたが、画像条件付けに使う **DINOv3 の重み**
-(Meta独自ライセンス、商用利用可・attribution等の付帯義務あり)が別途
-制約になります(「Pixal3Dジェネレータ」節・OSS一覧参照)。
 
 ### 利用しているOSS
 
@@ -1134,25 +870,8 @@ Pixal3D(DINOv3)を有効にする場合の所定の謝辞・Notice文言は
 |---|---|
 | Three.js (r160, `web/vendor/three/`) | MIT |
 
-**別リポジトリのモデル(`third_party/`、本リポジトリには含まれない)**
+**別リポジトリのモデル(`third_party/Hunyuan3D-2`、本リポジトリには含まれない)**
 
 | 対象 | ライセンス |
 |---|---|
 | Tencent Hunyuan3D-2 (hy3dgen) | TENCENT HUNYUAN 3D 2.0 COMMUNITY LICENSE AGREEMENT(独自ライセンス。地域制限・月間アクティブユーザー数100万人超での別途許諾要件あり) |
-| TencentARC Pixal3D(コード+モデル重み) | MIT(コード・重みともにMIT。ただし画像条件付けに使うDINOv3重みは別ライセンス、下記参照) |
-| Microsoft TRELLIS.2 / o-voxel | MIT |
-| JeffreyXiang CuMesh(o-voxelのビルド時依存、GitHub直接取得) | MIT |
-| JeffreyXiang FlexGEMM(o-voxelのビルド時依存、GitHub直接取得) | MIT |
-| **Meta drtk**(既定のラスタライザ。`server/generators/pixal3d_raster.py` 経由で使用、実機検証済み) | **MIT** |
-| NVlabs nvdiffrast(drtkが使えない場合のみのフォールバック。既定構成では未使用) | NVIDIA Source Code License(非商用研究用途。商用利用はNVIDIAの許諾が必要な点に注意) |
-| NATTEN | MIT |
-| valeoai NAF(NAFアップサンプラ重み、torch.hub経由) | Apache-2.0 |
-| **Meta DINOv3 重み**(`camenduru/dinov3-vitl16-pretrain-lvd1689m`、Meta `facebook/dinov3-vit7b16-pretrain-lvd1689m` からの蒸留モデル。Pixal3Dの画像条件付けに使用) | **DINOv3 License**(Meta独自ライセンス、MITではない)。[ライセンス原文](https://ai.meta.com/resources/models-and-libraries/dinov3-license/)の要約(法的拘束力は原文のみ): 商用利用は**許可**されており、企業規模・地域・MAU等による制限は無い。ただし (1) 再配布時はライセンス原文の写しを同梱すること、(2) 関連するWebサイト・UI・製品ドキュメント等に "Built with DINOv3" の表示を行うこと、(3) 研究成果を公開する場合はDINO Materialsの利用を謝辞に記載すること、(4) リバースエンジニアリング禁止、(5) 軍事・兵器・ITAR対象活動などへの利用禁止、が付帯義務として定められている。utils3d(upstream inference.pyのレンダリング/学習系専用ライブラリ)は本アプリの生成経路では使用しないため未導入。 |
-
-**まとめ**: Pixal3D構成は「コード全体(Pixal3D本体・TRELLIS.2/o-voxel・CuMesh/
-FlexGEMM・drtk・NATTEN)はMIT」であり、既定のラスタライザ構成
-(`IMAGE3D_PIXAL3D_RASTERIZER=auto` かつdrtk導入済み)では nvdiffrast
-(非商用ライセンス)を一切使用しない。しかし**画像条件付けに使うDINOv3の
-重みがMeta独自ライセンス**であるため、**構成全体としては「完全MIT」とは
-言えない**(商用利用自体は許可される緩やかなライセンスだが、attribution等の
-付帯義務がある点に注意)。

@@ -282,6 +282,80 @@ async def download_job_model(job_id: str, format: str = "stl"):
     )
 
 
+async def _post_to_rig_service(filename: str, glb_bytes: bytes, params: Optional[str]) -> dict:
+    """rig-service に GLB を送ってリグジョブを作る。
+
+    ブラウザから直接叩かずサーバ経由にしているのは、数十MBのGLBを
+    クライアントに往復させないためと、CORS設定を rig-service 側に強いないため。
+    """
+    import httpx
+
+    files = {"model": (filename, glb_bytes, "model/gltf-binary")}
+    data = {"params": params} if params else None
+    async with httpx.AsyncClient(timeout=config.RIGSVC_TIMEOUT_SEC) as client:
+        response = await client.post(
+            f"{config.RIGSVC_URL}/api/rig", files=files, data=data
+        )
+    if response.status_code != 200:
+        detail = response.text
+        try:
+            detail = response.json().get("detail", detail)
+        except ValueError:
+            pass
+        raise HTTPException(
+            status_code=502,
+            detail=f"リグサービスがエラーを返しました({response.status_code}): {detail}",
+        )
+    return response.json()
+
+
+@app.post("/api/jobs/{job_id}/rig")
+async def send_job_to_rig_service(job_id: str, params: Optional[str] = Form(None)):
+    """完了ジョブの model.glb を rig-service へ送る (別リポジトリ rig-service の計画書 §7 R4-1)。
+
+    リグ結果は rig-service 側のジョブになるため、ここではそのジョブIDと
+    プレビューURLだけを返す(image-3d はリグ結果を保持しない)。
+    """
+    if not config.RIGSVC_URL:
+        raise HTTPException(
+            status_code=503,
+            detail="リグサービスのURLが未設定です(環境変数 IMAGE3D_RIGSVC_URL)。",
+        )
+    job = job_manager.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="ジョブが見つかりません。")
+    if job.status != STATUS_COMPLETED:
+        raise HTTPException(status_code=409, detail=f"ジョブは未完了です(status={job.status})。")
+    path = job.model_path("glb")
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="モデルファイルが見つかりません。")
+
+    import asyncio
+
+    loop = asyncio.get_running_loop()
+    glb_bytes = await loop.run_in_executor(None, path.read_bytes)
+    # VRMのタイトルは rig-service 側でファイル名から決まるため、元の画像名を渡す
+    filename = job.original_filename or f"{job_id}.glb"
+    filename = f"{filename.rsplit('.', 1)[0]}.glb"
+
+    try:
+        result = await _post_to_rig_service(filename, glb_bytes, params)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Failed to call rig service for job %s", job_id)
+        raise HTTPException(
+            status_code=502,
+            detail=f"リグサービス({config.RIGSVC_URL})に接続できませんでした: {exc}",
+        ) from exc
+
+    rig_job_id = result.get("job_id")
+    return {
+        "rig_job_id": rig_job_id,
+        "url": f"{config.RIGSVC_URL}/?job={rig_job_id}",
+    }
+
+
 @app.delete("/api/jobs/{job_id}")
 async def delete_job(job_id: str):
     ok = job_manager.delete_job(job_id)
@@ -349,6 +423,8 @@ async def health():
         "python_version": platform.python_version(),
         "gpu": gpu_info,
         "texgen_available": texture.is_available(),
+        # 未設定(null)ならフロントは「リグ/VRM化」ボタンを出さない
+        "rigsvc_url": config.RIGSVC_URL,
     }
 
 

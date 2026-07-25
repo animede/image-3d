@@ -516,3 +516,97 @@ def test_auto_generator_resolves_to_hunyuan3d_when_usable(monkeypatch):
     monkeypatch.setattr(config, "GENERATOR", "auto")
     monkeypatch.setattr(main, "_hunyuan3d_usable", lambda: True)
     assert main._build_generator().name == "hunyuan3d"
+
+
+# --- rig-service 連携 (docs/RIG_SERVICE_PLAN.md §7 R4-1) ----------------------
+
+
+def _completed_job_id(client) -> str:
+    res = client.post("/api/jobs", files={"image": ("t.png", make_test_png_bytes(), "image/png")})
+    job_id = res.json()["job_id"]
+    job = _wait_for_completion(client, job_id)
+    assert job["status"] == "completed"
+    return job_id
+
+
+def test_health_reports_rig_service_url(client, monkeypatch):
+    from server import config
+
+    assert client.get("/api/health").json()["rigsvc_url"] is None
+
+    monkeypatch.setattr(config, "RIGSVC_URL", "http://127.0.0.1:8100")
+    assert client.get("/api/health").json()["rigsvc_url"] == "http://127.0.0.1:8100"
+
+
+def test_rig_endpoint_disabled_when_url_unset(client):
+    """IMAGE3D_RIGSVC_URL 未設定なら 503(UI側はボタンを出さない)。"""
+    job_id = _completed_job_id(client)
+    res = client.post(f"/api/jobs/{job_id}/rig")
+    assert res.status_code == 503
+    assert "IMAGE3D_RIGSVC_URL" in res.json()["detail"]
+
+
+def test_rig_endpoint_forwards_glb_and_returns_preview_url(client, monkeypatch):
+    from server import config, main as main_module
+
+    monkeypatch.setattr(config, "RIGSVC_URL", "http://rigsvc.test")
+    sent = {}
+
+    async def fake_post(filename, glb_bytes, params):
+        sent["filename"] = filename
+        sent["glb"] = glb_bytes
+        sent["params"] = params
+        return {"job_id": "rig-123"}
+
+    monkeypatch.setattr(main_module, "_post_to_rig_service", fake_post)
+
+    job_id = _completed_job_id(client)
+    res = client.post(f"/api/jobs/{job_id}/rig", data={"params": '{"height_m":1.2}'})
+
+    assert res.status_code == 200
+    assert res.json() == {
+        "rig_job_id": "rig-123",
+        "url": "http://rigsvc.test/?job=rig-123",
+    }
+    # 実際に生成済みGLBが送られていること
+    assert sent["glb"].startswith(b"glTF")
+    assert sent["params"] == '{"height_m":1.2}'
+    # VRMのタイトルが元画像名から決まるよう、拡張子だけglbに替えて渡す
+    assert sent["filename"] == "t.glb"
+
+
+def test_rig_endpoint_rejects_incomplete_job(client, monkeypatch):
+    from server import config
+
+    monkeypatch.setattr(config, "RIGSVC_URL", "http://rigsvc.test")
+    res = client.post("/api/jobs", files={"image": ("t.png", make_test_png_bytes(), "image/png")})
+    job_id = res.json()["job_id"]
+
+    # 完了前に呼ぶと 409(タイミング次第で完了済みなら 200 でもよい)
+    status = client.post(f"/api/jobs/{job_id}/rig").status_code
+    assert status in (409, 200)
+    _wait_for_completion(client, job_id)
+
+
+def test_rig_endpoint_reports_unreachable_service(client, monkeypatch):
+    """リグサービスが落ちていても image-3d 側は 502 を返すだけで落ちない。"""
+    from server import config, main as main_module
+
+    monkeypatch.setattr(config, "RIGSVC_URL", "http://127.0.0.1:1")
+
+    async def boom(filename, glb_bytes, params):
+        raise OSError("接続できません")
+
+    monkeypatch.setattr(main_module, "_post_to_rig_service", boom)
+
+    job_id = _completed_job_id(client)
+    res = client.post(f"/api/jobs/{job_id}/rig")
+    assert res.status_code == 502
+    assert "接続できませんでした" in res.json()["detail"]
+
+
+def test_rig_endpoint_unknown_job(client, monkeypatch):
+    from server import config
+
+    monkeypatch.setattr(config, "RIGSVC_URL", "http://rigsvc.test")
+    assert client.post("/api/jobs/does-not-exist/rig").status_code == 404

@@ -216,6 +216,13 @@
                 title="カラーモード時: 色ごとに分割された最大4オブジェクトを出力します。スライサーでオブジェクトごとにフィラメントを割り当ててください。">3MF</button>
         <button class="export-btn" data-format="glb" disabled>GLB</button>
         <button class="export-btn" data-format="obj" disabled>OBJ</button>
+        <button type="button" id="rig-btn" class="secondary-btn" disabled hidden
+                title="ボーンを自動で付けてVRM 1.0にします。Tポーズの立ち絵から生成したモデルを送ってください。">
+          リグ/VRM化
+        </button>
+        <span class="hint" id="rig-note" hidden>
+          ※リグ化はTポーズの立ち絵から生成したモデルにのみ有効です。別タブでリグサービスが開きます。
+        </span>
         <span class="hint" id="export-color-note" hidden>
           ※カラーモード時の3MFは色ごとに分割された最大4オブジェクトです。スライサーでフィラメントを割り当ててください。
         </span>

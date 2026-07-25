@@ -56,6 +56,8 @@ const viewerCanvas = document.getElementById("viewer-canvas");
 const presetSelect = document.getElementById("preset-select");
 
 const exportButtons = document.querySelectorAll(".export-btn");
+const rigBtn = document.getElementById("rig-btn");
+const rigNote = document.getElementById("rig-note");
 
 const STATUS_LABELS = {
   queued: "待機中(キュー)",
@@ -496,6 +498,7 @@ async function loadJobIntoViewer(job) {
 
   updateModelInfo(job.stats);
   exportButtons.forEach((btn) => (btn.disabled = false));
+  rigBtn.disabled = false;
 }
 
 function updateModelInfo(stats) {
@@ -574,6 +577,41 @@ exportButtons.forEach((btn) => {
     const format = btn.dataset.format;
     window.location.href = `/api/jobs/${currentJobId}/download?format=${format}`;
   });
+});
+
+// --- リグ/VRM化 (別リポジトリ rig-service の計画書 §7 R4-1) -------------------
+// IMAGE3D_RIGSVC_URL が設定されているときだけボタンを出す。
+async function initRigService() {
+  try {
+    const res = await fetch("/api/health");
+    if (!res.ok) return;
+    const health = await res.json();
+    if (!health.rigsvc_url) return;
+    rigBtn.hidden = false;
+    rigNote.hidden = false;
+  } catch (err) {
+    console.error("Failed to check rig service", err);
+  }
+}
+initRigService();
+
+rigBtn.addEventListener("click", async () => {
+  if (!currentJobId) return;
+  const label = rigBtn.textContent;
+  rigBtn.disabled = true;
+  rigBtn.textContent = "送信中...";
+  try {
+    const res = await fetch(`/api/jobs/${currentJobId}/rig`, { method: "POST" });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.detail || res.statusText);
+    // リグ結果は rig-service 側のジョブなので、そのプレビューを別タブで開く
+    window.open(body.url, "_blank", "noopener");
+  } catch (err) {
+    alert(`リグ化の依頼に失敗しました: ${err.message}`);
+  } finally {
+    rigBtn.textContent = label;
+    rigBtn.disabled = false;
+  }
 });
 
 // --- ジョブ履歴 -------------------------------------------------------------

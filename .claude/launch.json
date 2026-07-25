@@ -4,13 +4,30 @@
     {
       "name": "image3d-server",
       "runtimeExecutable": "env",
-      "runtimeArgs": ["IMAGE3D_GENERATOR=hunyuan3d", ".venv/bin/uvicorn", "server.main:app", "--host", "127.0.0.1", "--port", "8020"],
+      "runtimeArgs": [
+        "IMAGE3D_GENERATOR=hunyuan3d",
+        "IMAGE3D_RIGSVC_URL=http://127.0.0.1:8100",
+        ".venv/bin/uvicorn",
+        "server.main:app",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8020"
+      ],
       "port": 8020
     },
     {
       "name": "image3d-server-verify",
       "runtimeExecutable": "env",
-      "runtimeArgs": ["IMAGE3D_GENERATOR=mock", ".venv/bin/uvicorn", "server.main:app", "--host", "127.0.0.1", "--port", "8021"],
+      "runtimeArgs": [
+        "IMAGE3D_GENERATOR=mock",
+        ".venv/bin/uvicorn",
+        "server.main:app",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8021"
+      ],
       "port": 8021
     },
     {
@@ -21,9 +38,20 @@
         "ATTN_BACKEND=sdpa",
         "SPARSE_ATTN_BACKEND=sdpa",
         "CUDA_HOME=/usr/local/cuda-12.8",
-        ".venv-pixal3d/bin/uvicorn", "server.main:app", "--host", "127.0.0.1", "--port", "8022"
+        ".venv-pixal3d/bin/uvicorn",
+        "server.main:app",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8022"
       ],
       "port": 8022
+    },
+    {
+      "name": "rig-service",
+      "runtimeExecutable": "../rig-service/run.sh",
+      "runtimeArgs": [],
+      "port": 8100
     }
   ]
 }
