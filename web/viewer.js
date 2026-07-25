@@ -35,7 +35,12 @@ export class Viewer {
     // メッシュごとの元マテリアル・元頂点カラー属性を退避しておく (Map<mesh, {material, color}>)
     this._overhangBackup = new Map();
 
-    window.addEventListener("resize", () => this._onResize());
+    // ウィンドウリサイズだけを見ていると、**ウィンドウは変わらないまま
+    // ビューア枠だけが縮む**変化を取りこぼす(例: エクスポート欄の要素を
+    // 後から表示すると、その分 #viewer-container が縮む)。描画バッファと
+    // カメラのアスペクト比が古いままになり、表示が歪んで操作感もずれるため、
+    // 実際の枠のサイズ変化を ResizeObserver で拾う。
+    new ResizeObserver(() => this._onResize()).observe(this.canvas.parentElement);
     this._onResize();
     this._animate();
   }
@@ -65,6 +70,11 @@ export class Viewer {
     const plateEdges = new THREE.LineSegments(plateGeom, plateMat);
     plateEdges.position.y = 0;
     this.scene.add(plateEdges);
+  }
+
+  /** 枠のサイズが変わったことを外から知らせる(レイアウトを変えた側が呼ぶ)。 */
+  resize() {
+    this._onResize();
   }
 
   _onResize() {

@@ -589,6 +589,10 @@ async function initRigService() {
     if (!health.rigsvc_url) return;
     rigBtn.hidden = false;
     rigNote.hidden = false;
+    // ここでエクスポート欄が高くなり #viewer-container が縮む。ビューアは
+    // 構築時のサイズで描画バッファを確保済みなので、明示的に再計算させないと
+    // 表示が歪んだままになる(ウィンドウはリサイズされないので resize も来ない)。
+    viewer.resize();
   } catch (err) {
     console.error("Failed to check rig service", err);
   }

@@ -588,10 +588,25 @@ html, body {
 #export-bar {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 10px;
   padding: 12px 16px;
   background: var(--bg-1);
   border-top: 1px solid var(--border);
+}
+
+/* 長いヒント文が nowrap の行に入ると、他の項目が min-content まで潰されて
+   ラベルが1文字ずつ縦積みになり、バーだけが極端に高くなる。折り返しを
+   許可したうえで、ヒントは行を専有させる。 */
+#export-bar .hint {
+  flex-basis: 100%;
+}
+
+/* .secondary-btn は左ペインの全幅ボタン用に width:100% なので、そのまま
+   エクスポート欄に置くと1行を丸ごと占有してバーが不要に高くなる。 */
+#export-bar .secondary-btn {
+  width: auto;
+  white-space: nowrap;
 }
 
 .export-label {
