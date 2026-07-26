@@ -260,12 +260,29 @@ def _trusted_pixel_mask(alpha: np.ndarray) -> np.ndarray:
     return eroded
 
 
-def _project_image_colors(mesh: trimesh.Trimesh, image: Image.Image, *, view: str) -> np.ndarray:
-    """単一ビュー画像を直交投影し、全頂点分のRGBAカラーを返す。
+def project_points_to_pixels(
+    mesh: trimesh.Trimesh, image: Image.Image, points: np.ndarray, *, view: str
+) -> tuple[np.ndarray, np.ndarray]:
+    """任意の点群を指定ビューの画像画素座標 (px, py) へ直交投影する。
 
     正面(-Y側)/背面(+Y側)は メッシュXZ 平面へ、左側面(+X側)/右側面(-X側)は
     メッシュYZ 平面へ投影する。カメラの右手方向が変わるので、ビューごとに
     横方向の対応軸と符号が変わる(`_VIEW_U_AXIS`)。
+
+    投影の基準(メッシュbbox <-> 被写体bbox の対応、見切れ時のシルエット照合)は
+    頂点でもテクセルでも同じでなければならないため、頂点カラー投影
+    (`_project_image_colors`)とテクスチャ精細化(`texrefine`)の両方から
+    この関数を使う。符号の取り決めは実生成で検証済みなので、ここを唯一の
+    出どころにしておく。
+
+    Args:
+        mesh: 投影の基準となるメッシュ(bboxのみ使用)。Z-up・正面が-Y。
+        image: 投影元画像(RGBA推奨)。被写体bboxの算出に使う。
+        points: (N, 3) の点群。メッシュと同じ座標系。
+        view: `VIEW_NAMES` のいずれか。
+
+    Returns:
+        (px, py): それぞれ (N,) int64 の画素座標(画像内にクリップ済み)。
     """
     if view not in _VIEW_U_AXIS:
         raise ValueError(f"viewは{sorted(_VIEW_U_AXIS)}のいずれかである必要があります(got {view})。")
@@ -273,9 +290,6 @@ def _project_image_colors(mesh: trimesh.Trimesh, image: Image.Image, *, view: st
         image = image.convert("RGBA")
 
     w, h = image.size
-    rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)  # (h, w, 3)
-    alpha = np.asarray(image.getchannel("A"), dtype=np.uint8)  # (h, w)
-    trusted = _trusted_pixel_mask(alpha)  # (h, w) フチを除いた信頼できる画素
     axis, u_sign = _view_u_axis(view)
 
     u_min, u_max, v_min, v_max = _subject_bbox_uv(image)
@@ -288,7 +302,7 @@ def _project_image_colors(mesh: trimesh.Trimesh, image: Image.Image, *, view: st
         if aligned is not None:
             v_min, v_max = aligned
 
-    vertices = mesh.vertices
+    points = np.asarray(points, dtype=np.float64)
     bounds = mesh.bounds
     a_min, a_max = bounds[0][axis], bounds[1][axis]
     z_min, z_max = bounds[0][2], bounds[1][2]
@@ -298,16 +312,29 @@ def _project_image_colors(mesh: trimesh.Trimesh, image: Image.Image, *, view: st
     # 横方向の軸 -> 正規化u (被写体bbox基準)。
     # 例) front は _U_TO_X_SIGN=+1 (実生成検証済み) で u=0(左端)が-X側、
     #     back はカメラが反対側(+Y)にあるため左右対応が反転する。
-    a_norm = (vertices[:, axis] - a_min) / a_extent  # 0..1
+    a_norm = (points[:, axis] - a_min) / a_extent  # 0..1
     u_norm = a_norm if u_sign > 0 else 1.0 - a_norm
     u = u_min + u_norm * (u_max - u_min)
 
     # メッシュZ -> 正規化v (上下反転: Z最大=画像上端 v=0)
-    z_norm = (vertices[:, 2] - z_min) / z_extent  # 0..1, 0=床, 1=頭頂
+    z_norm = (points[:, 2] - z_min) / z_extent  # 0..1, 0=床, 1=頭頂
     v = v_min + (1.0 - z_norm) * (v_max - v_min)
 
     px = np.clip((u * w).astype(np.int64), 0, w - 1)
     py = np.clip((v * h).astype(np.int64), 0, h - 1)
+    return px, py
+
+
+def _project_image_colors(mesh: trimesh.Trimesh, image: Image.Image, *, view: str) -> np.ndarray:
+    """単一ビュー画像を直交投影し、全頂点分のRGBAカラーを返す。"""
+    if image.mode != "RGBA":
+        image = image.convert("RGBA")
+
+    rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)  # (h, w, 3)
+    alpha = np.asarray(image.getchannel("A"), dtype=np.uint8)  # (h, w)
+    trusted = _trusted_pixel_mask(alpha)  # (h, w) フチを除いた信頼できる画素
+
+    px, py = project_points_to_pixels(mesh, image, mesh.vertices, view=view)
 
     sampled_rgb = rgb[py, px]  # (N, 3)
     sampled_trusted = trusted[py, px]  # (N,) フチ・透明画素はFalse
@@ -326,7 +353,7 @@ def _project_image_colors(mesh: trimesh.Trimesh, image: Image.Image, *, view: st
         # 完全に透明(アルファ情報が無い画像等)な場合は投影色をそのまま使う
         pass
 
-    colors = np.empty((len(vertices), 4), dtype=np.uint8)
+    colors = np.empty((len(mesh.vertices), 4), dtype=np.uint8)
     colors[:, :3] = sampled_rgb
     colors[:, 3] = 255
     return colors

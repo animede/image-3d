@@ -1,0 +1,180 @@
+"""texgen アトラスを参照画像の全解像度で上書きする処理のテスト (server/texrefine.py)。
+
+GPU不要。texgen の出力に見立てた「UV+平坦なテクスチャ付きの球」を作り、
+正面から見える面だけが参照画像の色に置き換わることを確認する。
+"""
+import numpy as np
+import pytest
+import trimesh
+from PIL import Image
+
+from server import texrefine
+from server.texture import sample_vertex_colors_from_texture
+
+TEXGEN_GREY = 128
+REFERENCE_RED = (220, 30, 40)
+
+
+def _sphere_with_uv(texture_size: int = 512) -> trimesh.Trimesh:
+    """球体に「面ごとのチャート」UVと単色テクスチャを付け、texgen 出力を模す。
+
+    球面UV(緯度経度)にすると経度0°をまたぐ面のUV三角形がアトラス全幅に
+    広がり、その面のサンプルが無関係なテクセルへ飛び散る。実際の texgen は
+    xatlas で切り開いたチャートを並べるので、こちらに合わせて面ごとに
+    独立したセルへ割り当てる。
+    """
+    mesh = trimesh.creation.uv_sphere(radius=50, count=[24, 24])
+    mesh.unmerge_vertices()  # 面ごとに頂点を独立させ、チャートを切り離す
+
+    n_faces = len(mesh.faces)
+    grid = int(np.ceil(np.sqrt(n_faces)))
+    cell = 1.0 / grid
+    # セル内に収まる三角形(端に寄せるとチャート外周にかかるので余白を取る)
+    corners = np.array([[0.2, 0.2], [0.8, 0.2], [0.2, 0.8]]) * cell
+
+    uv = np.zeros((len(mesh.vertices), 2))
+    index = np.arange(n_faces)
+    origin = np.column_stack([index % grid, index // grid]) * cell
+    for k in range(3):
+        uv[mesh.faces[:, k]] = origin + corners[k]
+
+    texture = Image.new("RGB", (texture_size, texture_size), (TEXGEN_GREY,) * 3)
+    mesh.visual = trimesh.visual.TextureVisuals(
+        uv=uv, material=trimesh.visual.material.SimpleMaterial(image=texture)
+    )
+    return mesh
+
+
+def _circular_reference(size: int = 256, color=REFERENCE_RED) -> Image.Image:
+    """球のシルエットに合わせた円形の参照画像(円の外は透明)。"""
+    yy, xx = np.mgrid[0:size, 0:size]
+    centre = (size - 1) / 2
+    inside = (xx - centre) ** 2 + (yy - centre) ** 2 <= (size * 0.48) ** 2
+    arr = np.zeros((size, size, 4), dtype=np.uint8)
+    arr[inside, :3] = color
+    arr[inside, 3] = 255
+    return Image.fromarray(arr, "RGBA")
+
+
+def _vertex_colors_by_facing(mesh: trimesh.Trimesh) -> tuple[np.ndarray, np.ndarray]:
+    """(正面を正対して向く頂点の色, 背面を向く頂点の色) を返す。"""
+    colors = sample_vertex_colors_from_texture(mesh)[:, :3].astype(int)
+    normals = np.asarray(mesh.vertex_normals)
+    front = normals @ np.array([0.0, -1.0, 0.0])
+    return colors[front > 0.9], colors[front < -0.9]
+
+
+def test_front_facing_texels_take_the_reference_colour():
+    """正面を正対して向くテクセルは、参照画像の色に置き換わる。"""
+    mesh = _sphere_with_uv()
+    stats = texrefine.refine_texture_with_references(mesh, {"front": _circular_reference()})
+
+    assert stats.applied, stats.reason
+    front, _ = _vertex_colors_by_facing(mesh)
+    assert len(front) > 0
+    assert np.allclose(front.mean(axis=0), REFERENCE_RED, atol=12)
+
+
+def test_back_facing_texels_keep_the_texgen_colour():
+    """参照が正面だけなら、背面は texgen の色のまま残す。"""
+    mesh = _sphere_with_uv()
+    texrefine.refine_texture_with_references(mesh, {"front": _circular_reference()})
+
+    _, back = _vertex_colors_by_facing(mesh)
+    assert len(back) > 0
+    assert np.allclose(back.mean(axis=0), TEXGEN_GREY, atol=6)
+
+
+def test_back_reference_paints_the_back():
+    """背面参照を渡せば背面もその色になる。"""
+    mesh = _sphere_with_uv()
+    blue = (20, 40, 210)
+    stats = texrefine.refine_texture_with_references(
+        mesh,
+        {"front": _circular_reference(), "back": _circular_reference(color=blue)},
+    )
+
+    assert stats.applied, stats.reason
+    front, back = _vertex_colors_by_facing(mesh)
+    assert np.allclose(front.mean(axis=0), REFERENCE_RED, atol=12)
+    assert np.allclose(back.mean(axis=0), blue, atol=12)
+
+
+def test_full_resolution_detail_survives():
+    """512に潰れた texgen では出せない細かい模様が、参照から転写される。
+
+    これがこの処理の存在理由なので、模様の本数で確かめる。
+    """
+    size = 512
+    ref = np.asarray(_circular_reference(size)).copy()
+    stripe = (np.arange(size) // 4) % 2 == 0
+    ref[:, stripe, :3] = np.where(
+        ref[:, stripe, 3:4] > 0, np.array([250, 250, 250], dtype=np.uint8), 0
+    )
+    mesh = _sphere_with_uv(texture_size=1024)
+    stats = texrefine.refine_texture_with_references(
+        mesh, {"front": Image.fromarray(ref, "RGBA")}
+    )
+
+    assert stats.applied, stats.reason
+    front, _ = _vertex_colors_by_facing(mesh)
+    # 白い縞(G=250)と赤い地(G=30)が両方残っているか。平均化されると中間に寄る。
+    green = front[:, 1]
+    assert (green > 200).sum() > 5, "白い縞が消えている"
+    assert (green < 80).sum() > 5, "赤い地が消えている"
+
+
+def test_dirty_silhouette_edge_is_not_sampled():
+    """シルエット境界の汚れた画素は上書きに使わない(黒筋の原因)。"""
+    size = 256
+    ref = np.asarray(_circular_reference(size)).copy()
+    opaque = ref[..., 3] > 0
+    from scipy.ndimage import binary_erosion
+
+    edge = opaque & ~binary_erosion(opaque, iterations=3)
+    ref[edge, :3] = 0  # 黒く汚れたフチ
+
+    mesh = _sphere_with_uv()
+    texrefine.refine_texture_with_references(mesh, {"front": Image.fromarray(ref, "RGBA")})
+
+    colors = sample_vertex_colors_from_texture(mesh)[:, :3].astype(int)
+    normals = np.asarray(mesh.vertex_normals)
+    refined = colors[normals @ np.array([0.0, -1.0, 0.0]) > 0.9]
+    assert refined.max() > 100, "フチの黒がそのまま乗っている"
+    assert np.allclose(refined.mean(axis=0), REFERENCE_RED, atol=12)
+
+
+def test_grazing_angles_are_left_to_texgen():
+    """視線に対し浅い角度の面は上書きしない(投影が伸びて信用できないため)。"""
+    assert texrefine._blend_weight(np.array([0.0]))[0] == 0.0
+    assert texrefine._blend_weight(np.array([texrefine.MIN_CONFIDENCE_DOT]))[0] == 0.0
+    assert texrefine._blend_weight(np.array([1.0]))[0] == 1.0
+    mid = texrefine._blend_weight(
+        np.array([(texrefine.MIN_CONFIDENCE_DOT + texrefine.FULL_CONFIDENCE_DOT) / 2])
+    )[0]
+    assert 0.0 < mid < 1.0
+
+
+@pytest.mark.parametrize(
+    "references, fragment",
+    [({}, "参照画像"), ({"nonsense": None}, "参照画像")],
+)
+def test_declines_without_usable_references(references, fragment):
+    stats = texrefine.refine_texture_with_references(_sphere_with_uv(), references)
+    assert stats.applied is False
+    assert fragment in stats.reason
+
+
+def test_declines_when_the_mesh_has_no_texture():
+    mesh = trimesh.creation.uv_sphere(radius=50, count=[16, 16])
+    stats = texrefine.refine_texture_with_references(mesh, {"front": _circular_reference()})
+    assert stats.applied is False
+    assert "UV" in stats.reason
+
+
+def test_declines_when_uv_count_mismatches():
+    mesh = _sphere_with_uv()
+    mesh.visual.uv = np.asarray(mesh.visual.uv)[:-5]
+    stats = texrefine.refine_texture_with_references(mesh, {"front": _circular_reference()})
+    assert stats.applied is False
+    assert "一致しません" in stats.reason

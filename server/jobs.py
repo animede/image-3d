@@ -24,7 +24,7 @@ import numpy as np
 import trimesh
 from PIL import Image
 
-from . import colorproc, config, meshproc, preprocess, texture
+from . import colorproc, config, meshproc, preprocess, texrefine, texture
 from .generators.base import GenerationParams, Generator
 
 logger = logging.getLogger(__name__)
@@ -168,18 +168,39 @@ class JobManager:
         未検証のため今回は渡さない(3枚以上でのcamera_info_ref拡張の挙動は
         未確認)。
 
+        texgen のテクスチャは参照画像を512pxに落として作られるため細部が残らない。
+        生成後に `texrefine` で、正対して見えているテクセルだけを参照画像の
+        **全解像度**で上書きする(server/texrefine.py 参照)。
+
         失敗時は例外を送出せず None を返し、`job.warnings` に警告メッセージを
         記録する(graceful degradation: SPEC.md §3.9)。
         """
         try:
             pipeline = self._get_texture_pipeline()
-            return pipeline.paint(mesh, image, back_image=back_image)
+            painted = pipeline.paint(mesh, image, back_image=back_image)
         except Exception as exc:
             logger.exception("texture_mode=paint failed for job %s; falling back", job.job_id)
             job.warnings.append(
                 f"テクスチャ生成(paint)に失敗したため、正面/背面投影方式にフォールバックしました: {exc}"
             )
             return None
+
+        references = {"front": image}
+        if back_image is not None:
+            references["back"] = back_image
+        try:
+            stats = texrefine.refine_texture_with_references(painted, references)
+            if not stats.applied:
+                # texgen の結果自体は使えるので、job は失敗させない。
+                logger.warning(
+                    "Texture refinement skipped for job %s: %s", job.job_id, stats.reason
+                )
+                job.warnings.append(f"テクスチャの高解像度化を適用できませんでした: {stats.reason}")
+        except Exception as exc:
+            logger.exception("Texture refinement failed for job %s; keeping texgen output", job.job_id)
+            job.warnings.append(f"テクスチャの高解像度化に失敗し、texgenの結果をそのまま使います: {exc}")
+
+        return painted
 
     # --- 永続化 -----------------------------------------------------------
     def load_history(self) -> None:
