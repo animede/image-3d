@@ -787,4 +787,82 @@ def test_preprocess_still_removes_background_for_opaque_input(monkeypatch):
     )
 
     assert len(called) == 1, "不透明な入力に rembg が呼ばれていない"
+
+
+# --- 単色背景の色キー ---------------------------------------------------------
+
+
+def _pale_subject_on_white(size: int = 96) -> Image.Image:
+    """白背景に、背景とよく似た淡色の被写体(細い腕つき)を描く。
+
+    rembg が腕を落とした実例(白背景・白い毛のT字キャラ)を模したもの。
+    """
+    arr = np.full((size, size, 3), 253, dtype=np.uint8)
+    arr[size // 4 : size * 3 // 4, size * 2 // 5 : size * 3 // 5] = 235  # 胴
+    arr[size * 2 // 5 : size * 2 // 5 + 4, 4 : size - 4] = 235  # 左右に伸びる腕
+    return Image.fromarray(arr, "RGB")
+
+
+def test_colour_key_keeps_pale_limbs_on_a_uniform_background():
+    """背景と色が近い細い部位も、単色背景なら確実に残る。"""
+    from server.preprocess import remove_uniform_background
+
+    size = 96
+    result, removed = remove_uniform_background(_pale_subject_on_white(size))
+
+    assert removed is True
+    alpha = np.asarray(result)[..., 3]
+    arm_row = alpha[size * 2 // 5 + 1]
+    assert arm_row[5] > 128, "左腕の先が消えている"
+    assert arm_row[size - 6] > 128, "右腕の先が消えている"
+
+
+def test_colour_key_keeps_background_coloured_areas_inside_the_subject():
+    """被写体の内側にある背景と同色の領域(白い服など)は塗りつぶしで残す。"""
+    from server.preprocess import remove_uniform_background
+
+    arr = np.full((80, 80, 3), 253, dtype=np.uint8)
+    arr[20:60, 20:60] = 40  # 暗い被写体
+    arr[35:45, 35:45] = 253  # その内側にある背景色の領域
+    result, removed = remove_uniform_background(Image.fromarray(arr, "RGB"))
+
+    assert removed is True
+    assert np.asarray(result)[40, 40, 3] > 128, "被写体内部の背景色が抜けている"
+
+
+def test_colour_key_declines_a_non_uniform_background():
+    """写真のような背景では色キーを使わず rembg に譲る。"""
+    from server.preprocess import remove_uniform_background
+
+    rng = np.random.default_rng(0)
+    noisy = rng.integers(0, 255, (64, 64, 3), dtype=np.uint8)
+    _, removed = remove_uniform_background(Image.fromarray(noisy, "RGB"))
+
+    assert removed is False
+
+
+def test_colour_key_declines_when_nothing_remains():
+    """全面が単色(被写体なし)なら破綻とみなしてフォールバックする。"""
+    from server.preprocess import remove_uniform_background
+
+    _, removed = remove_uniform_background(Image.new("RGB", (64, 64), (200, 50, 50)))
+
+    assert removed is False
+
+
+def test_preprocess_prefers_the_colour_key_over_rembg(monkeypatch):
+    """単色背景では rembg を呼ばない(推定より色キーの方が確実)。"""
+    from server import preprocess
+
+    called = []
+    monkeypatch.setattr(
+        preprocess, "remove_background", lambda image: (called.append(image), (image, True))[1]
+    )
+
+    buf = io.BytesIO()
+    _pale_subject_on_white().save(buf, format="PNG")
+    _, _, bg_removed = preprocess.preprocess_image(buf.getvalue(), 10_000_000, remove_bg=True)
+
+    assert called == [], "単色背景なのに rembg が呼ばれている"
+    assert bg_removed is True
     assert bg_removed is True

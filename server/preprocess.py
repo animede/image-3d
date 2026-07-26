@@ -2,7 +2,7 @@
 
 - アップロード画像の検証(フォーマット・サイズ)
 - リサイズ・正方形化
-- 背景除去(rembg)。未導入環境では自動スキップ(NFR-5)。
+- 背景除去。単色背景は色キー、それ以外は rembg。未導入環境では自動スキップ(NFR-5)。
 """
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import logging
 
 import numpy as np
 from PIL import Image, UnidentifiedImageError
+from scipy.ndimage import binary_dilation, binary_fill_holes, label
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +76,74 @@ def remove_background(image: Image.Image) -> tuple[Image.Image, bool]:
         return image, False
 
 
+# --- 単色背景の色キー -------------------------------------------------------
+# 画像生成で作った素材は背景が完全な単色のことが多い。そこに rembg をかけると
+# **背景と同系色の部位を丸ごと落とす**ことがある(実測: 白背景・白い毛のT字
+# キャラで両腕が消失し、前景率 37.8%→28.6%)。単色と判定できる場合は推定より
+# 確実な色キーを使う。
+
+# 枠画素の背景色からの平均ずれ(max channel)がこれ以下なら「単色背景」とみなす。
+UNIFORM_BG_SPREAD = 8.0
+# 背景色とみなす色差。背景が単色であることは判定済みなので、JPEGノイズを吸収
+# する程度に狭く取る。広げると背景と色の近い被写体(白背景の白い毛など)を
+# 削ってしまう。アンチエイリアスのふちはこの下限から線形に不透明化する。
+UNIFORM_BG_TOLERANCE = 12
+UNIFORM_BG_SOFT_FLOOR = 4
+# 色キー結果がこの範囲外なら破綻とみなし rembg にフォールバックする。
+UNIFORM_BG_MIN_FOREGROUND = 0.02
+UNIFORM_BG_MAX_FOREGROUND = 0.95
+
+
+def detect_uniform_background(rgb: np.ndarray) -> np.ndarray | None:
+    """枠1画素の色から単色背景を推定する。単色でなければ None。"""
+    border = np.concatenate([rgb[0], rgb[-1], rgb[:, 0], rgb[:, -1]])
+    bg = np.median(border, axis=0)
+    spread = float(np.abs(border - bg).max(axis=1).mean())
+    if spread > UNIFORM_BG_SPREAD:
+        logger.info("Background is not uniform (spread=%.1f); colour key skipped.", spread)
+        return None
+    return bg
+
+
+def remove_uniform_background(image: Image.Image) -> tuple[Image.Image, bool]:
+    """単色背景を色キーで抜く。単色でない・結果が破綻した場合は (元画像, False)。
+
+    枠から連結している背景色領域だけを塗りつぶすため、キャラ内部にある背景と
+    同色の部分(白い服など)は残る。
+    """
+    rgba = image.convert("RGBA")
+    rgb = np.asarray(rgba)[..., :3].astype(np.int16)
+    bg = detect_uniform_background(rgb)
+    if bg is None:
+        return image, False
+
+    distance = np.abs(rgb - bg).max(axis=2)
+    components, _ = label(distance <= UNIFORM_BG_TOLERANCE)
+    touching = set(components[0]) | set(components[-1])
+    touching |= set(components[:, 0]) | set(components[:, -1])
+    touching.discard(0)
+    foreground = binary_fill_holes(~np.isin(components, list(touching)))
+
+    ratio = float(foreground.mean())
+    if not UNIFORM_BG_MIN_FOREGROUND <= ratio <= UNIFORM_BG_MAX_FOREGROUND:
+        logger.warning("Colour key produced an implausible foreground (%.1f%%); falling back.", ratio * 100)
+        return image, False
+
+    # アンチエイリアスのふちは色キーでは背景側に落ちる。前景を少し広げた帯に
+    # 限って色差から半透明を復元し、ジャギーを避ける。
+    soft = np.clip(
+        (distance - UNIFORM_BG_SOFT_FLOOR) / (UNIFORM_BG_TOLERANCE - UNIFORM_BG_SOFT_FLOOR),
+        0.0,
+        1.0,
+    )
+    fringe = binary_dilation(foreground, iterations=2)
+    alpha = np.where(foreground, 1.0, np.where(fringe, soft, 0.0))
+
+    result = np.dstack([np.asarray(rgba)[..., :3], (alpha * 255).astype(np.uint8)])
+    logger.info("Removed a uniform background %s by colour key (foreground %.1f%%).", tuple(bg.astype(int)), ratio * 100)
+    return Image.fromarray(result, "RGBA"), True
+
+
 # 既に背景が抜かれていると判断する透明画素の割合。ふちの薄いアンチエイリアス
 # だけで誤判定しないよう、ある程度まとまった透明領域を要求する。
 TRANSPARENT_PIXEL_RATIO = 0.05
@@ -109,7 +178,10 @@ def preprocess_image(
             # 既に抜けている画像に rembg をかけると前景を削るだけになる
             logger.info("Input already has a transparent background; skipping rembg.")
         else:
-            processed, bg_removed = remove_background(original)
+            # 単色背景は色キーの方が確実。推定に頼る rembg は最後の手段。
+            processed, bg_removed = remove_uniform_background(original)
+            if not bg_removed:
+                processed, bg_removed = remove_background(original)
 
     processed = resize_to_square(processed, size=size)
     return original, processed, bg_removed
