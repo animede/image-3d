@@ -5,6 +5,7 @@
 UV→ピクセル対応が正しいことを検証する。
 """
 import numpy as np
+import pytest
 import trimesh
 from PIL import Image
 
@@ -179,3 +180,118 @@ def test_ensure_non_metallic_converts_simple_material():
     assert pbr["metallicFactor"] == 0.0
     assert "baseColorTexture" in pbr, "テクスチャが失われた"
     assert gltf["images"], "テクスチャ画像が失われた"
+
+
+# --- 背面参照画像対応 (paint()の複数画像入力) ---------------------------------
+
+
+def _fake_wrapper_with_recording_pipeline(monkeypatch):
+    """paint()の内部ロジックのみを検証するため、_load_pipelineをモックに差し替える。
+
+    実パイプラインはGPU/hy3dgenロードを要求するため、テストでは
+    「pipeline(mesh, image_or_list) がどう呼ばれたか」だけを記録する
+    軽量な偽パイプラインで置き換える(単体テストの方針: GPU不要)。
+    """
+    wrapper = texture.TexturePipelineWrapper()
+    calls: list = []
+
+    def fake_pipeline(mesh, image_arg):
+        calls.append(image_arg)
+        textured = trimesh.creation.box()
+        textured.visual = trimesh.visual.TextureVisuals(
+            uv=np.zeros((len(textured.vertices), 2)),
+            material=trimesh.visual.material.SimpleMaterial(
+                image=Image.new("RGB", (4, 4), (10, 20, 30))
+            ),
+        )
+        return textured
+
+    monkeypatch.setattr(wrapper, "_load_pipeline", lambda: fake_pipeline)
+    return wrapper, calls
+
+
+def test_paint_passes_single_image_when_no_back_image(monkeypatch):
+    """back_imageを渡さない場合は従来通り画像1枚(リストでなく単体)を渡す。"""
+    wrapper, calls = _fake_wrapper_with_recording_pipeline(monkeypatch)
+    mesh = trimesh.creation.box()
+    front = Image.new("RGBA", (8, 8), (255, 0, 0, 255))
+
+    wrapper.paint(mesh, front)
+
+    assert len(calls) == 1
+    assert calls[0] is front  # リスト化されていないこと(後方互換)
+
+
+def test_paint_passes_image_list_when_back_image_given(monkeypatch):
+    """back_imageを渡すと [front, back] のリストでパイプラインへ渡す。"""
+    wrapper, calls = _fake_wrapper_with_recording_pipeline(monkeypatch)
+    mesh = trimesh.creation.box()
+    front = Image.new("RGBA", (8, 8), (255, 0, 0, 255))
+    back = Image.new("RGBA", (8, 8), (0, 0, 255, 255))
+
+    wrapper.paint(mesh, front, back_image=back)
+
+    assert len(calls) == 1
+    assert calls[0] == [front, back]
+
+
+def test_paint_truncates_beyond_max_ref_images(monkeypatch, caplog):
+    """MAX_REF_IMAGES(=5、hunyuanpaint/unet/modules.py:456のmax_num_ref_image由来)
+    を超える枚数を渡そうとしても例外にせず、上限で切り詰めて警告を出す。
+
+    現状の呼び出し元(front + back の最大2枚)では発生しないが、将来の
+    拡張に対する安全弁として、内部ヘルパーで直接大量の画像を渡した場合の
+    挙動を検証する。
+    """
+    wrapper, calls = _fake_wrapper_with_recording_pipeline(monkeypatch)
+    mesh = trimesh.creation.box()
+    front = Image.new("RGBA", (8, 8), (255, 0, 0, 255))
+    back = Image.new("RGBA", (8, 8), (0, 0, 255, 255))
+
+    # paint()のシグネチャはfront+back限定なので、切り詰めロジック自体を
+    # MAX_REF_IMAGESを一時的に下げて2枚のケースで検証する。
+    monkeypatch.setattr(texture, "MAX_REF_IMAGES", 1)
+    with caplog.at_level("WARNING"):
+        wrapper.paint(mesh, front, back_image=back)
+
+    assert len(calls) == 1
+    assert calls[0] is front  # 2枚目(back)が切り詰められ、1枚扱いになる
+    assert any("Truncating" in rec.message for rec in caplog.records)
+
+
+# --- multiview_utils.camera_info_ref モンキーパッチのフォールバック ------------
+
+
+class _FakeMultiviewModelWrongType:
+    """Multiview_Diffusion_Netではない偽の属性(想定外の構造)。"""
+
+
+class _FakePipelineWithWrongModelType:
+    def __init__(self):
+        self.models = {"multiview_model": _FakeMultiviewModelWrongType()}
+
+
+class _FakePipelineMissingModels:
+    """`models`属性自体を持たない偽パイプライン(想定と違う構造)。"""
+
+
+def test_patch_falls_back_gracefully_when_model_type_unexpected(caplog):
+    """ラップ対象が想定と異なる型でも例外を出さず警告になる(graceful degradation)。"""
+    fake_pipeline = _FakePipelineWithWrongModelType()
+    with caplog.at_level("WARNING"):
+        texture._patch_multiview_ref_camera_info(fake_pipeline)
+    assert any(
+        "multi-reference" in rec.message or "camera_info_ref" in rec.message
+        for rec in caplog.records
+    )
+
+
+def test_patch_falls_back_gracefully_when_models_attribute_missing(caplog):
+    """`pipeline.models`自体が無い(属性エラー)場合も例外にせず警告になる。"""
+    fake_pipeline = _FakePipelineMissingModels()
+    with caplog.at_level("WARNING"):
+        texture._patch_multiview_ref_camera_info(fake_pipeline)
+    assert any(
+        "multi-reference" in rec.message or "camera_info_ref" in rec.message
+        for rec in caplog.records
+    )

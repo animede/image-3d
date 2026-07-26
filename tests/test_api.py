@@ -434,7 +434,7 @@ def test_texture_mode_paint_job_completes_with_mock(client, monkeypatch):
     """
     from server import main as main_module
 
-    def _fail_paint(self, mesh, image, job):
+    def _fail_paint(self, mesh, image, job, back_image=None):
         job.warnings.append("test: paint intentionally failed")
         return None
 
@@ -463,6 +463,51 @@ def test_texture_mode_paint_job_completes_with_mock(client, monkeypatch):
     assert len(res.content) > 0
 
 
+def test_texture_mode_paint_receives_back_view(client, monkeypatch):
+    """image_back付き + texture_mode=paint のジョブで、_run_paintに背面画像が
+    渡されること(背面参照対応、docs/RIG_SERVICE_PLAN.md記載のスパイク実装)。
+
+    left/rightはスパイク未検証のため今回は渡さない仕様なので、それらを
+    指定しても_run_paintに渡らないことも合わせて確認する。
+    """
+    from server import main as main_module
+
+    received: dict = {}
+
+    def _capture_paint(self, mesh, image, job, back_image=None):
+        received["back_image"] = back_image
+        job.warnings.append("test: paint intentionally short-circuited")
+        return None
+
+    monkeypatch.setattr(
+        main_module.job_manager.__class__, "_run_paint", _capture_paint, raising=True
+    )
+
+    front_bytes = make_test_png_bytes(color=(200, 50, 50))
+    back_bytes = make_test_png_bytes(color=(50, 50, 200))
+    left_bytes = make_test_png_bytes(color=(50, 200, 50))
+
+    res = client.post(
+        "/api/jobs",
+        files={
+            "image": ("front.png", front_bytes, "image/png"),
+            "image_back": ("back.png", back_bytes, "image/png"),
+            "image_left": ("left.png", left_bytes, "image/png"),
+        },
+        data={"params": '{"texture_mode": "paint", "seed": 42}'},
+    )
+    assert res.status_code == 200
+    job_id = res.json()["job_id"]
+
+    job = _wait_for_completion(client, job_id)
+    assert job["status"] == "completed", job.get("error")
+
+    assert received["back_image"] is not None
+    from PIL import Image as _Image
+
+    assert isinstance(received["back_image"], _Image.Image)
+
+
 def test_texture_mode_paint_with_color4_completes_with_mock(client, monkeypatch):
     """texture_mode=paint + color_mode=color4 の組合せもmockでジョブ完了すること。
 
@@ -471,7 +516,7 @@ def test_texture_mode_paint_with_color4_completes_with_mock(client, monkeypatch)
     """
     from server import main as main_module
 
-    def _fail_paint(self, mesh, image, job):
+    def _fail_paint(self, mesh, image, job, back_image=None):
         job.warnings.append("test: paint intentionally failed")
         return None
 

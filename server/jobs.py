@@ -154,16 +154,26 @@ class JobManager:
         return self._texture_pipeline
 
     def _run_paint(
-        self, mesh: trimesh.Trimesh, image: Image.Image, job: "Job"
+        self,
+        mesh: trimesh.Trimesh,
+        image: Image.Image,
+        job: "Job",
+        back_image: Optional[Image.Image] = None,
     ) -> Optional[trimesh.Trimesh]:
         """texture_mode=paint 時のペイント実行(同期・ワーカースレッドから呼ばれる)。
+
+        back_image があれば背面参照画像として texgen に渡し、背面ビューへの
+        正面色の回り込みを軽減する(検証スパイクで確認済み、server/texture.py の
+        `_patch_multiview_ref_camera_info` 参照)。left/right はスパイクで
+        未検証のため今回は渡さない(3枚以上でのcamera_info_ref拡張の挙動は
+        未確認)。
 
         失敗時は例外を送出せず None を返し、`job.warnings` に警告メッセージを
         記録する(graceful degradation: SPEC.md §3.9)。
         """
         try:
             pipeline = self._get_texture_pipeline()
-            return pipeline.paint(mesh, image)
+            return pipeline.paint(mesh, image, back_image=back_image)
         except Exception as exc:
             logger.exception("texture_mode=paint failed for job %s; falling back", job.job_id)
             job.warnings.append(
@@ -375,7 +385,7 @@ class JobManager:
             textured_mesh: Optional[trimesh.Trimesh] = None
             if params.texture_mode == "paint":
                 textured_mesh = await loop.run_in_executor(
-                    None, self._run_paint, processed_mesh, processed, job
+                    None, self._run_paint, processed_mesh, processed, job, extra_views.get("back")
                 )
                 job.textured = textured_mesh is not None
 

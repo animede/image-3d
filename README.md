@@ -615,6 +615,32 @@ curl -s -X POST http://127.0.0.1:8000/api/jobs \
   -F 'params={"texture_mode":"paint","color_mode":"color4","n_colors":4,"seed":42}'
 ```
 
+### 背面参照画像 (`image_back`) の利用
+
+`texture_mode=paint` と同時に `image_back`(SPEC.md §3.8 / FR-9 の追加ビュー)を
+指定すると、texgenのmultiview拡散に**背面の参照画像**を渡せる。指定しない場合、
+texgenは正面画像1枚だけを参照して残り5ビュー(背面含む)をモデル自身が
+推測生成するため、背面に正面の配色が回り込みやすい(下記「既知の制限」参照)。
+`image_back` を渡すと `server/jobs.py: JobManager._run_paint` が
+`TexturePipelineWrapper.paint(mesh, image, back_image=...)` を呼び出し、
+背面ビュー生成時に実際の背面画像の配色(髪型・服の色等)が反映されるようになる。
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/api/jobs \
+  -F "image=@front.png" \
+  -F "image_back=@back.png" \
+  -F 'params={"texture_mode":"paint","seed":42}'
+```
+
+- `left`/`right` は今回のE2E検証では未対応(下記の実装メモ参照)。指定しても
+  paintへは渡らない(back のみ反映される)。
+- 内部実装: `server/texture.py` の `_patch_multiview_ref_camera_info` が、
+  ロード済みパイプラインインスタンスの `multiview_model.__call__` を実行時に
+  ラップし、`camera_info_ref`(参照画像インデックス)を画像枚数に応じて
+  `[[0, 1, ...]]` に拡張する。vendored コード(`multiview_utils.py`)自体は
+  書き換えない。ラップ対象の属性構造が想定と異なる場合は例外にせず警告ログを
+  出し、従来動作(正面1枚のみ参照)にフォールバックする。
+
 ### 実機検証結果 (GPU, momo.png, ポート8021)
 
 `IMAGE3D_GENERATOR=hunyuan3d`、`texture_mode=paint`、`color_mode=color4`、
@@ -655,10 +681,20 @@ curl -s -X POST http://127.0.0.1:8000/api/jobs \
 - paint後のテクスチャは全周を6視点(正面/背面/左右/上/下相当)からの
   マルチビュー拡散結果をベイクする方式のため、細部の一貫性は入力画像の
   品質・被写体の複雑さに依存する。
+- **背面参照画像 (`image_back`) 対応(2026-07)**: 従来、`texgen`は正面画像
+  1枚だけを参照画像として使い、背面含む残り5ビューをマルチビュー拡散モデルが
+  新規推測生成していたため、背面に正面の配色が回り込む問題があった
+  (`third_party/Hunyuan3D-2/hy3dgen/texgen/utils/multiview_utils.py:80` の
+  `camera_info_ref = [[0]]` 固定が原因)。`image_back` を指定すると
+  `server/texture.py` の実行時パッチ(`_patch_multiview_ref_camera_info`)が
+  `camera_info_ref` を参照画像枚数に応じて拡張し、背面ビュー生成時に実際の
+  背面画像の配色が反映されるようになった(上記「背面参照画像」節参照)。
+  `left`/`right` は3枚以上でのcamera_info_ref拡張が未検証のため今回は
+  対象外(`server/jobs.py: JobManager._run_paint` はback画像のみをpaintへ渡す)。
 - **目など小さく高コントラストな特徴のズレ・シームは既知の限界**:
-  正面画像は参照にのみ使われ、他の5ビューは `Hunyuan3DPaintPipeline`
+  背面参照画像を渡しても、`Hunyuan3DPaintPipeline`
   (`third_party/Hunyuan3D-2/hy3dgen/texgen/pipelines.py`)がマルチビュー
-  拡散モデルで新規生成する。生成ビュー間で目の位置が完全には一致せず、
+  拡散モデルで生成する各ビューは独立生成のため完全には一致せず、
   それをメッシュへベイクする際にズレ・二重写り・輪郭のシームとして
   現れることがある。彫りの浅い(平坦に近い)ジオメトリのぬいぐるみ系被写体
   で特に目立ちやすい。`__call__(self, mesh, image)` にsteps/解像度等の

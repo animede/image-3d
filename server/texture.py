@@ -39,6 +39,11 @@ _IMPORT_ERROR_HINT = (
     " xatlas/pygltflib等の追加依存を導入してください。"
 )
 
+# 検証スパイクの実測: third_party/Hunyuan3D-2/hy3dgen/texgen/hunyuanpaint/unet/modules.py:456
+# `self.max_num_ref_image = 5` が参照画像の埋め込みテーブルの上限を定めているため、
+# それを超える枚数を渡すと class_labels の埋め込みlookupが範囲外になる。
+MAX_REF_IMAGES = 5
+
 
 def is_available() -> bool:
     """texgenが利用可能か(依存import + CUDA拡張の存在確認のみ、実ロードはしない)。
@@ -57,6 +62,100 @@ def is_available() -> bool:
     except Exception:
         return False
     return True
+
+
+def _patch_multiview_ref_camera_info(pipeline: Any) -> None:
+    """`Multiview_Diffusion_Net.__call__` の `camera_info_ref` 固定値を実行時ラップで解消する。
+
+    根拠(検証スパイクでのコード読解、third_party/Hunyuan3D-2/hy3dgen/texgen/ 配下):
+      - `utils/multiview_utils.py:80` の `camera_info_ref = [[0]]` は「参照画像は
+        常に1枚、インデックス0」というハードコード。参照画像を複数渡しても
+        2枚目以降のcamera embeddingが使われず、背面ビューへ正面の配色が
+        回り込む原因になっていた。
+      - `hunyuanpaint/unet/modules.py:456` の `self.max_num_ref_image = 5` が
+        参照側camera embeddingテーブルの上限。参照画像のインデックスは生成側
+        (azim/elevから符号化される値域[0,44)、pipelines.py参照)とは別体系で、
+        素の0始まりインデックス(0,1,2,...)をそのまま使うのが正しい
+        (modules.py:508 の生成側 `+ max_num_ref_image` オフセットは参照側には
+        加算されないため)。
+      - スパイク(painted_multi.glb)で、この拡張により背面ビューに背面参照画像の
+        配色(帽子の赤・服の紺)が反映されることを確認済み。VRAMピーク9.69GB、
+        生成時間は1枚時と同等(常駐後~7秒)。
+
+    vendored ファイル(multiview_utils.py)自体は書き換えず、ロード済み
+    パイプラインインスタンスの `multiview_model.__call__` をこの関数でラップする。
+    想定した属性構造(`pipeline.models['multiview_model']`)が無い場合は例外にせず、
+    警告ログを出して従来動作(参照1枚固定)にフォールバックする
+    (このリポジトリの graceful degradation の流儀に合わせる)。
+    """
+    try:
+        from hy3dgen.texgen.utils import multiview_utils as mvu
+
+        multiview_model = pipeline.models["multiview_model"]
+        if not isinstance(multiview_model, mvu.Multiview_Diffusion_Net):
+            raise TypeError(
+                f"pipeline.models['multiview_model'] は "
+                f"Multiview_Diffusion_Net ではありません(型: {type(multiview_model)!r})"
+            )
+    except Exception as exc:
+        logger.warning(
+            "Could not attach the multi-reference camera_info_ref patch "
+            "(falling back to single reference image only): %s",
+            exc,
+        )
+        return
+
+    def patched_call(self, input_images, control_images, camera_info):
+        from typing import List as _List
+
+        self.seed_everything(0)
+
+        if not isinstance(input_images, _List):
+            input_images = [input_images]
+
+        n_ref = len(input_images)
+
+        input_images = [
+            im.resize((self.view_size, self.view_size)) for im in input_images
+        ]
+        for i in range(len(control_images)):
+            control_images[i] = control_images[i].resize((self.view_size, self.view_size))
+            if control_images[i].mode == "L":
+                control_images[i] = control_images[i].point(lambda x: 255 if x > 1 else 0, mode="1")
+
+        import torch as _torch
+
+        kwargs = dict(generator=_torch.Generator(device=self.pipeline.device).manual_seed(0))
+
+        num_view = len(control_images) // 2
+        normal_image = [[control_images[i] for i in range(num_view)]]
+        position_image = [[control_images[i + num_view] for i in range(num_view)]]
+
+        camera_info_gen = [camera_info]
+        # ここが本パッチの核: 参照画像の枚数ぶんの camera_info_ref を生成する
+        # (固定 [[0]] ではなく [[0, 1, ...]])。
+        camera_info_ref = [list(range(n_ref))]
+
+        kwargs["width"] = self.view_size
+        kwargs["height"] = self.view_size
+        kwargs["num_in_batch"] = num_view
+        kwargs["camera_info_gen"] = camera_info_gen
+        kwargs["camera_info_ref"] = camera_info_ref
+        kwargs["normal_imgs"] = normal_image
+        kwargs["position_imgs"] = position_image
+
+        mvd_image = self.pipeline(input_images, num_inference_steps=30, **kwargs).images
+        return mvd_image
+
+    # インスタンス単位でバインドし直す(クラス自体は書き換えない = 他の
+    # TexturePipelineWrapper/将来のパイプラインインスタンスには影響しない)。
+    import types
+
+    multiview_model.__call__ = types.MethodType(patched_call, multiview_model)
+    logger.info(
+        "Patched Multiview_Diffusion_Net.__call__ on the loaded pipeline instance "
+        "to support multiple reference images (camera_info_ref expansion)."
+    )
 
 
 class TexturePipelineWrapper:
@@ -106,16 +205,34 @@ class TexturePipelineWrapper:
                 ) from exc
 
             self._pipeline = pipeline
+            _patch_multiview_ref_camera_info(pipeline)
             logger.info("Hunyuan3D-2 paint pipeline loaded and resident.")
             return self._pipeline
 
-    def paint(self, mesh: trimesh.Trimesh, image: Image.Image) -> trimesh.Trimesh:
-        """メッシュ(mm スケール、Z-up)+ 正面画像(背景除去後)からテクスチャ付き
-        メッシュを生成する。
+    def paint(
+        self,
+        mesh: trimesh.Trimesh,
+        image: Image.Image,
+        back_image: Optional[Image.Image] = None,
+    ) -> trimesh.Trimesh:
+        """メッシュ(mm スケール、Z-up)+ 参照画像からテクスチャ付きメッシュを生成する。
+
+        検証スパイク(2026-07時点)で、`Hunyuan3DPaintPipeline.__call__(mesh, image)`
+        は image がリストなら複数画像を受け付け、各画像に delight を適用したうえで
+        multiview拡散の参照画像として使う実装であることを確認済み。ただし
+        `multiview_utils.Multiview_Diffusion_Net.__call__` 内の `camera_info_ref` が
+        `[[0]]` に固定されているため(third_party/Hunyuan3D-2/hy3dgen/texgen/utils/
+        multiview_utils.py:80)、参照画像を増やしても2枚目以降が正しく紐付かず、
+        背面ビューへ正面色が回り込む問題があった。`_load_pipeline` 内で
+        `_patch_multiview_ref_camera_info` により実行時ラップし、参照画像枚数に
+        応じて camera_info_ref を拡張することでこれを解消する(vendored コード
+        自体は書き換えない)。
 
         Args:
             mesh: 後処理済みメッシュ(meshproc.process適用後、mm スケール)。
             image: 正面画像(背景除去後推奨、RGBA)。
+            back_image: 背面参照画像(背景除去後推奨、RGBA)。省略時は正面のみの
+                従来動作(参照画像1枚)。
 
         Returns:
             UV + テクスチャ画像(TextureVisuals)付きの trimesh.Trimesh。
@@ -125,10 +242,25 @@ class TexturePipelineWrapper:
 
         import torch
 
+        images: list[Image.Image] = [image]
+        if back_image is not None:
+            images.append(back_image)
+        if len(images) > MAX_REF_IMAGES:
+            # スパイクで確認した上限(max_num_ref_image=5)を超えないようガードする。
+            # 現状呼び出し元(jobs.py)はfront+backの最大2枚しか渡さないため
+            # 実運用では発生しないが、将来left/right追加時の安全弁として残す。
+            logger.warning(
+                "Truncating %d reference images to MAX_REF_IMAGES=%d for texgen paint.",
+                len(images),
+                MAX_REF_IMAGES,
+            )
+            images = images[:MAX_REF_IMAGES]
+
         # paint pipeline はメッシュを破壊的に変更しうるためコピーを渡す。
         mesh_copy = mesh.copy()
         try:
-            textured = pipeline(mesh_copy, image)
+            pipeline_input = images[0] if len(images) == 1 else images
+            textured = pipeline(mesh_copy, pipeline_input)
         except Exception as exc:
             raise RuntimeError(f"Hunyuan3D-2 texgen でのテクスチャ生成に失敗しました: {exc}") from exc
         finally:
