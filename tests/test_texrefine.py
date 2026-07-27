@@ -230,6 +230,49 @@ def test_declines_when_the_mesh_has_no_texture():
     assert "UV" in stats.reason
 
 
+def _eye_fixture(synth_eye_x: int, ref_eye_x: int, size: int = 256):
+    """「メッシュ側の目」と「参照側の目」の位置が異なる合成ビュー/参照を作る。"""
+    yy, xx = np.mgrid[0:size, 0:size]
+
+    def disc(cx, cy, r):
+        return (xx - cx) ** 2 + (yy - cy) ** 2 <= r * r
+
+    synth = np.full((size, size, 3), 255, np.uint8)
+    synth[disc(synth_eye_x, 128, 14)] = 20
+    mask = disc(128, 128, 110)
+
+    ref = np.full((size, size, 4), 255, np.uint8)
+    ref[disc(128, 128, 110), :3] = (230, 200, 170)  # 毛
+    ref[disc(ref_eye_x, 128, 14), :3] = 20  # 目
+    return synth, mask, Image.fromarray(ref, "RGBA")
+
+
+def test_reference_features_move_rigidly_to_the_mesh_position():
+    """参照の目は形のままメッシュ側の位置へ動き、元の位置は毛で埋まる。
+
+    ずれ(10px/256=3.9%)は上限 FEATURE_MATCH_MAX_FRACTION(5%) 未満に収める。
+    実ジョブのずれは10〜25px/1024(1〜2.5%)。
+    """
+    synth, mask, reference = _eye_fixture(synth_eye_x=100, ref_eye_x=110)
+    corrected, moved = texrefine.align_reference_features(synth, mask, reference)
+
+    assert moved == 1
+    out = np.asarray(corrected)
+    assert out[128, 100, :3].mean() < 60, "目がメッシュ側の位置に来ていない"
+    assert out[128, 121, :3].mean() > 150, "元の位置に目が残っている(二重写し)"
+    # 形が保たれている(移動先で円がそのまま): 縁の少し内側も暗い
+    assert out[128 - 10, 100, :3].mean() < 60
+
+
+def test_features_without_a_match_stay_put():
+    """メッシュ側に対応が無い(ずれ上限超)特徴は動かさない。"""
+    synth, mask, reference = _eye_fixture(synth_eye_x=40, ref_eye_x=210)
+    corrected, moved = texrefine.align_reference_features(synth, mask, reference)
+
+    assert moved == 0
+    assert np.array_equal(np.asarray(corrected), np.asarray(reference.convert("RGBA")))
+
+
 def test_shadow_deepening_darkens_baked_shine_only():
     """黒締めは「暗い無彩色」(目の照り)だけに効き、デニムや毛には効かない。"""
     tex = np.array(

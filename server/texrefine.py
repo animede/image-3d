@@ -77,6 +77,36 @@ FACE_CHUNK = 20000
 # 拾って細い継ぎ目になる。
 HOLE_FILL_RADIUS_TEXELS = 4
 
+# --- 顔の特徴(目・鼻・口)は texgen に任せる -------------------------------
+# 生成メッシュの目・鼻は参照画像と数%ずれる(実測: 目の中心で10〜25px/1024)。
+# texgen はメッシュの法線・位置マップに条件付けて描くので**形状に揃っており**、
+# 画像基準の直交投影だけだと、目のくぼみと描かれた目がずれて「浮いた」顔になる
+# (リグ後の照明で顕著)。
+#
+# ワープで参照側を寄せる案は2通り試して**両方とも悪化**した:
+#   - 密なオプティカルフロー(cv2 DIS): 参照の目の輪郭を texgen の目の輪郭に
+#     合わせようとするが、texgen の特徴は512px品質で形・大きさが不正確な
+#     ため、「縮んだ目・崩れた鼻」まで転写してしまう。
+#   - 暗い塊の重心マッチ+ガウスRBF: 近接する特徴(目と耳の黒パッチ)の変位が
+#     食い違い、その勾配が目を横切って形を歪めた(半目のように潰れる)。
+#
+# 「特徴領域は texgen に任せる」案も試したが、texgen の目は世代によって
+# 小さく生気の無い点になり、質感の魅力を落とした。
+#
+# 採用したのは**特徴の剛体移動(切って貼る)**: 参照側の暗い塊を、対応する
+# メッシュ側(合成ビュー)の位置へ**形を変えずに平行移動**した「補正済み参照」
+# を作り、それを転写する。塊ごとに一定の変位なので変形が原理的に起きず、
+# 参照のくっきりした目がそのままメッシュのくぼみ位置に載る。元の位置は
+# 周囲の毛(最近傍の非特徴画素)で埋めて、二重写しを防ぐ。
+FEATURE_MAX_LUMINANCE = 95.0  # 「暗い特徴」とみなす輝度上限
+FEATURE_MAX_SATURATION = 70.0  # 同・彩度上限(有彩色の服などを除く)
+FEATURE_MIN_AREA_PX = 60  # ノイズ除去: これ未満の塊は無視
+FEATURE_MAX_AREA_FRACTION = 0.05  # 被写体比これ超の塊(大きな黒い服等)は無視
+FEATURE_MATCH_MAX_FRACTION = 0.05  # 対応とみなす特徴間距離の上限(画像辺比)
+FEATURE_MIN_SHIFT_PX = 3.0  # これ未満のずれは移動しない(誤差の範囲)
+FEATURE_DILATE_FRACTION = 0.006  # 塊の周囲をこの半径(画像辺比)だけ一緒に運ぶ
+FEATURE_FEATHER_FRACTION = 0.004  # 貼り付け境界をぼかす幅(画像辺比)
+
 # --- 焼き込まれた照りの補正(黒締め) ----------------------------------------
 # 参照画像は撮影(生成)時の照明ごと写っており、艶のある部位(プラスチックの
 # 目・鼻)には反射の照りが焼き込まれている。テクスチャとして貼ると、ビューアの
@@ -200,6 +230,169 @@ def _iter_surface_samples(
         sample_normals /= np.maximum(norm, 1e-9)
         sample_uv = (tri_uv * bary).sum(axis=1)  # (S, 2)
         yield points, sample_normals, sample_uv
+
+
+class _SynthView:
+    """参照画像と同じ解像度で「メッシュを texgen 色で描いた合成ビュー」を作る。
+
+    最前面のサンプルの texgen 色を画素ごとに残す(単純なポイントラスタライザ)。
+    フローワープの位置合わせ先として使う。
+    """
+
+    def __init__(self, image: Image.Image, view_normal: np.ndarray):
+        self.w, self.h = image.size
+        self.depth = np.full(self.h * self.w, np.inf, dtype=np.float64)
+        self.color = np.zeros((self.h * self.w, 3), dtype=np.uint8)
+        self.direction = -view_normal
+
+    def record(self, points: np.ndarray, px: np.ndarray, py: np.ndarray, rgb: np.ndarray) -> None:
+        d = points @ self.direction
+        flat = py * self.w + px
+        # 奥→手前の順に書けば、同一画素は最前面が最後に残る。チャンクを跨ぐ
+        # 分は self.depth との比較で守る。
+        order = np.argsort(-d)
+        flat_o = flat[order]
+        nearer = d[order] < self.depth[flat_o]
+        idx = order[nearer]
+        self.depth[flat_o[nearer]] = d[idx]
+        self.color[flat_o[nearer]] = rgb[idx]
+
+    def image(self) -> tuple[np.ndarray, np.ndarray]:
+        """(色 (h,w,3) uint8, 被覆マスク (h,w)) を返す。未被覆は白。"""
+        covered = np.isfinite(self.depth).reshape(self.h, self.w)
+        rgb = self.color.reshape(self.h, self.w, 3).copy()
+        rgb[~covered] = 255
+        return rgb, covered
+
+
+def _dark_feature_mask(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """暗く彩度の低い塊(目・鼻・口・黒パッチ)のマスクを返す。
+
+    小さすぎる塊(ノイズ)と大きすぎる塊(黒い服全体など、面積比
+    `FEATURE_MAX_AREA_FRACTION` 超)は「特徴」とみなさない。
+    """
+    from scipy.ndimage import label
+
+    a = rgb.astype(np.float32)
+    dark = (a.mean(axis=2) < FEATURE_MAX_LUMINANCE) & (
+        a.max(axis=2) - a.min(axis=2) < FEATURE_MAX_SATURATION
+    ) & mask
+    components, n = label(dark)
+    if n == 0:
+        return dark  # 全False
+    areas = np.bincount(components.ravel())
+    max_area = mask.sum() * FEATURE_MAX_AREA_FRACTION
+    keep = (areas >= FEATURE_MIN_AREA_PX) & (areas <= max_area)
+    keep[0] = False
+    return keep[components]
+
+
+def _feature_components(
+    rgb: np.ndarray, mask: np.ndarray
+) -> list[tuple[np.ndarray, float, float]]:
+    """暗い特徴の連結成分ごとに (画素マスク, 重心x, 重心y) を返す。"""
+    from scipy.ndimage import label
+
+    dark = _dark_feature_mask(rgb, mask)
+    components, n = label(dark)
+    out = []
+    for i in range(1, n + 1):
+        m = components == i
+        ys, xs = np.where(m)
+        out.append((m, float(xs.mean()), float(ys.mean())))
+    return out
+
+
+def align_reference_features(
+    synth_rgb: np.ndarray,
+    synth_mask: np.ndarray,
+    reference: Image.Image,
+) -> tuple[Image.Image, int]:
+    """参照画像の暗い特徴をメッシュ側の位置へ剛体移動した補正版を返す。
+
+    合成ビュー(メッシュ側)と参照(画像側)の暗い塊の重心を距離昇順で一対一に
+    対応付け、対応した塊を**形を変えずに**平行移動する。元の位置は周囲の
+    非特徴画素(毛)で埋める。対応が無い塊は動かさない。
+
+    Returns:
+        (補正済み参照RGBA, 移動した特徴数)。
+    """
+    from scipy.ndimage import binary_dilation, distance_transform_edt, gaussian_filter
+
+    ref = reference.convert("RGBA")
+    w, h = ref.size
+    if synth_rgb.shape[:2] != (h, w):
+        raise ValueError("合成ビューと参照画像の解像度が一致していません。")
+    ref_arr = np.asarray(ref).copy()
+    ref_rgb = ref_arr[..., :3]
+
+    synth_feats = _feature_components(synth_rgb, synth_mask)
+    ref_feats = _feature_components(ref_rgb, ref_arr[..., 3] > 128)
+    if not synth_feats or not ref_feats:
+        return ref, 0
+
+    limit = FEATURE_MATCH_MAX_FRACTION * max(w, h)
+    pairs = []
+    for i, (_, sx, sy) in enumerate(synth_feats):
+        for j, (_, rx, ry) in enumerate(ref_feats):
+            d = ((sx - rx) ** 2 + (sy - ry) ** 2) ** 0.5
+            if FEATURE_MIN_SHIFT_PX <= d <= limit:
+                pairs.append((d, i, j))
+    pairs.sort()
+    used_s: set[int] = set()
+    used_r: set[int] = set()
+    moves = []  # (参照の塊マスク, dx, dy)
+    for d, i, j in pairs:
+        if i in used_s or j in used_r:
+            continue
+        used_s.add(i)
+        used_r.add(j)
+        _, sx, sy = synth_feats[i]
+        rmask, rx, ry = ref_feats[j]
+        moves.append((rmask, sx - rx, sy - ry))
+    if not moves:
+        return ref, 0
+
+    radius = max(int(FEATURE_DILATE_FRACTION * max(w, h)), 2)
+    sigma = max(FEATURE_FEATHER_FRACTION * max(w, h), 1.0)
+
+    # 1) 動かす塊の元位置をすべて消す(最近傍の非特徴画素=毛で埋める)。
+    #    先に全部消してから貼ることで、移動先が他の塊の元位置と重なっても
+    #    消し残しが出ない。
+    erase = np.zeros((h, w), bool)
+    for rmask, _, _ in moves:
+        erase |= binary_dilation(rmask, iterations=radius)
+    _, (iy, ix) = distance_transform_edt(erase, return_distances=True, return_indices=True)
+    filled_rgb = ref_rgb.copy()
+    filled_rgb[erase] = ref_rgb[iy[erase], ix[erase]]
+    out_rgb = filled_rgb.astype(np.float32)
+
+    # 2) 塊をずらした位置へ、ふちをぼかして貼る。
+    shifts = []
+    for rmask, dx, dy in moves:
+        patch = binary_dilation(rmask, iterations=radius)
+        soft = gaussian_filter(patch.astype(np.float32), sigma=sigma)
+        idx, idy = int(round(dx)), int(round(dy))
+        shifted_soft = np.zeros_like(soft)
+        src_y = slice(max(0, -idy), min(h, h - idy))
+        src_x = slice(max(0, -idx), min(w, w - idx))
+        dst_y = slice(max(0, idy), min(h, h + idy))
+        dst_x = slice(max(0, idx), min(w, w + idx))
+        shifted_soft[dst_y, dst_x] = soft[src_y, src_x]
+        shifted_rgb = np.zeros_like(out_rgb)
+        shifted_rgb[dst_y, dst_x] = ref_rgb[src_y, src_x]
+        alpha = shifted_soft[..., None]
+        out_rgb = out_rgb * (1.0 - alpha) + shifted_rgb * alpha
+        shifts.append((dx * dx + dy * dy) ** 0.5)
+
+    ref_arr[..., :3] = np.clip(out_rgb, 0, 255).astype(np.uint8)
+    logger.info(
+        "Aligned %d dark features onto the mesh (shift mean %.1fpx / max %.1fpx).",
+        len(moves),
+        float(np.mean(shifts)),
+        float(np.max(shifts)),
+    )
+    return Image.fromarray(ref_arr, "RGBA"), len(moves)
 
 
 class _DepthBuffer:
@@ -341,18 +534,46 @@ def refine_texture_with_references(
 
     counts_all = _face_sample_counts(uv_texels, faces)
 
-    # --- パス1: ビューごとの深度バッファを作る(可視性判定) ------------------
+    # --- パス1: ビューごとの深度バッファ(可視性)と合成ビュー(位置合わせ) ----
+    base_u8 = np.clip(base, 0, 255).astype(np.uint8)
     depth_buffers = {
         view: _DepthBuffer(view_data[view][3], view_data[view][2], mesh.extents)
         for view in views
     }
-    for points, _, _ in _iter_surface_samples(vertices, normals, uv_texels, faces, counts_all):
+    synth_views = {
+        view: _SynthView(view_data[view][3], view_data[view][2]) for view in views
+    }
+    for points, _, sample_uv in _iter_surface_samples(
+        vertices, normals, uv_texels, faces, counts_all
+    ):
+        tx = np.clip(sample_uv[:, 0].astype(np.int64), 0, w - 1)
+        ty = np.clip(sample_uv[:, 1].astype(np.int64), 0, h - 1)
+        texgen_rgb = base_u8[ty, tx]
         for view in views:
             image = view_data[view][3]
             px, py = colorproc.project_points_to_pixels(mesh, image, points, view=view)
             depth_buffers[view].record(points, px, py)
+            synth_views[view].record(points, px, py, texgen_rgb)
     for buffer in depth_buffers.values():
         buffer.finalize()
+
+    # 参照の目・鼻・口をメッシュ側の位置へ剛体移動し、以降のサンプリングは
+    # この補正済み参照から行う(位置ずれした顔パーツが「浮く」のを防ぐ)。
+    for view in views:
+        synth_rgb, synth_mask = synth_views[view].image()
+        rgb, trusted, view_normal, image = view_data[view]
+        try:
+            corrected, moved = align_reference_features(synth_rgb, synth_mask, image)
+        except Exception:
+            logger.exception("Feature alignment failed for the %s view; using it as-is.", view)
+            continue
+        if moved:
+            view_data[view] = (
+                np.asarray(corrected.convert("RGB"), dtype=np.float32),
+                trusted,
+                view_normal,
+                image,
+            )
 
     # --- パス2: 可視かつ信頼できるサンプルだけを参照画像から転写する --------
     occluded_samples = 0
