@@ -189,6 +189,14 @@ class JobManager:
         if back_image is not None:
             references["back"] = back_image
         try:
+            # 精細化前のアトラスを保存しておく(調整・切り分け用: これがあれば
+            # GPU再生成なしで texrefine だけを再実行できる)。
+            raw_texture = texrefine._extract_texture_image(painted.visual)
+            if raw_texture is not None:
+                raw_texture.convert("RGB").save(job.dir_path() / "texture_texgen.png")
+        except Exception:
+            logger.exception("Could not save the pre-refinement atlas for job %s", job.job_id)
+        try:
             stats = texrefine.refine_texture_with_references(painted, references)
             if not stats.applied:
                 # texgen の結果自体は使えるので、job は失敗させない。

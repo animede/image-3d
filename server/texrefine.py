@@ -21,6 +21,13 @@ texgen の結果へ上書きする。texgen は「参照が無い/浅い角度�
 サンプリングしてしまい黒い筋の原因になる(colorproc の
 `_LOW_CONFIDENCE_DOT_THRESHOLD` と同じ理由)。境目が出ないよう、法線の向きに
 応じて texgen 側へなめらかに戻す。
+
+もう一つの肝が**可視性**。直交投影は (x,z) しか見ないため、帽子の垂れや耳の
+裏に隠れた面も「正面を向いてさえいれば」画像を拾ってしまい、そこを覆っている
+帽子の赤や耳の黒が顔の縁に筋として写る(実測: 遮蔽された正面向き頂点の52%が
+赤/黒を拾っていた)。表面サンプル自身からビューごとの深度バッファを作り、
+最前面から `DEPTH_EPS_FRACTION` より奥のサンプルは参照から塗らず texgen に
+任せる。これにより「最悪でも texgen、可視なら精細」という下限が保証される。
 """
 from __future__ import annotations
 
@@ -38,18 +45,26 @@ from . import colorproc
 logger = logging.getLogger(__name__)
 
 # 参照画像を全面的に信用する法線しきい値(視線との内積)。
-# 0.75 ≒ 視線から41°以内。正対する顔・胸・腕の前面がここに入る。
-FULL_CONFIDENCE_DOT = 0.75
+# 0.50 ≒ 視線から60°以内。可視性テスト導入前は 0.75 だったが、遮蔽画素を
+# 拾う心配が無くなったので広げた。この帯を狭くすると、texgen と半々に
+# 混ざる帯域が広がり、texgen 側の目の輪郭が参照の目の下に「二重写し」で
+# 残る(実ジョブ46b64850で確認)。
+FULL_CONFIDENCE_DOT = 0.50
 
-# 上書きを完全にやめる法線しきい値。0.35 ≒ 視線から70°。colorproc が
-# 「投影を信用しない」と判断するのと同じ値。ここから上へ向けて線形に
-# 重みを上げ、texgen との境目が線にならないようにする。
-MIN_CONFIDENCE_DOT = 0.35
+# 上書きを完全にやめる法線しきい値。0.20 ≒ 視線から78°。可視性テストと
+# フチ除外(trusted mask)導入前は 0.35 だったが、両ガードが入った後の実測
+# (c78dac23 の生アトラスで 0.35 と 0.20 を比較)では、0.20 の方が帽子の
+# つば下の texgen ノイズ帯を参照で置き換えられ、側面の引き伸ばしは
+# 増えなかった。ここから上へ向けて線形に重みを上げ、texgen との境目が
+# 線にならないようにする。浅い角度では1画素が表面上で大きく引き伸ばされる
+# (テクセル密度の問題)ので、下限自体は残す。
+MIN_CONFIDENCE_DOT = 0.20
 
 # 面あたりのサンプル数の目安(テクセル面積の何倍を撒くか)。
 # ランダムなバリセントリックサンプリングなので取りこぼしが出るが、
-# 残った穴は `HOLE_FILL_RADIUS_TEXELS` で埋める。
-SAMPLES_PER_TEXEL = 4.0
+# 残った穴は `HOLE_FILL_RADIUS_TEXELS` で埋める。少なすぎると遮蔽境界で
+# テクセルごとの可視率の分散が大きくなり、ごま塩状のノイズになる。
+SAMPLES_PER_TEXEL = 6.0
 
 # 1面あたりのサンプル数の上限(極端に大きい面でメモリが跳ねるのを防ぐ)。
 MAX_SAMPLES_PER_FACE = 4096
@@ -62,6 +77,18 @@ FACE_CHUNK = 20000
 # 拾って細い継ぎ目になる。
 HOLE_FILL_RADIUS_TEXELS = 4
 
+# 可視性判定の深度バッファは参照画像をこの係数で縮めた格子で持つ。
+# サンプル密度はUVテクセル面積基準なので、画像解像度そのままでは
+# 疎な面にピンホール(誤って「可視」になる穴)ができる。粗くするほど
+# 密度は上がるが、深度の段差近傍で過剰に遮蔽扱いになる(texgenに戻る
+# だけなので安全側)。
+DEPTH_GRID_DIVISOR = 2
+
+# 最前面からこの割合(ビュー方向の奥行き全長比)より奥のサンプルは
+# 遮蔽とみなす。頂点単位の事前計測(2%)で帽子の垂れ・耳の裏の誤サンプル
+# 1080頂点を妥当に検出できた値。
+DEPTH_EPS_FRACTION = 0.02
+
 
 @dataclass
 class RefineStats:
@@ -72,6 +99,7 @@ class RefineStats:
     texture_size: tuple[int, int] = (0, 0)
     refined_texel_ratio: float = 0.0
     mean_blend_weight: float = 0.0
+    occluded_sample_ratio: float = 0.0
     reason: Optional[str] = None
 
 
@@ -122,6 +150,91 @@ def _blend_weight(dot: np.ndarray) -> np.ndarray:
     """法線と視線の内積 -> 参照画像を信用する重み (0..1)。"""
     span = max(FULL_CONFIDENCE_DOT - MIN_CONFIDENCE_DOT, 1e-9)
     return np.clip((dot - MIN_CONFIDENCE_DOT) / span, 0.0, 1.0).astype(np.float32)
+
+
+def _iter_surface_samples(
+    vertices: np.ndarray,
+    normals: np.ndarray,
+    uv_texels: np.ndarray,
+    faces: np.ndarray,
+    counts_all: np.ndarray,
+):
+    """面のUVテクセル面積に比例したランダム表面サンプルをチャンク単位で返す。
+
+    深度バッファ構築(パス1)と色サンプリング(パス2)で**同一のサンプル列**を
+    使うため、呼び出しごとに同じシードで乱数列を作り直す(決定的)。
+    """
+    rng = np.random.default_rng(0)
+    for start in range(0, len(faces), FACE_CHUNK):
+        chunk = faces[start : start + FACE_CHUNK]
+        counts = counts_all[start : start + FACE_CHUNK]
+        total = int(counts.sum())
+        if total == 0:
+            continue
+
+        face_idx = np.repeat(np.arange(len(chunk)), counts)
+        bary = _barycentric(total, rng)[:, :, None]  # (S, 3, 1)
+
+        tri_v = vertices[chunk[face_idx]]  # (S, 3, 3)
+        tri_n = normals[chunk[face_idx]]
+        tri_uv = uv_texels[chunk[face_idx]]
+
+        points = (tri_v * bary).sum(axis=1)  # (S, 3)
+        sample_normals = (tri_n * bary).sum(axis=1)
+        norm = np.linalg.norm(sample_normals, axis=1, keepdims=True)
+        sample_normals /= np.maximum(norm, 1e-9)
+        sample_uv = (tri_uv * bary).sum(axis=1)  # (S, 2)
+        yield points, sample_normals, sample_uv
+
+
+class _DepthBuffer:
+    """1ビュー分の直交深度バッファ(可視性判定用)。
+
+    表面サンプル自身を「その画素の最前面はどの奥行きか」の証言として使う。
+    遮蔽物は裏を向いていても遮蔽するので、面の向きに関係なく全サンプルを
+    登録する。格子は参照画像を `DEPTH_GRID_DIVISOR` で縮めた解像度
+    (サンプル密度はUV面積基準のため、画像解像度そのままでは疎な面に
+    ピンホールができる)。
+    """
+
+    def __init__(self, image: Image.Image, view_normal: np.ndarray, extents: np.ndarray):
+        w, h = image.size
+        self.gw = (w + DEPTH_GRID_DIVISOR - 1) // DEPTH_GRID_DIVISOR
+        self.gh = (h + DEPTH_GRID_DIVISOR - 1) // DEPTH_GRID_DIVISOR
+        self.depth = np.full(self.gh * self.gw, np.inf, dtype=np.float64)
+        # 奥行き = 視線方向(カメラ→被写体)に沿った座標。カメラは view_normal 側に
+        # あるので、視線方向は -view_normal。値が小さいほど手前。
+        self.direction = -view_normal
+        axis = int(np.argmax(np.abs(view_normal)))
+        self.eps = float(extents[axis]) * DEPTH_EPS_FRACTION
+
+    def _cells(self, px: np.ndarray, py: np.ndarray) -> np.ndarray:
+        return (py // DEPTH_GRID_DIVISOR) * self.gw + (px // DEPTH_GRID_DIVISOR)
+
+    def record(self, points: np.ndarray, px: np.ndarray, py: np.ndarray) -> None:
+        np.minimum.at(self.depth, self._cells(px, py), points @ self.direction)
+
+    def finalize(self) -> None:
+        """3x3の最小値フィルタでピンホール(疎な面の取りこぼし)を塞ぐ。
+
+        深度の段差近傍では過剰に遮蔽扱いになりうるが、その場合は texgen に
+        戻るだけなので安全側。
+        """
+        from scipy.ndimage import minimum_filter
+
+        grid = self.depth.reshape(self.gh, self.gw)
+        self.depth = minimum_filter(grid, size=3).reshape(-1)
+
+    def visibility(self, points: np.ndarray, px: np.ndarray, py: np.ndarray) -> np.ndarray:
+        """可視度 (0..1)。最前面から eps までは 1、2*eps で 0 へ落とす。
+
+        二値にすると、深度の段差(鼻の付け根・帽子のつばの縁)の周りで
+        テクセルごとに可視/遮蔽が切り替わり、参照と texgen がまだらに
+        混ざるごま塩ノイズになる(実ジョブc78dac23で確認)。
+        """
+        depth = points @ self.direction
+        excess = depth - self.depth[self._cells(px, py)] - self.eps
+        return np.clip(1.0 - excess / max(self.eps, 1e-9), 0.0, 1.0)
 
 
 def refine_texture_with_references(
@@ -191,28 +304,26 @@ def refine_texture_with_references(
     accum_count = np.zeros(h * w, dtype=np.float32)
 
     counts_all = _face_sample_counts(uv_texels, faces)
-    rng = np.random.default_rng(0)
 
-    for start in range(0, len(faces), FACE_CHUNK):
-        chunk = faces[start : start + FACE_CHUNK]
-        counts = counts_all[start : start + FACE_CHUNK]
-        total = int(counts.sum())
-        if total == 0:
-            continue
+    # --- パス1: ビューごとの深度バッファを作る(可視性判定) ------------------
+    depth_buffers = {
+        view: _DepthBuffer(view_data[view][3], view_data[view][2], mesh.extents)
+        for view in views
+    }
+    for points, _, _ in _iter_surface_samples(vertices, normals, uv_texels, faces, counts_all):
+        for view in views:
+            image = view_data[view][3]
+            px, py = colorproc.project_points_to_pixels(mesh, image, points, view=view)
+            depth_buffers[view].record(points, px, py)
+    for buffer in depth_buffers.values():
+        buffer.finalize()
 
-        face_idx = np.repeat(np.arange(len(chunk)), counts)
-        bary = _barycentric(total, rng)[:, :, None]  # (S, 3, 1)
-
-        tri_v = vertices[chunk[face_idx]]  # (S, 3, 3)
-        tri_n = normals[chunk[face_idx]]
-        tri_uv = uv_texels[chunk[face_idx]]
-
-        points = (tri_v * bary).sum(axis=1)  # (S, 3)
-        sample_normals = (tri_n * bary).sum(axis=1)
-        norm = np.linalg.norm(sample_normals, axis=1, keepdims=True)
-        sample_normals /= np.maximum(norm, 1e-9)
-        sample_uv = (tri_uv * bary).sum(axis=1)  # (S, 2)
-
+    # --- パス2: 可視かつ信頼できるサンプルだけを参照画像から転写する --------
+    occluded_samples = 0
+    assigned_samples = 0
+    for points, sample_normals, sample_uv in _iter_surface_samples(
+        vertices, normals, uv_texels, faces, counts_all
+    ):
         tx = np.clip(sample_uv[:, 0].astype(np.int64), 0, w - 1)
         ty = np.clip(sample_uv[:, 1].astype(np.int64), 0, h - 1)
         flat = ty * w + tx
@@ -223,6 +334,8 @@ def refine_texture_with_references(
         best_dot = dots[np.arange(len(dots)), best]
 
         weight = _blend_weight(best_dot)
+        # 遮蔽・フチ落ちしたサンプルも分母には入れる(境界のテクセルが
+        # 自動的に texgen 側へ寄り、遮蔽の切り替わりが線にならない)。
         np.add.at(accum_count, flat, 1.0)
 
         for vi, view in enumerate(views):
@@ -231,12 +344,18 @@ def refine_texture_with_references(
                 continue
             rgb, trusted, _, image = view_data[view]
             px, py = colorproc.project_points_to_pixels(mesh, image, points[sel], view=view)
-            # フチ・透明画素に落ちたサンプルは信用しない(黒筋の原因)。
-            ok = trusted[py, px]
+            # 手前に別の面がある(=このビューから見えていない)サンプルは
+            # 参照から塗らない。遮蔽を無視すると、帽子の垂れの裏の頭側面が
+            # 帽子の赤を拾う等、覆っているパーツの色が筋として写る。
+            visibility = depth_buffers[view].visibility(points[sel], px, py)
+            assigned_samples += int(sel.sum())
+            occluded_samples += int((visibility <= 0.0).sum())
+            # フチ・透明画素に落ちたサンプルも信用しない(黒筋の原因)。
+            ok = trusted[py, px] & (visibility > 0.0)
             if not ok.any():
                 continue
             idx = np.flatnonzero(sel)[ok]
-            wgt = weight[idx]
+            wgt = weight[idx] * visibility[ok].astype(np.float32)
             np.add.at(accum_rgb, flat[idx], rgb[py[ok], px[ok]] * wgt[:, None])
             np.add.at(accum_weight, flat[idx], wgt)
 
@@ -259,13 +378,25 @@ def refine_texture_with_references(
 
     # 取りこぼしと UV チャート外周を、最近傍の上書き済みテクセルで埋める。
     # 埋めないとバイリニア補間がチャート外の texgen 色を拾って継ぎ目になる。
+    # ただし「サンプルは届いたが遮蔽/フチで棄却された」テクセル(count>0,
+    # weight=0)は意図して texgen に残した場所なので埋めない。
     if not covered_2d.all():
+        never_sampled = accum_count.reshape(h, w) == 0
         distance, (iy, ix) = distance_transform_edt(
             ~covered_2d, return_distances=True, return_indices=True
         )
-        fill = (distance > 0) & (distance <= HOLE_FILL_RADIUS_TEXELS)
+        fill = (distance > 0) & (distance <= HOLE_FILL_RADIUS_TEXELS) & never_sampled
         refined[fill] = refined[iy[fill], ix[fill]]
         blend[fill] = blend[iy[fill], ix[fill]]
+
+    # 混合率マップの孤立ノイズを除去する。遮蔽境界ではサンプルの当たり方の
+    # 揺らぎでテクセル単位の外れ値(周囲は参照なのに1点だけtexgen、またはその逆)
+    # が出て、ごま塩状に見える。色ではなく**混合率だけ**を均すので、参照側の
+    # 毛並み等のディテールは鈍らない。ガター埋めの**後**に掛けること
+    # (先に掛けるとチャート外周の blend=0 と混ざって縁が侵食される)。
+    from scipy.ndimage import median_filter
+
+    blend = median_filter(blend, size=3)
 
     result = base * (1.0 - blend[..., None]) + refined * blend[..., None]
     new_texture = Image.fromarray(np.clip(result, 0, 255).astype(np.uint8), "RGB")
@@ -277,13 +408,15 @@ def refine_texture_with_references(
     stats.applied = True
     stats.refined_texel_ratio = float((blend > 0).mean())
     stats.mean_blend_weight = float(blend[blend > 0].mean())
+    stats.occluded_sample_ratio = occluded_samples / max(assigned_samples, 1)
     logger.info(
         "Refined the texgen atlas from %s references at full resolution: "
-        "%.1f%% of %dx%d texels touched (mean blend %.2f).",
+        "%.1f%% of %dx%d texels touched (mean blend %.2f, %.1f%% of samples occluded).",
         "+".join(views),
         stats.refined_texel_ratio * 100,
         w,
         h,
         stats.mean_blend_weight,
+        stats.occluded_sample_ratio * 100,
     )
     return stats

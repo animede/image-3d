@@ -144,6 +144,64 @@ def test_dirty_silhouette_edge_is_not_sampled():
     assert np.allclose(refined.mean(axis=0), REFERENCE_RED, atol=12)
 
 
+def _two_plates_mesh(texture_size: int = 256) -> trimesh.Trimesh:
+    """正面(-Y)を向く2枚の板。小さい板が大きい板の手前(帽子の垂れの模型)。
+
+    どちらも法線は正面ビューへ正対しているので、可視性を見ない投影では
+    後ろの板も参照画像(=手前の板を覆う色)を拾ってしまう。
+    UVは左半分=後ろの板、右半分=手前の板に分ける。
+    """
+    # 後ろの大きい板 (y=+10)、手前の小さい板 (y=0)。Z-up、正面 -Y。
+    back = np.array([[-50, 10, -50], [50, 10, -50], [50, 10, 50], [-50, 10, 50]], float)
+    front = np.array([[-20, 0, -20], [20, 0, -20], [20, 0, 20], [-20, 0, 20]], float)
+    vertices = np.vstack([back, front])
+    faces = np.array([[0, 1, 2], [0, 2, 3], [4, 5, 6], [4, 6, 7]])
+    uv = np.array(
+        [[0.05, 0.05], [0.45, 0.05], [0.45, 0.95], [0.05, 0.95],
+         [0.55, 0.05], [0.95, 0.05], [0.95, 0.95], [0.55, 0.95]]
+    )
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    texture = Image.new("RGB", (texture_size, texture_size), (TEXGEN_GREY,) * 3)
+    mesh.visual = trimesh.visual.TextureVisuals(
+        uv=uv, material=trimesh.visual.material.SimpleMaterial(image=texture)
+    )
+    return mesh
+
+
+def test_occluded_surfaces_are_not_painted_from_the_reference():
+    """手前の板に隠れた面は、正面を向いていても参照から塗らない。
+
+    これを怠ると、帽子の垂れや耳の裏に隠れた頭側面が、そこを覆っている
+    帽子の赤・耳の黒を拾って筋になる(実ジョブ46b64850で確認した欠陥)。
+    """
+    mesh = _two_plates_mesh()
+    ref = Image.new("RGBA", (256, 256), (*REFERENCE_RED, 255))
+    stats = texrefine.refine_texture_with_references(mesh, {"front": ref})
+
+    assert stats.applied, stats.reason
+    assert stats.occluded_sample_ratio > 0.0
+    tex = np.asarray(texrefine._extract_texture_image(mesh.visual).convert("RGB")).astype(int)
+    h, w = tex.shape[:2]
+    front_plate = tex[h // 2, int(w * 0.75)]  # 手前の板の中央
+    hidden_centre = tex[h // 2, int(w * 0.25)]  # 後ろの板のうち隠れている中央部
+    assert np.allclose(front_plate, REFERENCE_RED, atol=10), "手前の板が塗られていない"
+    assert np.allclose(hidden_centre, TEXGEN_GREY, atol=10), "隠れた面に参照色が乗っている"
+
+
+def test_visible_parts_of_a_partially_occluded_surface_are_still_painted():
+    """部分的に隠れた面でも、見えている部分は参照から塗る。"""
+    mesh = _two_plates_mesh()
+    ref = Image.new("RGBA", (256, 256), (*REFERENCE_RED, 255))
+    texrefine.refine_texture_with_references(mesh, {"front": ref})
+
+    tex = np.asarray(texrefine._extract_texture_image(mesh.visual).convert("RGB")).astype(int)
+    h, w = tex.shape[:2]
+    # 後ろの板の外周(手前の板 40/100 の外側)は見えている。
+    # UV左半分の端 (u=0.08 -> 板の左端付近) をサンプルする。
+    visible_edge = tex[h // 2, int(w * 0.08)]
+    assert np.allclose(visible_edge, REFERENCE_RED, atol=10), "見えている外周が塗られていない"
+
+
 def test_grazing_angles_are_left_to_texgen():
     """視線に対し浅い角度の面は上書きしない(投影が伸びて信用できないため)。"""
     assert texrefine._blend_weight(np.array([0.0]))[0] == 0.0
