@@ -99,6 +99,7 @@ def _parse_params(params_json: Optional[str]) -> GenerationParams:
         color_mode="none",
         n_colors=4,
         texture_mode="none",
+        texture_refine=False,
     )
 
     steps = data.get("steps", defaults.steps)
@@ -111,6 +112,7 @@ def _parse_params(params_json: Optional[str]) -> GenerationParams:
     color_mode = data.get("color_mode", defaults.color_mode)
     n_colors = data.get("n_colors", defaults.n_colors)
     texture_mode = data.get("texture_mode", defaults.texture_mode)
+    texture_refine = data.get("texture_refine", defaults.texture_refine)
 
     if octree_resolution not in config.ALLOWED_OCTREE_RESOLUTIONS:
         raise HTTPException(
@@ -133,6 +135,10 @@ def _parse_params(params_json: Optional[str]) -> GenerationParams:
         raise HTTPException(
             status_code=400, detail="texture_modeは'none'または'paint'である必要があります。"
         )
+    if not isinstance(texture_refine, bool):
+        raise HTTPException(
+            status_code=400, detail="texture_refineは真偽値である必要があります。"
+        )
 
     return GenerationParams(
         steps=steps,
@@ -145,6 +151,7 @@ def _parse_params(params_json: Optional[str]) -> GenerationParams:
         color_mode=color_mode,
         n_colors=n_colors,
         texture_mode=texture_mode,
+        texture_refine=texture_refine,
     )
 
 

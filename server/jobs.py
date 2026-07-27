@@ -169,8 +169,10 @@ class JobManager:
         未確認)。
 
         texgen のテクスチャは参照画像を512pxに落として作られるため細部が残らない。
-        生成後に `texrefine` で、正対して見えているテクセルだけを参照画像の
-        **全解像度**で上書きする(server/texrefine.py 参照)。
+        `texture_refine` 指定時は、生成後に `texrefine` で正対して見えている
+        テクセルだけを参照画像の**全解像度**で上書きする(server/texrefine.py
+        参照)。未指定(既定)なら素の texgen 出力を使う: ぼやけるが位置ずれの
+        類いが出ず破綻が少ない。
 
         失敗時は例外を送出せず None を返し、`job.warnings` に警告メッセージを
         記録する(graceful degradation: SPEC.md §3.9)。
@@ -184,6 +186,9 @@ class JobManager:
                 f"テクスチャ生成(paint)に失敗したため、正面/背面投影方式にフォールバックしました: {exc}"
             )
             return None
+
+        if not job.params.get("texture_refine"):
+            return painted
 
         references = {"front": image}
         if back_image is not None:
@@ -294,6 +299,7 @@ class JobManager:
                 "color_mode": params.color_mode,
                 "n_colors": params.n_colors,
                 "texture_mode": params.texture_mode,
+                "texture_refine": params.texture_refine,
             },
             generator=self.generator.name,
             original_filename=original_filename,

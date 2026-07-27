@@ -318,6 +318,9 @@ async function checkHealth() {
       textureModeCheckbox.checked = false;
       textureModeCheckbox.disabled = true;
       textureModeUnavailableNote.hidden = false;
+      const refine = document.getElementById("texture-refine-checkbox");
+      refine.checked = false;
+      refine.disabled = true;
     }
     const badge = document.getElementById("generator-badge");
     badge.textContent = `生成エンジン: ${data.generator}`;
@@ -395,6 +398,7 @@ paramsForm.addEventListener("submit", async (e) => {
     color_mode: formData.get("color_mode") === "on" ? "color4" : "none",
     n_colors: Number(formData.get("n_colors") || 4),
     texture_mode: formData.get("texture_mode") === "on" ? "paint" : "none",
+    texture_refine: formData.get("texture_refine") === "on",
   };
 
   const uploadData = new FormData();

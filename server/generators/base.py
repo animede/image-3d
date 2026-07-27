@@ -27,6 +27,11 @@ class GenerationParams:
     color_mode: str = "none"
     n_colors: int = 4
     texture_mode: str = "none"
+    # paint 時、参照画像による全解像度の高精細化(texrefine)を適用するか。
+    # 素の texgen(False)はぼやけるが位置ずれ・継ぎ目の類いが出ず破綻が少ない。
+    # 高精細化(True)は毛並み等の質感が出る代わりに、形状が画像から乖離した
+    # 生成では顔パーツ位置の不整合が残ることがある。既定は破綻の少ない False。
+    texture_refine: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
 
 

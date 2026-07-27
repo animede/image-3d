@@ -424,6 +424,73 @@ def test_reject_invalid_texture_mode(client):
     assert res.status_code == 400
 
 
+def test_reject_non_boolean_texture_refine(client):
+    png_bytes = make_test_png_bytes()
+    res = client.post(
+        "/api/jobs",
+        files={"image": ("test.png", png_bytes, "image/png")},
+        data={"params": '{"texture_refine": "yes"}'},
+    )
+    assert res.status_code == 400
+
+
+def test_texture_refine_defaults_to_off_and_is_recorded(client):
+    """高精細化は明示しない限りオフ(素のtexgen=破綻の少ない既定)。"""
+    png_bytes = make_test_png_bytes()
+    res = client.post(
+        "/api/jobs",
+        files={"image": ("test.png", png_bytes, "image/png")},
+        data={"params": "{}"},
+    )
+    job = _wait_for_completion(client, res.json()["job_id"])
+    assert job["params"]["texture_refine"] is False
+
+    res = client.post(
+        "/api/jobs",
+        files={"image": ("test.png", png_bytes, "image/png")},
+        data={"params": '{"texture_refine": true}'},
+    )
+    job = _wait_for_completion(client, res.json()["job_id"])
+    assert job["params"]["texture_refine"] is True
+
+
+def test_paint_without_refine_skips_texrefine(client, monkeypatch):
+    """texture_refine=false なら texrefine を呼ばない(素のtexgen出力)。"""
+    from server import main as main_module, texrefine
+    import trimesh as _trimesh
+
+    called = []
+    monkeypatch.setattr(
+        texrefine,
+        "refine_texture_with_references",
+        lambda *a, **k: called.append(1),
+        raising=True,
+    )
+
+    # 実GPUは使わず、texgen成功後の分岐(refine有無)だけを本物の _run_paint で
+    # 通すため、pipeline 取得だけを差し替える。
+    class _FakePipeline:
+        def paint(self, mesh, image, back_image=None):
+            return mesh.copy()
+
+    monkeypatch.setattr(
+        main_module.job_manager.__class__,
+        "_get_texture_pipeline",
+        lambda self: _FakePipeline(),
+        raising=True,
+    )
+
+    png_bytes = make_test_png_bytes()
+    res = client.post(
+        "/api/jobs",
+        files={"image": ("test.png", png_bytes, "image/png")},
+        data={"params": '{"texture_mode": "paint", "texture_refine": false}'},
+    )
+    job = _wait_for_completion(client, res.json()["job_id"])
+    assert job["status"] == "completed", job.get("error")
+    assert called == [], "texture_refine=false なのに texrefine が呼ばれている"
+
+
 def test_texture_mode_paint_job_completes_with_mock(client, monkeypatch):
     """mock環境でtexture_mode=paintを指定してもジョブは完了すること。
 

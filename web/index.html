@@ -148,6 +148,10 @@
             <input type="checkbox" name="texture_mode" id="texture-mode-checkbox" />
             <span>テクスチャ生成(実験的)</span>
           </label>
+          <label class="field checkbox">
+            <input type="checkbox" name="texture_refine" id="texture-refine-checkbox" />
+            <span>参照画像で高精細化(毛並み等。顔パーツがずれる場合はオフ)</span>
+          </label>
           <div class="hint" id="texture-mode-unavailable-note" hidden>
             この環境では利用できません(texgenが未導入・未ビルドです)。
           </div>
