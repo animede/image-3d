@@ -77,6 +77,21 @@ FACE_CHUNK = 20000
 # 拾って細い継ぎ目になる。
 HOLE_FILL_RADIUS_TEXELS = 4
 
+# --- 焼き込まれた照りの補正(黒締め) ----------------------------------------
+# 参照画像は撮影(生成)時の照明ごと写っており、艶のある部位(プラスチックの
+# 目・鼻)には反射の照りが焼き込まれている。テクスチャとして貼ると、ビューアの
+# ライトがその上にさらに乗り、深い黒であるべき目が茶色いリングに見える
+# (texgen 自身は delight 済みなので出にくい。全解像度再投影は元画素を
+# そのまま使うため、この副作用だけが残る)。
+# 「暗くて彩度が低い」テクセル(目・鼻・肉球の無彩色の照り)だけを黒へ寄せる。
+# デニムのような暗い有彩色は彩度ガードで対象外。明るいグレーの服(輝度90超)も
+# 対象外だが、木炭色など極端に暗い無彩色の衣装は締まりが強く出る点に注意。
+SHADOW_DEEPEN_MAX_LUMINANCE = 90.0
+SHADOW_DEEPEN_LUMINANCE_RAMP = 60.0
+SHADOW_DEEPEN_MAX_SATURATION = 45.0
+SHADOW_DEEPEN_SATURATION_RAMP = 30.0
+SHADOW_DEEPEN_STRENGTH = 0.75
+
 # 可視性判定の深度バッファは参照画像をこの係数で縮めた格子で持つ。
 # サンプル密度はUVテクセル面積基準なので、画像解像度そのままでは
 # 疎な面にピンホール(誤って「可視」になる穴)ができる。粗くするほど
@@ -235,6 +250,27 @@ class _DepthBuffer:
         depth = points @ self.direction
         excess = depth - self.depth[self._cells(px, py)] - self.eps
         return np.clip(1.0 - excess / max(self.eps, 1e-9), 0.0, 1.0)
+
+
+def deepen_neutral_shadows(texture: np.ndarray) -> np.ndarray:
+    """暗く彩度の低いテクセルを黒へ寄せる(焼き込まれた照りの補正)。
+
+    Args:
+        texture: (h, w, 3) float32 の RGB。
+
+    Returns:
+        同形状の補正済み配列(入力は変更しない)。
+    """
+    luminance = texture.mean(axis=2)
+    saturation = texture.max(axis=2) - texture.min(axis=2)
+    dark = np.clip(
+        (SHADOW_DEEPEN_MAX_LUMINANCE - luminance) / SHADOW_DEEPEN_LUMINANCE_RAMP, 0.0, 1.0
+    )
+    neutral = np.clip(
+        (SHADOW_DEEPEN_MAX_SATURATION - saturation) / SHADOW_DEEPEN_SATURATION_RAMP, 0.0, 1.0
+    )
+    factor = 1.0 - SHADOW_DEEPEN_STRENGTH * dark * neutral
+    return texture * factor[..., None]
 
 
 def refine_texture_with_references(
@@ -399,6 +435,7 @@ def refine_texture_with_references(
     blend = median_filter(blend, size=3)
 
     result = base * (1.0 - blend[..., None]) + refined * blend[..., None]
+    result = deepen_neutral_shadows(result)
     new_texture = Image.fromarray(np.clip(result, 0, 255).astype(np.uint8), "RGB")
 
     if not _set_texture_image(visual, new_texture):

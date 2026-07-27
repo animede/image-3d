@@ -230,6 +230,34 @@ def test_declines_when_the_mesh_has_no_texture():
     assert "UV" in stats.reason
 
 
+def test_shadow_deepening_darkens_baked_shine_only():
+    """黒締めは「暗い無彩色」(目の照り)だけに効き、デニムや毛には効かない。"""
+    tex = np.array(
+        [[[50, 45, 42],     # 目の照り(暗い無彩色) -> 締まる
+          [26, 30, 67],     # デニム(暗いが有彩色) -> ほぼ不変
+          [229, 196, 160]]],  # 毛(明るい) -> 不変
+        dtype=np.float32,
+    )
+    out = texrefine.deepen_neutral_shadows(tex)
+
+    assert out[0, 0].mean() < tex[0, 0].mean() * 0.65, "目の照りが締まっていない"
+    assert np.allclose(out[0, 1], tex[0, 1], atol=6), "デニムまで暗くなっている"
+    assert np.allclose(out[0, 2], tex[0, 2]), "明るい毛が変わっている"
+
+
+def test_refine_applies_shadow_deepening_to_the_atlas():
+    """精細化の出力では、参照から転写された暗い無彩色が締められている。"""
+    mesh = _sphere_with_uv()
+    shine = (50, 45, 42)
+    stats = texrefine.refine_texture_with_references(
+        mesh, {"front": _circular_reference(color=shine)}
+    )
+
+    assert stats.applied, stats.reason
+    front, _ = _vertex_colors_by_facing(mesh)
+    assert front.mean(axis=0).mean() < np.mean(shine) * 0.65
+
+
 def test_declines_when_uv_count_mismatches():
     mesh = _sphere_with_uv()
     mesh.visual.uv = np.asarray(mesh.visual.uv)[:-5]
