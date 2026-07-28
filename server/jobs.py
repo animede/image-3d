@@ -62,6 +62,30 @@ def _mesh_vertex_colors(mesh: trimesh.Trimesh) -> Optional[np.ndarray]:
     return None
 
 
+def _resolve_refine_reference(
+    native_processed: Image.Image, processed: Image.Image
+) -> Optional[Image.Image]:
+    """texrefine用の参照画像を選ぶ: ネイティブ版がprocessed(1024)より大きい場合のみ、
+    キャップを適用したネイティブ版を返す。同じ大きさ(=背景除去なし、または
+    元々1024以下)なら None を返し、呼び出し元は従来通り processed を使う
+    (挙動不変)。
+
+    ネイティブ版が MAX_REFERENCE_DIMENSION を超える場合は Lanczos で縮小する
+    (texrefine の合成ビュー・深度バッファは参照解像度の2乗でメモリを使うため、
+    server/texrefine.py の `MAX_REFERENCE_DIMENSION` 参照)。
+    """
+    if max(native_processed.size) <= max(processed.size):
+        return None
+
+    reference = native_processed
+    if max(reference.size) > texrefine.MAX_REFERENCE_DIMENSION:
+        reference = reference.copy()
+        reference.thumbnail(
+            (texrefine.MAX_REFERENCE_DIMENSION, texrefine.MAX_REFERENCE_DIMENSION), Image.LANCZOS
+        )
+    return reference
+
+
 @dataclass
 class Job:
     job_id: str
@@ -106,6 +130,16 @@ class Job:
 
     def extra_view_raw_path(self, view: str) -> Path:
         return self.dir_path() / f"_raw_upload_{view}"
+
+    def reference_image_path(self, view: str) -> Path:
+        """texrefine用のネイティブ解像度参照(processedより大きい場合のみ保存)。
+
+        front は `reference.png`、それ以外は `reference_back.png` のように
+        ビュー名を付ける(タスク指定の命名。GPUなしで texrefine だけを
+        texture_texgen.png と組み合わせて再実行できるようにするため)。
+        """
+        suffix = "" if view == "front" else f"_{view}"
+        return self.dir_path() / f"reference{suffix}.png"
 
     def model_path(self, fmt: str) -> Path:
         return self.dir_path() / f"model.{fmt}"
@@ -159,6 +193,7 @@ class JobManager:
         image: Image.Image,
         job: "Job",
         back_image: Optional[Image.Image] = None,
+        refine_references: Optional[dict[str, Image.Image]] = None,
     ) -> Optional[trimesh.Trimesh]:
         """texture_mode=paint 時のペイント実行(同期・ワーカースレッドから呼ばれる)。
 
@@ -173,6 +208,12 @@ class JobManager:
         テクセルだけを参照画像の**全解像度**で上書きする(server/texrefine.py
         参照)。未指定(既定)なら素の texgen 出力を使う: ぼやけるが位置ずれの
         類いが出ず破綻が少ない。
+
+        `image`/`back_image` は texgen への入力(常に前処理後の1024px)。
+        `refine_references` を渡すと texrefine 側だけそちらを使う(アップロードが
+        1024より高解像度だった場合のネイティブ版。texgenの入力は変えず、
+        高精細化の参照だけを差し替える)。未指定時は `image`/`back_image` を使う
+        (挙動不変)。
 
         失敗時は例外を送出せず None を返し、`job.warnings` に警告メッセージを
         記録する(graceful degradation: SPEC.md §3.9)。
@@ -190,9 +231,10 @@ class JobManager:
         if not job.params.get("texture_refine"):
             return painted
 
-        references = {"front": image}
+        refine_references = refine_references or {}
+        references = {"front": refine_references.get("front", image)}
         if back_image is not None:
-            references["back"] = back_image
+            references["back"] = refine_references.get("back", back_image)
         try:
             # 精細化前のアトラスを保存しておく(調整・切り分け用: これがあれば
             # GPU再生成なしで texrefine だけを再実行できる)。
@@ -357,12 +399,22 @@ class JobManager:
 
             params = GenerationParams(**job.params)
 
-            original, processed, bg_removed = await loop.run_in_executor(
+            original, processed, bg_removed, native_processed = await loop.run_in_executor(
                 None, preprocess.preprocess_image, raw_bytes, config.MAX_UPLOAD_BYTES, params.remove_bg
             )
             job.bg_removed = bg_removed
             processed.save(job.input_image_path())
             original.save(job.original_image_path())
+
+            # texrefine用の高解像度参照。ネイティブ解像度の背景除去済み画像が
+            # processed(1024)より大きい場合のみ、ジョブディレクトリに保存する
+            # (同サイズなら重複保存を避ける=ディスク節約)。texgenへ渡す画像
+            # (processed)自体は変えない。
+            refine_references: dict[str, Image.Image] = {}
+            front_reference = _resolve_refine_reference(native_processed, processed)
+            if front_reference is not None:
+                front_reference.save(job.reference_image_path("front"))
+                refine_references["front"] = front_reference
 
             # 追加ビュー(back/left/right)の前処理。各ビューにも背景除去を適用する
             # (SPEC.md §3.8)。カラーモードではback画像があれば背面投影に利用する。
@@ -374,7 +426,7 @@ class JobManager:
                 if not view_raw_path.exists():
                     continue
                 view_raw_bytes = view_raw_path.read_bytes()
-                _, view_processed, _ = await loop.run_in_executor(
+                _, view_processed, _, view_native_processed = await loop.run_in_executor(
                     None,
                     preprocess.preprocess_image,
                     view_raw_bytes,
@@ -383,6 +435,11 @@ class JobManager:
                 )
                 view_processed.save(job.extra_view_input_path(view))
                 extra_views[view] = view_processed
+
+                view_reference = _resolve_refine_reference(view_native_processed, view_processed)
+                if view_reference is not None:
+                    view_reference.save(job.reference_image_path(view))
+                    refine_references[view] = view_reference
 
             set_status(STATUS_GENERATING)
             raw_mesh: trimesh.Trimesh = await loop.run_in_executor(
@@ -420,7 +477,13 @@ class JobManager:
             textured_mesh: Optional[trimesh.Trimesh] = None
             if params.texture_mode == "paint":
                 textured_mesh = await loop.run_in_executor(
-                    None, self._run_paint, processed_mesh, processed, job, extra_views.get("back")
+                    None,
+                    self._run_paint,
+                    processed_mesh,
+                    processed,
+                    job,
+                    extra_views.get("back"),
+                    refine_references,
                 )
                 job.textured = textured_mesh is not None
 

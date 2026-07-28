@@ -167,11 +167,18 @@ def preprocess_image(
     max_bytes: int,
     remove_bg: bool = True,
     size: int = TARGET_SIZE,
-) -> tuple[Image.Image, Image.Image, bool]:
-    """アップロードデータから (元画像RGBA, 前処理後画像, 背景除去適用有無) を返す。"""
+) -> tuple[Image.Image, Image.Image, bool, Image.Image]:
+    """アップロードデータから
+    (元画像RGBA, 前処理後画像(size角), 背景除去適用有無, ネイティブ解像度の背景除去済み画像)
+    を返す。
+
+    背景除去(色キー/rembg)は `resize_to_square` で `size`(既定1024)へ縮小する
+    **前の**ネイティブ解像度に対して行われる。この中間結果を呼び出し元(texrefine
+    用の高解像度参照)にも使えるよう、リサイズで捨てずに返す。
+    """
     original = load_and_validate_image(data, max_bytes)
 
-    processed = original
+    native_processed = original
     bg_removed = False
     if remove_bg:
         if has_removed_background(original):
@@ -179,9 +186,9 @@ def preprocess_image(
             logger.info("Input already has a transparent background; skipping rembg.")
         else:
             # 単色背景は色キーの方が確実。推定に頼る rembg は最後の手段。
-            processed, bg_removed = remove_uniform_background(original)
+            native_processed, bg_removed = remove_uniform_background(original)
             if not bg_removed:
-                processed, bg_removed = remove_background(original)
+                native_processed, bg_removed = remove_background(original)
 
-    processed = resize_to_square(processed, size=size)
-    return original, processed, bg_removed
+    processed = resize_to_square(native_processed, size=size)
+    return original, processed, bg_removed, native_processed

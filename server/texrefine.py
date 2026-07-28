@@ -125,7 +125,13 @@ REJECT_FILL_CLOSING_ITERATIONS = 2
 # 周囲の毛(最近傍の非特徴画素)で埋めて、二重写しを防ぐ。
 FEATURE_MAX_LUMINANCE = 95.0  # 「暗い特徴」とみなす輝度上限
 FEATURE_MAX_SATURATION = 70.0  # 同・彩度上限(有彩色の服などを除く)
-FEATURE_MIN_AREA_PX = 60  # ノイズ除去: これ未満の塊は無視
+# ノイズ除去: これ未満の塊は無視。1024px参照での実測値が基準。
+# 面積は解像度の2乗で効くため、2048/4096参照ではそのまま使うと閾値が
+# 相対的に緩くなり(同じ物理サイズの特徴でも画素数が4〜16倍になる)、
+# 誤対応の原因になりうる小さな暗色斑点まで拾ってしまう。`_dark_feature_mask`
+# で画像の一辺基準にスケールする。
+FEATURE_MIN_AREA_PX = 60  # ノイズ除去: これ未満の塊は無視(1024px基準)
+FEATURE_MIN_AREA_REFERENCE_PX = 1024
 FEATURE_MAX_AREA_FRACTION = 0.05  # 被写体比これ超の塊(大きな黒い服等)は無視
 # 対応とみなす特徴間距離の上限(画像辺比)。正当なずれの実測は1〜2.5%(犬・
 # 人型とも)。0.05 だと texgen が顔を描かなかったときに参照の目が4.6%先の
@@ -169,6 +175,13 @@ DEPTH_GRID_DIVISOR = 2
 # 遮蔽とみなす。頂点単位の事前計測(2%)で帽子の垂れ・耳の裏の誤サンプル
 # 1080頂点を妥当に検出できた値。
 DEPTH_EPS_FRACTION = 0.02
+
+# 参照画像の解像度上限。`_DepthBuffer`/`_SynthView` は参照と同じ画素数の
+# バッファを持つため、メモリ使用量は参照解像度の2乗に比例する。ネイティブ
+# アップロードが際限なく大きい場合に備え、実用上十分な精細さを保ちつつ
+# ここで頭打ちにする。この上限を超える参照は事前に Lanczos で縮小してから
+# 渡すこと(呼び出し側=jobs.pyの責務。texrefine自身はここでは縮小しない)。
+MAX_REFERENCE_DIMENSION = 4096
 
 
 @dataclass
@@ -318,8 +331,11 @@ def _dark_feature_mask(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
     if n == 0:
         return dark  # 全False
     areas = np.bincount(components.ravel())
+    # 面積は解像度の2乗で効くので、1024px基準の閾値を辺長比の2乗でスケールする。
+    scale = (max(rgb.shape[0], rgb.shape[1]) / FEATURE_MIN_AREA_REFERENCE_PX) ** 2
+    min_area_px = FEATURE_MIN_AREA_PX * scale
     max_area = mask.sum() * FEATURE_MAX_AREA_FRACTION
-    keep = (areas >= FEATURE_MIN_AREA_PX) & (areas <= max_area)
+    keep = (areas >= min_area_px) & (areas <= max_area)
     keep[0] = False
     return keep[components]
 

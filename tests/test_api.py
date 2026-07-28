@@ -501,7 +501,7 @@ def test_texture_mode_paint_job_completes_with_mock(client, monkeypatch):
     """
     from server import main as main_module
 
-    def _fail_paint(self, mesh, image, job, back_image=None):
+    def _fail_paint(self, mesh, image, job, back_image=None, refine_references=None):
         job.warnings.append("test: paint intentionally failed")
         return None
 
@@ -541,7 +541,7 @@ def test_texture_mode_paint_receives_back_view(client, monkeypatch):
 
     received: dict = {}
 
-    def _capture_paint(self, mesh, image, job, back_image=None):
+    def _capture_paint(self, mesh, image, job, back_image=None, refine_references=None):
         received["back_image"] = back_image
         job.warnings.append("test: paint intentionally short-circuited")
         return None
@@ -583,7 +583,7 @@ def test_texture_mode_paint_with_color4_completes_with_mock(client, monkeypatch)
     """
     from server import main as main_module
 
-    def _fail_paint(self, mesh, image, job, back_image=None):
+    def _fail_paint(self, mesh, image, job, back_image=None, refine_references=None):
         job.warnings.append("test: paint intentionally failed")
         return None
 
@@ -833,7 +833,7 @@ def test_preprocess_skips_rembg_for_transparent_input(monkeypatch):
         return image, True
 
     monkeypatch.setattr(preprocess, "remove_background", spy)
-    _, _, bg_removed = preprocess.preprocess_image(_rgba_png(0.5), 10_000_000, remove_bg=True)
+    _, _, bg_removed, _ = preprocess.preprocess_image(_rgba_png(0.5), 10_000_000, remove_bg=True)
 
     assert called == [], "透明な入力に rembg が呼ばれている"
     assert bg_removed is False
@@ -849,7 +849,7 @@ def test_preprocess_still_removes_background_for_opaque_input(monkeypatch):
         return image.convert("RGBA"), True
 
     monkeypatch.setattr(preprocess, "remove_background", spy)
-    _, _, bg_removed = preprocess.preprocess_image(
+    _, _, bg_removed, _ = preprocess.preprocess_image(
         make_test_png_bytes(), 10_000_000, remove_bg=True
     )
 
@@ -928,8 +928,117 @@ def test_preprocess_prefers_the_colour_key_over_rembg(monkeypatch):
 
     buf = io.BytesIO()
     _pale_subject_on_white().save(buf, format="PNG")
-    _, _, bg_removed = preprocess.preprocess_image(buf.getvalue(), 10_000_000, remove_bg=True)
+    _, _, bg_removed, _ = preprocess.preprocess_image(buf.getvalue(), 10_000_000, remove_bg=True)
 
     assert called == [], "単色背景なのに rembg が呼ばれている"
     assert bg_removed is True
     assert bg_removed is True
+
+
+# --- texrefine用の高解像度参照(ネイティブ解像度の背景除去済み画像) --------------
+
+
+def test_preprocess_returns_native_resolution_background_removed_image():
+    """透明PNGアップロード時、preprocessがネイティブ解像度の背景除去済み画像を返す。
+
+    透明入力は既に背景除去済みとみなされ rembg はスキップされるが(NFR-5)、
+    「ネイティブ解像度の背景除去済み画像」自体は resize_to_square 前の
+    ネイティブ画像として返る必要がある(texrefine用の高精細参照)。
+    """
+    from server import preprocess
+
+    native_size = 2048
+    original, processed, bg_removed, native_processed = preprocess.preprocess_image(
+        _rgba_png(0.5, size=native_size), 50_000_000, remove_bg=True
+    )
+
+    assert original.size == (native_size, native_size)
+    assert processed.size == (preprocess.TARGET_SIZE, preprocess.TARGET_SIZE)
+    assert native_processed.size == (native_size, native_size)
+    assert native_processed.mode == "RGBA"
+
+
+def _make_job_with_paint(client, monkeypatch, png_bytes, *, texture_refine=True, extra=None):
+    """texture_mode=paint のジョブを作り、_get_texture_pipelineをフェイクに
+    差し替えて完了させるための共通ヘルパー。
+
+    `test_paint_without_refine_skips_texrefine` と同様、実GPUのtexgenは使わず
+    `paint()`のフェイクだけを差し替え、`_run_paint`本体(texrefine呼び出しの
+    分岐)は本物を通す。
+    """
+    from server import main as main_module
+
+    class _FakePipeline:
+        def paint(self, mesh, image, back_image=None):
+            return mesh.copy()
+
+    monkeypatch.setattr(
+        main_module.job_manager.__class__,
+        "_get_texture_pipeline",
+        lambda self: _FakePipeline(),
+        raising=True,
+    )
+
+    params = {"texture_mode": "paint", "texture_refine": texture_refine, "remove_bg": True}
+    data = {"params": json.dumps(params)}
+    files = {"image": ("test.png", png_bytes, "image/png")}
+    if extra:
+        files.update(extra)
+
+    res = client.post("/api/jobs", files=files, data=data)
+    assert res.status_code == 200
+    job_id = res.json()["job_id"]
+    job = _wait_for_completion(client, job_id)
+    assert job["status"] == "completed", job.get("error")
+    return job_id, job
+
+
+def test_texrefine_receives_native_resolution_reference_for_high_res_upload(client, monkeypatch):
+    """2048pxの透明PNGでジョブを作ると、texrefineに渡る参照が2048であること。
+
+    texrefine.refine_texture_with_referencesをモンキーパッチし、受け取った
+    front参照画像のサイズを検証する(実texrefineは重いため呼ばない)。
+    """
+    from server import texrefine
+
+    received: dict = {}
+
+    def _fake_refine(mesh, references):
+        received["front_size"] = references["front"].size
+        return texrefine.RefineStats(applied=True)
+
+    monkeypatch.setattr(texrefine, "refine_texture_with_references", _fake_refine, raising=True)
+
+    png_bytes = _rgba_png(0.5, size=2048)
+    job_id, job = _make_job_with_paint(client, monkeypatch, png_bytes)
+
+    assert received.get("front_size") == (2048, 2048)
+
+    # ジョブディレクトリに reference.png が保存されていること(1024と異なるため)。
+    from server import config
+
+    reference_path = config.JOBS_DIR / job_id / "reference.png"
+    assert reference_path.exists()
+    with Image.open(reference_path) as img:
+        assert img.size == (2048, 2048)
+
+
+def test_texrefine_reference_unchanged_for_1024_input(client, monkeypatch):
+    """1024px入力では従来と同じ参照(1024)が渡り、reference.pngは保存されない。"""
+    from server import texrefine, config, preprocess
+
+    received: dict = {}
+
+    def _fake_refine(mesh, references):
+        received["front_size"] = references["front"].size
+        return texrefine.RefineStats(applied=True)
+
+    monkeypatch.setattr(texrefine, "refine_texture_with_references", _fake_refine, raising=True)
+
+    png_bytes = _rgba_png(0.5, size=preprocess.TARGET_SIZE)
+    job_id, job = _make_job_with_paint(client, monkeypatch, png_bytes)
+
+    assert received.get("front_size") == (1024, 1024)
+
+    reference_path = config.JOBS_DIR / job_id / "reference.png"
+    assert not reference_path.exists(), "同サイズなのにreference.pngが保存されている"
