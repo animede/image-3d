@@ -77,6 +77,31 @@ FACE_CHUNK = 20000
 # 拾って細い継ぎ目になる。
 HOLE_FILL_RADIUS_TEXELS = 4
 
+# --- 棄却領域の調和拡散(遮蔽された顔の白抜け対策) --------------------------
+# 前髪のように顔へ覆いかぶさる形状では、その裏の面はどのビューからも
+# 「遮蔽 or 浅い角度」で棄却され、texgen に戻る。アニメ顔では texgen が
+# のっぺらぼう(白い平坦面)を返すため、目の周りに白い欠損として現れる
+# (実ジョブ cb075cab)。棄却されたテクセルを、同じUVチャート内の転写済みの
+# 色から調和拡散(ラプラス方程式)で埋める。UVチャートは表面の近傍関係を
+# 保つので、これは「近くの肌・髪の色をなじませる」ことと等価
+# (2ビュー時代に頂点カラーで実証済みの手法のテクセル版)。
+#
+# texgen に本物の描き込みがある場所(犬の帽子の垂れの裏など)を潰さないよう、
+# **texgen が局所的に平坦(情報なし)なテクセルに限定**する。
+REJECT_FILL_FLAT_WINDOW = 7  # texgen の平坦さを測る窓(テクセル)
+REJECT_FILL_FLAT_STD = 6.0  # この局所標準偏差未満なら「情報なし」とみなす
+# 領域境界のうち転写済みテクセルが占める最低割合。低い領域(どのビューからも
+# 見えない広大な内側など)は拡散の根拠が乏しいので texgen のまま残す。
+REJECT_FILL_MIN_BOUNDARY_COVERAGE = 0.25
+# これを超える規模の連立方程式は解かない(異常なアトラスでの暴走防止)。
+# アニメ髪は浅い角度の面が多く、実ジョブで73万テクセルが対象になった。
+# 解法は共役勾配(下記)なのでこの規模でも数秒で解ける。
+REJECT_FILL_MAX_UNKNOWNS = 2_000_000
+# 棄却テクセルの点在を面に繋ぐ閉包の反復数。UV面積の大きい面はサンプル上限
+# (MAX_SAMPLES_PER_FACE)に当たり、棄却領域が塩粒状に途切れることがある。
+# 2反復=4テクセル幅までの隙間を繋ぐ(チャート間ガターはそれより広い前提)。
+REJECT_FILL_CLOSING_ITERATIONS = 2
+
 # --- 顔の特徴(目・鼻・口)は texgen に任せる -------------------------------
 # 生成メッシュの目・鼻は参照画像と数%ずれる(実測: 目の中心で10〜25px/1024)。
 # texgen はメッシュの法線・位置マップに条件付けて描くので**形状に揃っており**、
@@ -102,8 +127,19 @@ FEATURE_MAX_LUMINANCE = 95.0  # 「暗い特徴」とみなす輝度上限
 FEATURE_MAX_SATURATION = 70.0  # 同・彩度上限(有彩色の服などを除く)
 FEATURE_MIN_AREA_PX = 60  # ノイズ除去: これ未満の塊は無視
 FEATURE_MAX_AREA_FRACTION = 0.05  # 被写体比これ超の塊(大きな黒い服等)は無視
-FEATURE_MATCH_MAX_FRACTION = 0.05  # 対応とみなす特徴間距離の上限(画像辺比)
+# 対応とみなす特徴間距離の上限(画像辺比)。正当なずれの実測は1〜2.5%(犬・
+# 人型とも)。0.05 だと texgen が顔を描かなかったときに参照の目が4.6%先の
+# 髪の影と誤対応した(目が髪へ移動し元位置が肌色で消える)ため、余裕を
+# 持たせつつ 3.5% に絞る。
+FEATURE_MATCH_MAX_FRACTION = 0.035
 FEATURE_MIN_SHIFT_PX = 3.0  # これ未満のずれは移動しない(誤差の範囲)
+# 対応とみなすための「同種の特徴らしさ」。texgen が顔を描かない場合(アニメ顔で
+# 実際に発生)、参照の目に対応するメッシュ側の特徴が存在せず、貪欲マッチが
+# 髪の影の細片と誤対応して**目を髪の中へ移動し、元の位置を肌色で消す**
+# (実ジョブ cb075cab の左目白抜けの真因)。面積とアスペクト比が近い塊
+# どうししか対応させない。
+FEATURE_MATCH_MIN_AREA_RATIO = 0.35  # 面積比(小/大)の下限
+FEATURE_MATCH_MAX_ASPECT_RATIO = 2.5  # アスペクト比どうしの比の上限
 FEATURE_DILATE_FRACTION = 0.006  # 塊の周囲をこの半径(画像辺比)だけ一緒に運ぶ
 FEATURE_FEATHER_FRACTION = 0.004  # 貼り付け境界をぼかす幅(画像辺比)
 
@@ -145,6 +181,7 @@ class RefineStats:
     refined_texel_ratio: float = 0.0
     mean_blend_weight: float = 0.0
     occluded_sample_ratio: float = 0.0
+    filled_texel_ratio: float = 0.0
     reason: Optional[str] = None
 
 
@@ -289,8 +326,8 @@ def _dark_feature_mask(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
 
 def _feature_components(
     rgb: np.ndarray, mask: np.ndarray
-) -> list[tuple[np.ndarray, float, float]]:
-    """暗い特徴の連結成分ごとに (画素マスク, 重心x, 重心y) を返す。"""
+) -> list[tuple[np.ndarray, float, float, float, float]]:
+    """暗い特徴の連結成分ごとに (画素マスク, 重心x, 重心y, 面積, アスペクト比) を返す。"""
     from scipy.ndimage import label
 
     dark = _dark_feature_mask(rgb, mask)
@@ -299,8 +336,26 @@ def _feature_components(
     for i in range(1, n + 1):
         m = components == i
         ys, xs = np.where(m)
-        out.append((m, float(xs.mean()), float(ys.mean())))
+        width = float(xs.max() - xs.min() + 1)
+        height = float(ys.max() - ys.min() + 1)
+        aspect = max(width, height) / max(min(width, height), 1.0)
+        out.append((m, float(xs.mean()), float(ys.mean()), float(len(ys)), aspect))
     return out
+
+
+def _plausible_match(synth_feat, ref_feat) -> bool:
+    """同種の特徴(目と目、口と口)らしい対応か。
+
+    面積とアスペクト比が大きく違う対応(コンパクトな目 vs 細長い髪の影)は
+    誤マッチとして棄却する。
+    """
+    _, _, _, area_s, aspect_s = synth_feat
+    _, _, _, area_r, aspect_r = ref_feat
+    area_ratio = min(area_s, area_r) / max(area_s, area_r)
+    if area_ratio < FEATURE_MATCH_MIN_AREA_RATIO:
+        return False
+    aspect_ratio = max(aspect_s, aspect_r) / max(min(aspect_s, aspect_r), 1.0)
+    return aspect_ratio <= FEATURE_MATCH_MAX_ASPECT_RATIO
 
 
 def align_reference_features(
@@ -333,10 +388,10 @@ def align_reference_features(
 
     limit = FEATURE_MATCH_MAX_FRACTION * max(w, h)
     pairs = []
-    for i, (_, sx, sy) in enumerate(synth_feats):
-        for j, (_, rx, ry) in enumerate(ref_feats):
-            d = ((sx - rx) ** 2 + (sy - ry) ** 2) ** 0.5
-            if FEATURE_MIN_SHIFT_PX <= d <= limit:
+    for i, sf in enumerate(synth_feats):
+        for j, rf in enumerate(ref_feats):
+            d = ((sf[1] - rf[1]) ** 2 + (sf[2] - rf[2]) ** 2) ** 0.5
+            if FEATURE_MIN_SHIFT_PX <= d <= limit and _plausible_match(sf, rf):
                 pairs.append((d, i, j))
     pairs.sort()
     used_s: set[int] = set()
@@ -347,8 +402,8 @@ def align_reference_features(
             continue
         used_s.add(i)
         used_r.add(j)
-        _, sx, sy = synth_feats[i]
-        rmask, rx, ry = ref_feats[j]
+        _, sx, sy, _, _ = synth_feats[i]
+        rmask, rx, ry, _, _ = ref_feats[j]
         moves.append((rmask, sx - rx, sy - ry))
     if not moves:
         return ref, 0
@@ -443,6 +498,149 @@ class _DepthBuffer:
         depth = points @ self.direction
         excess = depth - self.depth[self._cells(px, py)] - self.eps
         return np.clip(1.0 - excess / max(self.eps, 1e-9), 0.0, 1.0)
+
+
+def _fill_rejected_regions(
+    refined: np.ndarray,
+    blend: np.ndarray,
+    base: np.ndarray,
+    *,
+    rejected: np.ndarray,
+) -> float:
+    """棄却されたテクセル領域を周囲の転写済みの色で調和拡散して埋める。
+
+    `refined` / `blend` を**その場で**書き換える。対象は次を全て満たす領域:
+
+    1. サンプルは届いたが全て棄却された(遮蔽・浅い角度・フチ)
+    2. texgen が局所的に平坦 = 情報を持たない(本物の描き込みは潰さない)
+    3. 領域境界の一定割合以上が転写済み(拡散の根拠がある)
+
+    Returns:
+        埋めたテクセルの全体比。
+    """
+    if not rejected.any():
+        return 0.0
+    source = blend > 0.0  # 転写済み+ガター埋め(同一チャート近傍の複製)
+
+    from scipy.ndimage import binary_closing, label, maximum_filter, uniform_filter
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.linalg import cg
+
+    h, w = rejected.shape
+
+    # texgen の局所的な平坦さ(グレースケール標準偏差)
+    grey = base.mean(axis=2)
+    mean = uniform_filter(grey, REJECT_FILL_FLAT_WINDOW)
+    mean_sq = uniform_filter(grey * grey, REJECT_FILL_FLAT_WINDOW)
+    local_std = np.sqrt(np.maximum(mean_sq - mean * mean, 0.0))
+    flat = local_std < REJECT_FILL_FLAT_STD
+
+    # UV面積の大きい面はサンプル上限で棄却テクセルが塩粒状に途切れるため、
+    # 閉包で面として繋いでから領域判定する。閉包で増えた分にも平坦条件と
+    # 「まだ何も転写されていない」条件を課す(転写済み・描き込みは守る)。
+    candidates = rejected & flat
+    if not candidates.any():
+        return 0.0
+    candidates = (
+        binary_closing(candidates, iterations=REJECT_FILL_CLOSING_ITERATIONS)
+        & flat
+        & (blend <= 0.0)
+    )
+    if not candidates.any():
+        return 0.0
+
+    # 領域ごとに「境界の何割が転写済みか」を見て採否を決める。
+    # 境界テクセルの帰属は 3x3 最大値フィルタで近似する(2領域が同じ境界
+    # テクセルに接する場合は大きいラベルが取るが、判定用途には十分)。
+    regions, n_regions = label(candidates)
+    ring_labels = maximum_filter(regions, size=3)
+    ring = (regions == 0) & (ring_labels > 0)
+    labels_on_ring = ring_labels[ring]
+    total = np.bincount(labels_on_ring, minlength=n_regions + 1).astype(np.float64)
+    covered_on_ring = np.bincount(
+        labels_on_ring, weights=source[ring].astype(np.float64), minlength=n_regions + 1
+    )
+    keep = covered_on_ring / np.maximum(total, 1.0) >= REJECT_FILL_MIN_BOUNDARY_COVERAGE
+    keep[0] = False
+    fill_mask = keep[regions]
+    n_unknown = int(fill_mask.sum())
+    if n_unknown == 0:
+        return 0.0
+    if n_unknown > REJECT_FILL_MAX_UNKNOWNS:
+        logger.warning(
+            "Skipping rejected-region fill: %d texels exceed the solver cap (%d).",
+            n_unknown,
+            REJECT_FILL_MAX_UNKNOWNS,
+        )
+        return 0.0
+
+    # 4近傍ラプラシアン。未知数=埋める対象、Dirichlet=転写済み、その他はNeumann。
+    index = np.full((h, w), -1, dtype=np.int64)
+    ys, xs = np.where(fill_mask)
+    index[ys, xs] = np.arange(n_unknown)
+
+    rows: list[np.ndarray] = []
+    cols: list[np.ndarray] = []
+    vals: list[np.ndarray] = []
+    rhs = np.zeros((n_unknown, 3), dtype=np.float64)
+    diag = np.zeros(n_unknown, dtype=np.float64)
+
+    for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+        ny, nx = ys + dy, xs + dx
+        inside = (ny >= 0) & (ny < h) & (nx >= 0) & (nx < w)
+        idx_self = index[ys[inside], xs[inside]]
+        n_idx = index[ny[inside], nx[inside]]
+
+        is_unknown = n_idx >= 0
+        np.add.at(diag, idx_self[is_unknown], 1.0)
+        rows.append(idx_self[is_unknown])
+        cols.append(n_idx[is_unknown])
+        vals.append(np.full(int(is_unknown.sum()), -1.0))
+
+        is_source = (~is_unknown) & source[ny[inside], nx[inside]]
+        np.add.at(diag, idx_self[is_source], 1.0)
+        np.add.at(rhs, idx_self[is_source], refined[ny[inside][is_source], nx[inside][is_source]])
+
+    # どの方向にも未知数・境界が無い孤立テクセルは texgen のまま固定する
+    isolated = diag == 0.0
+    diag[isolated] = 1.0
+    rhs[isolated] = base[ys[isolated], xs[isolated]]
+
+    matrix = coo_matrix(
+        (
+            np.concatenate([diag] + vals),
+            (
+                np.concatenate([np.arange(n_unknown)] + rows),
+                np.concatenate([np.arange(n_unknown)] + cols),
+            ),
+        ),
+        shape=(n_unknown, n_unknown),
+    ).tocsr()
+
+    # ラプラシアンは対称正定値なので共役勾配で解く(LU分解は73万未知数で
+    # メモリも時間も跳ねる)。初期値に texgen の色を使うと、正解に近い場所
+    # から始まるぶん速く、収束打ち切り時も「texgen より悪くならない」。
+    solution = np.empty_like(rhs)
+    for channel in range(3):
+        x, info = cg(
+            matrix,
+            rhs[:, channel],
+            x0=base[ys, xs, channel].astype(np.float64),
+            rtol=1e-4,
+            maxiter=1500,
+        )
+        if info != 0:
+            logger.info("Harmonic fill CG stopped early (info=%d); using the partial solution.", info)
+        solution[:, channel] = x
+
+    refined[ys, xs] = np.clip(solution, 0.0, 255.0)
+    blend[ys, xs] = 1.0
+    ratio = n_unknown / float(h * w)
+    logger.info(
+        "Filled %.2f%% of texels (rejected but featureless in texgen) by harmonic diffusion.",
+        ratio * 100,
+    )
+    return ratio
 
 
 def deepen_neutral_shadows(texture: np.ndarray) -> np.ndarray:
@@ -645,6 +843,18 @@ def refine_texture_with_references(
         fill = (distance > 0) & (distance <= HOLE_FILL_RADIUS_TEXELS) & never_sampled
         refined[fill] = refined[iy[fill], ix[fill]]
         blend[fill] = blend[iy[fill], ix[fill]]
+
+    # 棄却領域(遮蔽・浅い角度)のうち texgen が情報を持たない場所を、
+    # 周囲の転写済みの色から調和拡散で埋める(前髪の裏の白抜け対策)。
+    # 拡散の根拠(アンカー)は blend>0 のテクセル。ガター埋めの複製も含むが、
+    # それは同一チャート近傍(4テクセル以内)の色の複製なので根拠として十分。
+    sampled_2d = accum_count.reshape(h, w) > 0
+    stats.filled_texel_ratio = _fill_rejected_regions(
+        refined,
+        blend,
+        base,
+        rejected=sampled_2d & ~covered_2d,
+    )
 
     # 混合率マップの孤立ノイズを除去する。遮蔽境界ではサンプルの当たり方の
     # 揺らぎでテクセル単位の外れ値(周囲は参照なのに1点だけtexgen、またはその逆)

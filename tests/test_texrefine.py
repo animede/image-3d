@@ -144,7 +144,7 @@ def test_dirty_silhouette_edge_is_not_sampled():
     assert np.allclose(refined.mean(axis=0), REFERENCE_RED, atol=12)
 
 
-def _two_plates_mesh(texture_size: int = 256) -> trimesh.Trimesh:
+def _two_plates_mesh(texture_size: int = 256, texture: "Image.Image | None" = None) -> trimesh.Trimesh:
     """正面(-Y)を向く2枚の板。小さい板が大きい板の手前(帽子の垂れの模型)。
 
     どちらも法線は正面ビューへ正対しているので、可視性を見ない投影では
@@ -161,11 +161,28 @@ def _two_plates_mesh(texture_size: int = 256) -> trimesh.Trimesh:
          [0.55, 0.05], [0.95, 0.05], [0.95, 0.95], [0.55, 0.95]]
     )
     mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
-    texture = Image.new("RGB", (texture_size, texture_size), (TEXGEN_GREY,) * 3)
+    if texture is None:
+        texture = Image.new("RGB", (texture_size, texture_size), (TEXGEN_GREY,) * 3)
     mesh.visual = trimesh.visual.TextureVisuals(
         uv=uv, material=trimesh.visual.material.SimpleMaterial(image=texture)
     )
     return mesh
+
+
+GREEN = (30, 160, 60)
+
+
+def _two_tone_reference(size: int = 256) -> Image.Image:
+    """全体は緑、手前の板の足元(中央40%)だけ赤の参照画像。
+
+    「隠れた面が手前の板の色(赤)を透過して拾っていないか」を色で判別できる。
+    """
+    arr = np.zeros((size, size, 4), dtype=np.uint8)
+    arr[..., :3] = GREEN
+    arr[..., 3] = 255
+    lo, hi = int(size * 0.30), int(size * 0.70)
+    arr[lo:hi, lo:hi, :3] = REFERENCE_RED
+    return Image.fromarray(arr, "RGBA")
 
 
 def test_occluded_surfaces_are_not_painted_from_the_reference():
@@ -175,8 +192,7 @@ def test_occluded_surfaces_are_not_painted_from_the_reference():
     帽子の赤・耳の黒を拾って筋になる(実ジョブ46b64850で確認した欠陥)。
     """
     mesh = _two_plates_mesh()
-    ref = Image.new("RGBA", (256, 256), (*REFERENCE_RED, 255))
-    stats = texrefine.refine_texture_with_references(mesh, {"front": ref})
+    stats = texrefine.refine_texture_with_references(mesh, {"front": _two_tone_reference()})
 
     assert stats.applied, stats.reason
     assert stats.occluded_sample_ratio > 0.0
@@ -185,21 +201,40 @@ def test_occluded_surfaces_are_not_painted_from_the_reference():
     front_plate = tex[h // 2, int(w * 0.75)]  # 手前の板の中央
     hidden_centre = tex[h // 2, int(w * 0.25)]  # 後ろの板のうち隠れている中央部
     assert np.allclose(front_plate, REFERENCE_RED, atol=10), "手前の板が塗られていない"
-    assert np.allclose(hidden_centre, TEXGEN_GREY, atol=10), "隠れた面に参照色が乗っている"
+    # 隠れた面は「手前の板の赤」を透過して拾ってはいけない。texgen が平坦なら
+    # 同じ板の見えている部分(緑)から調和拡散で埋まる。
+    assert hidden_centre[0] < 120, "隠れた面が遮蔽物(赤)を透過して拾っている"
+    assert hidden_centre[1] > 80, "隠れた面が同じ板の周囲の色(緑)で埋まっていない"
 
 
 def test_visible_parts_of_a_partially_occluded_surface_are_still_painted():
     """部分的に隠れた面でも、見えている部分は参照から塗る。"""
     mesh = _two_plates_mesh()
-    ref = Image.new("RGBA", (256, 256), (*REFERENCE_RED, 255))
-    texrefine.refine_texture_with_references(mesh, {"front": ref})
+    texrefine.refine_texture_with_references(mesh, {"front": _two_tone_reference()})
 
     tex = np.asarray(texrefine._extract_texture_image(mesh.visual).convert("RGB")).astype(int)
     h, w = tex.shape[:2]
     # 後ろの板の外周(手前の板 40/100 の外側)は見えている。
     # UV左半分の端 (u=0.08 -> 板の左端付近) をサンプルする。
     visible_edge = tex[h // 2, int(w * 0.08)]
-    assert np.allclose(visible_edge, REFERENCE_RED, atol=10), "見えている外周が塗られていない"
+    assert np.allclose(visible_edge, GREEN, atol=12), "見えている外周が塗られていない"
+
+
+def test_fill_leaves_textured_hidden_areas_to_texgen():
+    """texgen が描き込みを持つ隠れ領域は拡散で潰さない(平坦ゲート)。"""
+    size = 256
+    base = np.full((size, size, 3), TEXGEN_GREY, np.uint8)
+    # 後ろの板のチャート(左半分)に市松模様 = texgen に本物の情報がある想定
+    yy, xx = np.mgrid[0:size, 0:size]
+    checker = (((yy // 8) + (xx // 8)) % 2 == 0) & (xx < size // 2)
+    base[checker] = (40, 40, 40)
+    mesh = _two_plates_mesh(texture=Image.fromarray(base, "RGB"))
+    stats = texrefine.refine_texture_with_references(mesh, {"front": _two_tone_reference()})
+
+    tex = np.asarray(texrefine._extract_texture_image(mesh.visual).convert("RGB")).astype(int)
+    h, w = tex.shape[:2]
+    patch = tex[h // 2 - 8 : h // 2 + 8, int(w * 0.25) - 8 : int(w * 0.25) + 8]
+    assert patch.std() > 20, "隠れ領域の texgen の描き込みが拡散で潰された"
 
 
 def test_grazing_angles_are_left_to_texgen():
@@ -250,18 +285,18 @@ def _eye_fixture(synth_eye_x: int, ref_eye_x: int, size: int = 256):
 def test_reference_features_move_rigidly_to_the_mesh_position():
     """参照の目は形のままメッシュ側の位置へ動き、元の位置は毛で埋まる。
 
-    ずれ(10px/256=3.9%)は上限 FEATURE_MATCH_MAX_FRACTION(5%) 未満に収める。
-    実ジョブのずれは10〜25px/1024(1〜2.5%)。
+    ずれ(8px/256=3.1%)は上限 FEATURE_MATCH_MAX_FRACTION(3.5%) 未満に収める。
+    実ジョブの正当なずれは10〜25px/1024(1〜2.5%)。
     """
-    synth, mask, reference = _eye_fixture(synth_eye_x=100, ref_eye_x=110)
+    synth, mask, reference = _eye_fixture(synth_eye_x=102, ref_eye_x=110)
     corrected, moved = texrefine.align_reference_features(synth, mask, reference)
 
     assert moved == 1
     out = np.asarray(corrected)
-    assert out[128, 100, :3].mean() < 60, "目がメッシュ側の位置に来ていない"
+    assert out[128, 102, :3].mean() < 60, "目がメッシュ側の位置に来ていない"
     assert out[128, 121, :3].mean() > 150, "元の位置に目が残っている(二重写し)"
     # 形が保たれている(移動先で円がそのまま): 縁の少し内側も暗い
-    assert out[128 - 10, 100, :3].mean() < 60
+    assert out[128 - 10, 102, :3].mean() < 60
 
 
 def test_features_without_a_match_stay_put():
@@ -307,3 +342,23 @@ def test_declines_when_uv_count_mismatches():
     stats = texrefine.refine_texture_with_references(mesh, {"front": _circular_reference()})
     assert stats.applied is False
     assert "一致しません" in stats.reason
+
+
+def test_features_do_not_match_dissimilar_shapes():
+    """コンパクトな目は細長い髪の影と対応しない(誤マッチで目が消える再発防止)。"""
+    size = 256
+    yy, xx = np.mgrid[0:size, 0:size]
+
+    synth = np.full((size, size, 3), 255, np.uint8)
+    # メッシュ側にあるのは細長い影だけ(texgenが顔を描かなかった状況)
+    synth[(np.abs(yy - 120) < 2) & (np.abs(xx - 120) < 30)] = 20
+    mask = (xx - 128) ** 2 + (yy - 128) ** 2 <= 110 ** 2
+
+    ref = np.full((size, size, 4), 255, np.uint8)
+    eye = (xx - 128) ** 2 + (yy - 128) ** 2 <= 12 ** 2  # コンパクトな目
+    ref[eye, :3] = 20
+    reference = Image.fromarray(ref, "RGBA")
+
+    corrected, moved = texrefine.align_reference_features(synth, mask, reference)
+    assert moved == 0, "目が髪の影と誤対応して移動している"
+    assert np.array_equal(np.asarray(corrected), np.asarray(reference.convert("RGBA")))
