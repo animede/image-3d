@@ -492,6 +492,8 @@ def test_side_views_are_not_used_above_the_head_base():
     above = sideways & (vertices[:, 2] > base + 5)
     below = sideways & (vertices[:, 2] < base - 5)
     assert above.sum() > 20 and below.sum() > 20, "頭の上下に真横向きの頂点が必要"
-    # 付け根より下の真横は側面(緑)、上は側面を使わない
-    assert colors[below][:, 1].mean() > colors[below][:, 0].mean(), "側面が使われていない"
-    assert colors[above][:, 1].mean() < colors[above][:, 0].mean(), "頭に側面が使われている"
+    # 付け根より下の真横は側面(緑)が担当する
+    assert colors[below][:, 1].mean() > colors[below][:, 0].mean() + 10, "側面が使われていない"
+    # 頭の真横は側面を使わない。転写されず texgen(無彩色)のまま残ってよい。
+    above_rgb = colors[above].mean(axis=0)
+    assert above_rgb[1] <= above_rgb[0] + 10, f"頭に側面(緑)が使われている: {above_rgb}"

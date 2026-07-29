@@ -60,6 +60,13 @@ FULL_CONFIDENCE_DOT = 0.50
 # (テクセル密度の問題)ので、下限自体は残す。
 MIN_CONFIDENCE_DOT = 0.20
 
+# 側面参照があるときの下限。前後だけのときは真横まで届かせる必要があって
+# 0.20(視線から78°)まで下げていたが、側面参照が入ると**どの面もどれかの
+# ビューから正対して見える**ので、浅い角度の転写に頼る理由が無くなる。
+# 浅い角度は1画素が表面上で大きく伸び、前後の取り合いが面ごとに揺れて
+# まだら模様になる(実測: 頭の真横で前後の内積が平均±0.01=事実上コイン投げ)。
+MIN_CONFIDENCE_DOT_WITH_SIDES = 0.40
+
 # 面あたりのサンプル数の目安(テクセル面積の何倍を撒くか)。
 # ランダムなバリセントリックサンプリングなので取りこぼしが出るが、
 # 残った穴は `HOLE_FILL_RADIUS_TEXELS` で埋める。少なすぎると遮蔽境界で
@@ -198,6 +205,11 @@ _PRIMARY_VIEWS = ("front", "back")
 # 低い=位置は合っているのに、頬に黒い塊・髪に肌色の滲みが出た)。
 # 利得がほぼ無くリスクだけがあるので、頭から上は前後に任せる。
 #
+# さらに頭では**拡散による穴埋めもしない**。頭の真横は前後どちらからも
+# 正対して見えないので転写できず、そこを拡散で埋めると texgen と拡散と
+# 転写の3すくみになって髪の色が斑に混ざる(実測: 直接34%/拡散24%/texgen43%)。
+# 素の texgen の髪は滑らかで破綻が無いので、任せたほうが良い。
+#
 # 頭の付け根は**メッシュから測る**(固定の高さ比では体型差に耐えない)。
 # Tポーズは腕で最大幅になり、肩から上で幅が急に落ちるので、その落ち際を
 # 境目とする。実測: 人型で全高の81%(=首)、犬で59%(=首)と妥当に出る。
@@ -326,10 +338,10 @@ def head_base_height(mesh: trimesh.Trimesh) -> float:
     return high
 
 
-def _blend_weight(dot: np.ndarray) -> np.ndarray:
+def _blend_weight(dot: np.ndarray, minimum: float = MIN_CONFIDENCE_DOT) -> np.ndarray:
     """法線と視線の内積 -> 参照画像を信用する重み (0..1)。"""
-    span = max(FULL_CONFIDENCE_DOT - MIN_CONFIDENCE_DOT, 1e-9)
-    return np.clip((dot - MIN_CONFIDENCE_DOT) / span, 0.0, 1.0).astype(np.float32)
+    span = max(FULL_CONFIDENCE_DOT - minimum, 1e-9)
+    return np.clip((dot - minimum) / span, 0.0, 1.0).astype(np.float32)
 
 
 def _iter_surface_samples(
@@ -961,6 +973,7 @@ def refine_texture_with_references(
     # --- パス2: 可視かつ信頼できるサンプルだけを参照画像から転写する --------
     primary_columns = [i for i, v in enumerate(views) if v in _PRIMARY_VIEWS]
     has_sides = bool(primary_columns) and len(primary_columns) < len(views)
+    min_dot = MIN_CONFIDENCE_DOT_WITH_SIDES if has_sides else MIN_CONFIDENCE_DOT
     head_base = head_base_height(mesh) if has_sides else None
     if head_base is not None:
         logger.info(
@@ -969,6 +982,7 @@ def refine_texture_with_references(
             head_base,
             float(np.asarray(mesh.vertices)[:, 2].max()),
         )
+    head_texels = np.zeros((h, w), dtype=bool) if has_sides else None
     occluded_samples = 0
     assigned_samples = 0
     for points, sample_normals, sample_uv in _iter_surface_samples(
@@ -985,15 +999,20 @@ def refine_texture_with_references(
         # 側面参照があるときは、正面・背面が十分正対している面と、頭より上の
         # 面を側面に渡さない(顔の細部が側面参照のわずかなずれで壊れるのを防ぐ)。
         if has_sides:
+            on_head = points[:, 2] >= head_base
+            if on_head.any():
+                head_tx = np.clip(sample_uv[on_head, 0].astype(np.int64), 0, w - 1)
+                head_ty = np.clip(sample_uv[on_head, 1].astype(np.int64), 0, h - 1)
+                head_texels[head_ty, head_tx] = True
             primary_dots = dots[:, primary_columns]
             primary_pick = np.asarray(primary_columns)[np.argmax(primary_dots, axis=1)]
             keep_primary = primary_dots.max(axis=1) >= PRIMARY_VIEW_MIN_DOT_WITH_SIDES
-            keep_primary |= points[:, 2] >= head_base
+            keep_primary |= on_head
             best = np.where(keep_primary, primary_pick, best)
 
         best_dot = dots[np.arange(len(dots)), best]
 
-        weight = _blend_weight(best_dot)
+        weight = _blend_weight(best_dot, min_dot)
         # 遮蔽・フチ落ちしたサンプルも分母には入れる(境界のテクセルが
         # 自動的に texgen 側へ寄り、遮蔽の切り替わりが線にならない)。
         np.add.at(accum_count, flat, 1.0)
@@ -1054,11 +1073,15 @@ def refine_texture_with_references(
     # 拡散の根拠(アンカー)は blend>0 のテクセル。ガター埋めの複製も含むが、
     # それは同一チャート近傍(4テクセル以内)の色の複製なので根拠として十分。
     sampled_2d = accum_count.reshape(h, w) > 0
+    fillable = sampled_2d & ~covered_2d
+    if head_texels is not None:
+        # 頭は拡散で埋めず texgen に任せる(髪の色が斑に混ざるのを防ぐ)
+        fillable &= ~head_texels
     stats.filled_texel_ratio = _fill_rejected_regions(
         refined,
         blend,
         base,
-        rejected=sampled_2d & ~covered_2d,
+        rejected=fillable,
     )
 
     # 混合率マップの孤立ノイズを除去する。遮蔽境界ではサンプルの当たり方の
