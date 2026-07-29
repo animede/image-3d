@@ -613,3 +613,156 @@ def test_diffusion_leaves_front_facing_vertices_unchanged():
     straight_on = normals[:, 1] < -0.8  # 正面をほぼ正対して向く頂点
     assert straight_on.any()
     assert (colors[straight_on, :3] == (255, 0, 0)).all()
+
+
+# --- 側面参照の異方歪み修正(等方スケール+横オフセット探索) -------------------
+#
+# 実ジョブ(cbf449b7...)で確認したバグ: 側面参照は腕を前へ出した姿勢で
+# 撮るため被写体bboxが横に広がるが、メッシュの側面投影は胴の厚みしかない。
+# 縦横で独立にbboxいっぱいへ引き伸ばすと胴が約2倍に間延びし、シルエット
+# 不一致ガードがほぼ全域(82%)を弾いていた。等方スケール(縦と同じpx/mm)+
+# IoU最大の横オフセットへ切り替えると、実ジョブで不一致率が34.6%まで下がる
+# ことを確認済み(実機検証はコードレビュー時の報告参照)。
+
+
+def _torso_with_side_arm_mesh():
+    """胴体(薄い直方体)のみのメッシュ。厚み(Y)は薄く、幅(X)・高さ(Z)は太い。
+
+    「側面ビュー」を想定し、Y軸方向への投影幅は薄い胴体の厚みだけになる。
+    実ジョブ同様、頂点が細分されていないと段のプロファイルが疎になるため
+    細分する。
+    """
+    box = trimesh.creation.box(extents=[20.0, 4.0, 40.0])
+    return box.subdivide().subdivide().subdivide()
+
+
+def _side_reference_with_arm_bulge(
+    canvas=(256, 256), torso_width_px=40, arm_width_px=200, arm_row_frac=(0.35, 0.55)
+):
+    """側面参照を模した合成画像。
+
+    ほとんどの行は胴体幅(torso_width_px)の細い帯だが、`arm_row_frac` の
+    行範囲だけ腕が突き出て被写体bboxが大きく広がる(arm_width_px)。
+    実ジョブの「胴は細いのに被写体bboxは腕を含んで広い」状況を再現する。
+    """
+    w, h = canvas
+    arr = np.zeros((h, w, 4), dtype=np.uint8)
+    centre = w / 2
+    arm_lo, arm_hi = int(h * arm_row_frac[0]), int(h * arm_row_frac[1])
+    for row in range(h):
+        half = (arm_width_px if arm_lo <= row < arm_hi else torso_width_px) / 2
+        lo, hi = max(int(centre - half), 0), min(int(centre + half), w)
+        arr[row, lo:hi] = (200, 120, 60, 255)
+    return Image.fromarray(arr, "RGBA")
+
+
+def test_isotropic_fit_keeps_the_torso_width_despite_an_arm_bulge():
+    """腕の突起で被写体bboxが横に広がっていても、胴の実幅が引き伸ばされないこと。
+
+    従来のbbox方式(縦横独立に引き伸ばす)だと、胴体の投影幅が被写体bbox幅
+    (腕を含む=torso_width_pxよりずっと広い)いっぱいまで引き伸ばされる。
+    等方スケール方式なら、胴の投影幅は「縦と同じpx/mm」で決まるので、
+    腕の有無に関係なく一定(≒torso_width_px相当)に保たれるはず。
+    """
+    mesh = _torso_with_side_arm_mesh()
+    image = _side_reference_with_arm_bulge()
+
+    axis, _ = colorproc._view_u_axis("left")
+    px, _ = colorproc.project_points_to_pixels(mesh, image, mesh.vertices, view="left")
+    projected_width = int(px.max()) - int(px.min())
+
+    # bbox方式(腕込みの被写体bbox幅)ならもっと広くなるはずの閾値。
+    # 胴だけの幅(torso_width_px=40)に近い値に収まっていることを確認する。
+    assert projected_width < 90, f"胴の投影幅が広すぎる(異方歪みが残っている): {projected_width}px"
+
+
+def test_isotropic_fit_matches_bbox_fit_when_bboxes_already_agree():
+    """前面/背面のようにメッシュbboxと被写体bboxが一致するケースでは、
+
+    安全弁が働いて従来のbbox方式のままになり、結果が変わらないこと
+    (回帰防止)。
+    """
+    mesh = make_subdivided_box()  # extents=[10,10,20]、前面/背面はX軸に投影
+    image = make_4color_image()  # 被写体bbox=画像全体(アルファ無し=不透明)
+
+    with_fit = colorproc.project_points_to_pixels(mesh, image, mesh.vertices, view="front")
+
+    axis, u_sign = colorproc._view_u_axis("front")
+    u_min, u_max, v_min, v_max = colorproc._subject_bbox_uv(image)
+    bounds = mesh.bounds
+    a_min, a_max = bounds[0][axis], bounds[1][axis]
+    a_norm = (mesh.vertices[:, axis] - a_min) / max(a_max - a_min, 1e-9)
+    u_norm = a_norm if u_sign > 0 else 1.0 - a_norm
+    expected_u = u_min + u_norm * (u_max - u_min)
+    w, h = image.size
+    expected_px = np.clip((expected_u * w).astype(np.int64), 0, w - 1)
+
+    assert np.array_equal(with_fit[0], expected_px), "bboxが一致するのに等方フィットへ切り替わった"
+
+
+def test_safety_valve_falls_back_to_bbox_when_isotropic_iou_is_worse():
+    """等方フィットのIoUがbbox方式を下回る場合は、bbox方式のまま使うこと。
+
+    `_resolve_horizontal_range` は両方式のIoUを比べ、改善しない場合は
+    従来のbbox方式を返す(安全弁)。被写体アルファがメッシュのシルエットと
+    無関係な位置にある(=bboxのほうがまだマシな)人工的なケースで確認する。
+    """
+    mesh = _torso_with_side_arm_mesh()
+    axis, _ = colorproc._view_u_axis("left")
+
+    # 被写体が画像の隅に偏って写っている、メッシュ形状と噛み合わない画像。
+    # 等方スケールの狭い窓をどこに置いてもbbox方式より良くならないはず。
+    w, h = 256, 256
+    arr = np.zeros((h, w, 4), dtype=np.uint8)
+    arr[h // 2 - 5 : h // 2 + 5, w - 30 : w - 5] = (200, 120, 60, 255)
+    image = Image.fromarray(arr, "RGBA")
+
+    u_min, u_max, v_min, v_max = colorproc._subject_bbox_uv(image)
+    result = colorproc._resolve_horizontal_range(
+        mesh, image, axis, u_min, u_max, v_min, v_max, "left"
+    )
+    assert result == (u_min, u_max), "IoUが悪化する場合はbbox方式を使うはずが等方フィットが選ばれた"
+
+
+def test_horizontal_fit_cache_is_ignored_after_id_reuse():
+    """id が再利用されたキャッシュ項目は使わず、計算し直すこと。
+
+    キーは id() なので、オブジェクト解放後の id 再利用でまったく別のメッシュに
+    古いマッピングを返す危険がある(実測: 200個のメッシュを生成/破棄すると
+    181個しか異なる id にならない)。弱参照で「同じオブジェクトか」を確かめる。
+    """
+    import weakref
+
+    from PIL import Image as PILImage
+
+    from server import colorproc
+
+    mesh = trimesh.creation.box(extents=(2.0, 1.0, 2.0))
+    arr = np.zeros((64, 64, 4), np.uint8)
+    arr[8:56, 8:56] = (200, 200, 200, 255)
+    image = PILImage.fromarray(arr, "RGBA")
+
+    colorproc._horizontal_fit_cache.clear()
+    expected, _ = colorproc.project_points_to_pixels(
+        mesh, image, mesh.vertices, view="front"
+    )
+
+    # 解放済みオブジェクトの弱参照 = id が再利用された状況を作る
+    class _Gone:
+        pass
+
+    dead = _Gone()
+    dead_ref = weakref.ref(dead)
+    del dead
+    assert dead_ref() is None
+
+    colorproc._horizontal_fit_cache[(id(mesh), id(image), "front")] = (
+        dead_ref,
+        dead_ref,
+        (0.0, 0.05),  # 使われたら投影が左端に潰れる、あり得ない値
+    )
+    actual, _ = colorproc.project_points_to_pixels(
+        mesh, image, mesh.vertices, view="front"
+    )
+    assert np.array_equal(actual, expected), "解放済みidのキャッシュが使われている"
+    colorproc._horizontal_fit_cache.clear()

@@ -31,6 +31,8 @@
 """
 from __future__ import annotations
 
+import logging
+import weakref
 from typing import Optional
 
 import numpy as np
@@ -41,6 +43,8 @@ from scipy.ndimage import binary_erosion
 from scipy.sparse import coo_matrix
 from scipy.sparse.linalg import spsolve
 from scipy.spatial import cKDTree
+
+logger = logging.getLogger(__name__)
 
 # 画像u(横, 0=左..1=右)からメッシュX座標への符号。
 # 実生成検証(momo.png, hunyuan3d, GPU実機)の結果、u=0(画像左端)が
@@ -243,6 +247,330 @@ def _align_vertical_by_silhouette(
     return best_top / height, (best_top + sample_count) / height
 
 
+# 等方フィットのIoU探索に使う低解像度グリッドの一辺。粗くても位置合わせの
+# 精度には大差ないが、探索を256候補×256画素で回しても数十msで終わる。
+_ISOTROPIC_FIT_GRID = 256
+
+
+def _rasterize_mesh_silhouette(
+    mesh: trimesh.Trimesh, axis: int, grid: int = _ISOTROPIC_FIT_GRID
+) -> np.ndarray:
+    """メッシュを (grid, grid) の低解像度シルエットマスクへ焼く。
+
+    行方向がZ(上=最大Z)、列方向が指定軸。`_mesh_silhouette_profile` の
+    段ごとの横幅を使い、bboxいっぱいに正規化した中心軸まわりの帯として
+    塗る(bbox方式・等方方式どちらのIoU評価でも同じ土俵で比べるため)。
+    """
+    profile = _mesh_silhouette_profile(mesh, axis, bins=grid)
+    max_width = float(profile.max())
+    mask = np.zeros((grid, grid), dtype=bool)
+    if max_width <= 0:
+        return mask
+    for row in range(grid):
+        half = profile[grid - 1 - row] / max_width * 0.5  # 行0=Z最大(画像上端)
+        if half <= 0:
+            continue
+        lo = int(round((0.5 - half) * grid))
+        hi = int(round((0.5 + half) * grid))
+        lo, hi = max(lo, 0), min(hi, grid)
+        if hi > lo:
+            mask[row, lo:hi] = True
+    return mask
+
+
+def _resize_mask(mask: np.ndarray, size: int) -> np.ndarray:
+    """真偽マスクを最近傍で (size, size) へリサイズする。"""
+    src_h, src_w = mask.shape
+    ys = np.clip((np.arange(size) * src_h // size), 0, src_h - 1)
+    xs = np.clip((np.arange(size) * src_w // size), 0, src_w - 1)
+    return mask[ys][:, xs]
+
+
+def _iou(a: np.ndarray, b: np.ndarray) -> float:
+    union = int((a | b).sum())
+    if union == 0:
+        return 0.0
+    return float((a & b).sum()) / union
+
+
+def _fit_isotropic_u_range(
+    mesh: trimesh.Trimesh,
+    image: Image.Image,
+    axis: int,
+    u_min: float,
+    u_max: float,
+    v_min: float,
+    v_max: float,
+) -> Optional[tuple[float, float]]:
+    """縦と同じ px/世界単位のスケールを横にも使い、IoU最大のオフセットを探す。
+
+    側面参照は腕を前へ出した姿勢で撮るため被写体bboxが横に広がるが、
+    メッシュの側面投影(胴の厚みのみ)はずっと細い。縦横で独立にスケール
+    すると胴が横に間延びして歪むため(実測: 側面で1.97倍の異方性)、
+    縦のスケールをそのまま横にも流用し、残る自由度=横オフセットだけを
+    「メッシュシルエットと被写体アルファのIoUが最大になる位置」で決める。
+
+    Returns:
+        (u_min, u_max) の新しい値。決められなければ None
+        (呼び出し側は従来のbbox方式にフォールバックする)。
+    """
+    w, h = image.size
+
+    # 縦のpx/世界単位は、渡された v_min/v_max(見切れ時は `_align_vertical_by_silhouette`
+    # で補正済み)ではなく、画像自身の被写体bbox高さから求め直す。
+    # 側面参照では `_align_vertical_by_silhouette` 自体が「横幅(=腕を含む
+    # 被写体bbox幅)/メッシュ奥行」という同じ異方スケールで縦の伸縮率を推定して
+    # いるため、その結果の v_min/v_max をそのままスケール源にすると異方性の
+    # 歪みを引き継いでしまう(実測: 左ビューでaligned v範囲から逆算すると
+    # 40.5px/mmとなり、被写体bbox高さから求めた約20.4px/mmの約2倍になる)。
+    # 被写体bbox高さ(アルファ>0領域の素の縦幅)は軸の選び方に依存せず、
+    # front/back/leftのどのビューでもほぼ一致する信頼できるスケール源になる
+    # (実測: front 20.39, back 20.39, left 20.48 px/mm)。
+    _, _, raw_v_min, raw_v_max = _subject_bbox_uv(image)
+    v_extent_px = (raw_v_max - raw_v_min) * h
+    if v_extent_px < 8:
+        return None
+
+    bounds = mesh.bounds
+    a_min, a_max = bounds[0][axis], bounds[1][axis]
+    z_min, z_max = bounds[0][2], bounds[1][2]
+    a_extent = max(a_max - a_min, 1e-9)
+    z_extent = max(z_max - z_min, 1e-9)
+
+    # 縦と同じ px/世界単位。これでメッシュの横幅(a_extent)を画素へ変換する。
+    px_per_unit = v_extent_px / z_extent
+    mesh_width_px = a_extent * px_per_unit
+    mesh_u_extent = mesh_width_px / w  # 正規化u幅
+    if not np.isfinite(mesh_u_extent) or mesh_u_extent <= 0:
+        return None
+
+    grid = _ISOTROPIC_FIT_GRID
+    mesh_mask = _rasterize_mesh_silhouette(mesh, axis, grid=grid)
+    alpha = np.asarray(image.getchannel("A"), dtype=np.uint8) > 0
+    # v範囲(縦)は既に確定しているので、そこだけ切り出してから縮小する。
+    v0, v1 = max(int(round(v_min * h)), 0), min(int(round(v_max * h)), h)
+    if v1 <= v0:
+        return None
+    alpha_strip = _resize_mask(alpha[v0:v1], grid)
+
+    # `mesh_mask` と `alpha_strip` はどちらも「画像全幅を grid 分割した」座標系
+    # (列0=画像左端、列grid=画像右端)。窓の幅もこの座標系で数えないと、
+    # bbox幅(span)基準の幅と画像全幅基準の内容がずれて誤った位置に最適化
+    # してしまう(実測: 窓幅を span 基準で数えると129セルになり、正しい
+    # 60セルの2倍以上に間延びして、探索がまるで違う位置に収束した)。
+    window_cells = max(int(round(mesh_u_extent * grid)), 1)
+    mesh_cols = np.flatnonzero(mesh_mask.any(axis=0))
+    if len(mesh_cols) == 0:
+        return None
+    mesh_lo, mesh_hi = int(mesh_cols.min()), int(mesh_cols.max()) + 1
+    # メッシュシルエット自体の実幅窓(mesh_lo..mesh_hi)を切り出し、
+    # bbox範囲いっぱいでスライドさせる候補列に詰め替える。
+    src_cols = np.clip(
+        np.linspace(mesh_lo, mesh_hi - 1, window_cells).astype(np.int64), 0, grid - 1
+    )
+    window_pattern = mesh_mask[:, src_cols]  # (grid, window_cells)
+
+    # スライド候補: bbox範囲(u_min..u_max)いっぱいを覆うオフセットを
+    # grid刻みで試す(粗い解像度なのでこれで十分な精度が出る)。
+    bbox_lo_cell = int(round(u_min * grid))
+    bbox_hi_cell = int(round(u_max * grid))
+    search_lo = min(bbox_lo_cell, grid - window_cells)
+    search_hi = max(bbox_hi_cell - window_cells, search_lo)
+
+    best_score, best_lo_cell = -1.0, None
+    for lo_cell in range(search_lo, search_hi + 1):
+        lo_clamped = max(lo_cell, 0)
+        hi_clamped = min(lo_cell + window_cells, grid)
+        if hi_clamped <= lo_clamped:
+            continue
+        candidate = np.zeros((grid, grid), dtype=bool)
+        candidate[:, lo_clamped:hi_clamped] = window_pattern[:, : hi_clamped - lo_clamped]
+        score = _iou(candidate, alpha_strip)
+        if score > best_score:
+            best_score, best_lo_cell = score, lo_cell
+
+    if best_lo_cell is None:
+        return None
+    best_u0 = best_lo_cell / grid
+    return best_u0, best_u0 + mesh_u_extent, best_score
+
+
+def _bbox_fit_iou(
+    mesh: trimesh.Trimesh,
+    image: Image.Image,
+    axis: int,
+    u_min: float,
+    u_max: float,
+    v_min: float,
+    v_max: float,
+) -> float:
+    """現行のbbox方式(被写体bboxいっぱいに引き伸ばす)のIoUを求める(安全弁比較用)。
+
+    `_rasterize_mesh_silhouette` はメッシュ自身のbboxで正規化した形状
+    (列0..grid = メッシュのa_min..a_max)を返すだけなので、実際のbbox方式の
+    ランタイム写像(メッシュ全幅を被写体bbox u_min..u_maxへ引き伸ばす)と
+    同じ座標系に置き直してから比べる。
+    """
+    grid = _ISOTROPIC_FIT_GRID
+    h = image.size[1]
+    mesh_mask = _rasterize_mesh_silhouette(mesh, axis, grid=grid)
+    alpha = np.asarray(image.getchannel("A"), dtype=np.uint8) > 0
+    v0, v1 = max(int(round(v_min * h)), 0), min(int(round(v_max * h)), h)
+    if v1 <= v0:
+        return 0.0
+    alpha_strip = _resize_mask(alpha[v0:v1], grid)
+
+    lo_cell = int(round(u_min * grid))
+    hi_cell = int(round(u_max * grid))
+    lo_clamped, hi_clamped = max(lo_cell, 0), min(hi_cell, grid)
+    candidate = np.zeros((grid, grid), dtype=bool)
+    if hi_clamped > lo_clamped:
+        src_cols = np.clip(
+            np.linspace(0, grid - 1, hi_clamped - lo_clamped).astype(np.int64), 0, grid - 1
+        )
+        candidate[:, lo_clamped:hi_clamped] = mesh_mask[:, src_cols]
+    return _iou(candidate, alpha_strip)
+
+
+# `(mesh, image, view)` 単位での横マッピング決定結果のメモ化キャッシュ。
+# IoU探索はO(grid^2)で数十msかかるため、頂点投影・テクセル投影の両方から
+# 大量に呼ばれる `project_points_to_pixels` の内部で毎回やり直すと遅い。
+# id() ベースのキーは同一プロセス内で mesh/image オブジェクトを使い回す
+# 呼び出し(texrefine.py は1回の精細化で同じオブジェクトを何度も渡す)
+# でのみ有効だが、それで十分(呼び出しごとに新しい mesh/image を渡す
+# 場合はキャッシュが効かないだけで、結果自体は毎回正しく計算される)。
+# 長時間起動したサーバでキャッシュが際限なく肥大しないよう上限で古い順に
+# 間引く(id()の再利用による誤ヒットも、上限を小さく保つことで一度の
+# ジョブ内(数ビュー分)を超えて残留しにくくする副次効果がある)。
+_HORIZONTAL_FIT_CACHE_MAX = 64
+# キーは id() だが、**オブジェクトが生きている間だけ有効**にする。id は解放後に
+# 再利用されるため(実測: 200個のメッシュを順に生成/破棄すると181個しか異なる
+# id にならない)、弱参照を併せて持ち、参照先が同一オブジェクトのままである
+# ことを確認してからキャッシュを使う。強参照で持つとメッシュ(数十MB)と参照画像を
+# 抱え込むので使わない。
+_horizontal_fit_cache: dict[
+    tuple[int, int, str],
+    tuple["weakref.ref", "weakref.ref", tuple[float, float, float, float]],
+] = {}
+
+
+def _resolve_horizontal_range(
+    mesh: trimesh.Trimesh,
+    image: Image.Image,
+    axis: int,
+    u_min: float,
+    u_max: float,
+    v_min: float,
+    v_max: float,
+    view: str,
+) -> tuple[float, float]:
+    """横方向の (u_min, u_max) を、bbox方式と等方方式のうち良い方で決める。
+
+    安全弁: 等方方式のIoUがbbox方式を上回らない場合はbbox方式のまま
+    (前面/背面のようにbboxが一致するビューでは通常bbox方式のIoUが高く、
+    従来通りの結果になる)。どちらを採用したかをログに残す。
+    """
+    cache_key = (id(mesh), id(image), view)
+    cached = _horizontal_fit_cache.get(cache_key)
+    if cached is not None:
+        mesh_ref, image_ref, value = cached
+        if mesh_ref() is mesh and image_ref() is image:
+            return value
+        # id が再利用された(元のオブジェクトは解放済み)。捨てて計算し直す。
+        _horizontal_fit_cache.pop(cache_key, None)
+
+    result = (u_min, u_max)
+    fitted = _fit_isotropic_u_range(mesh, image, axis, u_min, u_max, v_min, v_max)
+    if fitted is not None:
+        iso_u_min, iso_u_max, iso_score = fitted
+        bbox_score = _bbox_fit_iou(mesh, image, axis, u_min, u_max, v_min, v_max)
+        if iso_score > bbox_score:
+            result = (iso_u_min, iso_u_max)
+            logger.info(
+                "%s view: using the isotropic horizontal fit (IoU %.3f > bbox %.3f).",
+                view,
+                iso_score,
+                bbox_score,
+            )
+        else:
+            logger.info(
+                "%s view: keeping the bbox horizontal fit (IoU %.3f >= isotropic %.3f).",
+                view,
+                bbox_score,
+                iso_score,
+            )
+
+    if len(_horizontal_fit_cache) >= _HORIZONTAL_FIT_CACHE_MAX:
+        _horizontal_fit_cache.pop(next(iter(_horizontal_fit_cache)))
+    try:
+        _horizontal_fit_cache[cache_key] = (weakref.ref(mesh), weakref.ref(image), result)
+    except TypeError:
+        # 弱参照できない型が渡された場合はキャッシュしない(正しさを優先)
+        pass
+    return result
+
+
+def _resolve_uv_ranges(
+    mesh: trimesh.Trimesh, image: Image.Image, axis: int, view: str
+) -> tuple[float, float, float, float]:
+    """メッシュを画像へ写す (u_min, u_max, v_min, v_max) を決める。
+
+    縦・横それぞれに候補が2つある:
+
+    - 縦: 被写体bbox / シルエット照合(`_align_vertical_by_silhouette`、
+      見切れた参照のための補正)
+    - 横: 被写体bbox / 等方スケール+オフセット(腕で横bboxが広がる側面参照用)
+
+    どちらの補正も**前提が崩れると大きく外す**。特にシルエット照合は倍率を
+    「被写体の幅 ÷ メッシュの幅」で見積もるため、腕を前へ出した側面参照では
+    横bboxが腕で広がっているぶん倍率が約2倍になり、縦位置が画像の外まで
+    飛ぶ(実測: v範囲が -0.70..1.28 になり、側面画像の顔が腰へ貼られた)。
+    そこで4通りの組み合わせをシルエットのIoUで実測し、最良を採る。
+    候補が全滅しても素のbboxが必ず含まれるので、従来動作より悪くならない。
+    """
+    cache_key = (id(mesh), id(image), view)
+    cached = _horizontal_fit_cache.get(cache_key)
+    if cached is not None:
+        mesh_ref, image_ref, value = cached
+        if mesh_ref() is mesh and image_ref() is image:
+            return value
+        # id が再利用された(元のオブジェクトは解放済み)。捨てて計算し直す。
+        _horizontal_fit_cache.pop(cache_key, None)
+
+    bbox_u_min, bbox_u_max, bbox_v_min, bbox_v_max = _subject_bbox_uv(image)
+
+    v_candidates = [("bbox", bbox_v_min, bbox_v_max)]
+    if _subject_touches_vertical_edges(image):
+        aligned = _align_vertical_by_silhouette(mesh, image, axis)
+        if aligned is not None:
+            v_candidates.append(("silhouette", aligned[0], aligned[1]))
+
+    best = None
+    for v_name, v_min, v_max in v_candidates:
+        u_options = [("bbox", bbox_u_min, bbox_u_max)]
+        fitted = _fit_isotropic_u_range(
+            mesh, image, axis, bbox_u_min, bbox_u_max, v_min, v_max
+        )
+        if fitted is not None:
+            u_options.append(("isotropic", fitted[0], fitted[1]))
+        for u_name, u_min, u_max in u_options:
+            score = _bbox_fit_iou(mesh, image, axis, u_min, u_max, v_min, v_max)
+            if best is None or score > best[0]:
+                best = (score, (u_min, u_max, v_min, v_max), f"{u_name}/{v_name}")
+
+    score, result, label = best
+    logger.info("%s view: horizontal/vertical fit = %s (IoU %.3f).", view, label, score)
+
+    if len(_horizontal_fit_cache) >= _HORIZONTAL_FIT_CACHE_MAX:
+        _horizontal_fit_cache.pop(next(iter(_horizontal_fit_cache)))
+    try:
+        _horizontal_fit_cache[cache_key] = (weakref.ref(mesh), weakref.ref(image), result)
+    except TypeError:
+        # 弱参照できない型が渡された場合はキャッシュしない(正しさを優先)
+        pass
+    return result
+
+
 def _trusted_pixel_mask(alpha: np.ndarray) -> np.ndarray:
     """フチを除いた「信頼できる」不透明画素のマスクを返す。
 
@@ -292,15 +620,7 @@ def project_points_to_pixels(
     w, h = image.size
     axis, u_sign = _view_u_axis(view)
 
-    u_min, u_max, v_min, v_max = _subject_bbox_uv(image)
-
-    # 被写体が枠の上下に接している=見切れている可能性がある。その場合は
-    # 被写体bboxに全高を合わせると縦がずれるため、シルエット照合で
-    # メッシュ上端・下端に対応する行を求め直す。
-    if _subject_touches_vertical_edges(image):
-        aligned = _align_vertical_by_silhouette(mesh, image, axis)
-        if aligned is not None:
-            v_min, v_max = aligned
+    u_min, u_max, v_min, v_max = _resolve_uv_ranges(mesh, image, axis, view)
 
     points = np.asarray(points, dtype=np.float64)
     bounds = mesh.bounds
