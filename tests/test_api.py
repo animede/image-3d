@@ -501,7 +501,7 @@ def test_texture_mode_paint_job_completes_with_mock(client, monkeypatch):
     """
     from server import main as main_module
 
-    def _fail_paint(self, mesh, image, job, back_image=None, refine_references=None):
+    def _fail_paint(self, mesh, image, job, back_image=None, refine_references=None, extra_views=None):
         job.warnings.append("test: paint intentionally failed")
         return None
 
@@ -541,7 +541,7 @@ def test_texture_mode_paint_receives_back_view(client, monkeypatch):
 
     received: dict = {}
 
-    def _capture_paint(self, mesh, image, job, back_image=None, refine_references=None):
+    def _capture_paint(self, mesh, image, job, back_image=None, refine_references=None, extra_views=None):
         received["back_image"] = back_image
         job.warnings.append("test: paint intentionally short-circuited")
         return None
@@ -583,7 +583,7 @@ def test_texture_mode_paint_with_color4_completes_with_mock(client, monkeypatch)
     """
     from server import main as main_module
 
-    def _fail_paint(self, mesh, image, job, back_image=None, refine_references=None):
+    def _fail_paint(self, mesh, image, job, back_image=None, refine_references=None, extra_views=None):
         job.warnings.append("test: paint intentionally failed")
         return None
 

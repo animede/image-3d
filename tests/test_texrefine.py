@@ -362,3 +362,57 @@ def test_features_do_not_match_dissimilar_shapes():
     corrected, moved = texrefine.align_reference_features(synth, mask, reference)
     assert moved == 0, "目が髪の影と誤対応して移動している"
     assert np.array_equal(np.asarray(corrected), np.asarray(reference.convert("RGBA")))
+
+
+# --- シルエット不一致ガード ---------------------------------------------------
+#
+# 側面参照はTポーズのままだと腕が胴を隠すため、腕を前へ出した姿勢で作らざるを
+# 得ない。腕だけメッシュと食い違うので、その領域から転写しないようにする。
+
+
+def _silhouette_pair(size=256, ref_extra=None, synth_extra=None):
+    """胴(共通)+腕(位置違い)のシルエット対を作る。"""
+    yy, xx = np.mgrid[0:size, 0:size]
+    torso = (np.abs(xx - 128) < 30) & (np.abs(yy - 128) < 70)
+
+    synth = torso.copy()
+    if synth_extra is not None:
+        synth |= synth_extra(xx, yy)
+
+    ref = np.zeros((size, size, 4), np.uint8)
+    mask = torso.copy()
+    if ref_extra is not None:
+        mask |= ref_extra(xx, yy)
+    ref[mask, :3] = REFERENCE_RED
+    ref[mask, 3] = 255
+    return synth, Image.fromarray(ref, "RGBA")
+
+
+def test_silhouette_guard_keeps_the_agreeing_parts():
+    """胴が一致していれば胴は信頼される。"""
+    synth, ref = _silhouette_pair()
+    agree, ratio = texrefine.silhouette_agreement_mask(synth, ref)
+    assert ratio < 0.05, "同一シルエットなのに不一致と判定されている"
+    assert agree[128, 128], "一致している胴の中心が捨てられている"
+
+
+def test_silhouette_guard_rejects_a_differently_posed_arm():
+    """メッシュは腕が横、参照は腕が前 → その領域は信頼しない。"""
+    synth, ref = _silhouette_pair(
+        synth_extra=lambda x, y: (np.abs(y - 80) < 8) & (x > 150) & (x < 230),  # 横へ
+        ref_extra=lambda x, y: (np.abs(y - 150) < 8) & (x > 150) & (x < 230),   # 別位置
+    )
+    agree, ratio = texrefine.silhouette_agreement_mask(synth, ref)
+    assert ratio > 0.05, "ポーズ違いが不一致として検出されていない"
+    assert not agree[80, 190], "メッシュ側の腕の位置が信頼されたままになっている"
+    assert not agree[150, 190], "参照側の腕の位置が信頼されたままになっている"
+    assert agree[128, 128], "一致している胴まで捨てている"
+
+
+def test_silhouette_guard_tolerates_the_point_sampled_synth_holes():
+    """合成ビューの点描き由来の細かい穴は不一致に数えない。"""
+    synth, ref = _silhouette_pair()
+    rng = np.random.default_rng(0)
+    holes = rng.random(synth.shape) < 0.3
+    _, ratio = texrefine.silhouette_agreement_mask(synth & ~holes, ref)
+    assert ratio < 0.05, "サンプル穴を不一致と誤判定している"

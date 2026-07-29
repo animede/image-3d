@@ -194,6 +194,7 @@ class JobManager:
         job: "Job",
         back_image: Optional[Image.Image] = None,
         refine_references: Optional[dict[str, Image.Image]] = None,
+        extra_views: Optional[dict[str, Image.Image]] = None,
     ) -> Optional[trimesh.Trimesh]:
         """texture_mode=paint 時のペイント実行(同期・ワーカースレッドから呼ばれる)。
 
@@ -231,10 +232,23 @@ class JobManager:
         if not job.params.get("texture_refine"):
             return painted
 
+        # texrefine はビューごとに可視性と法線で担当範囲を決めるので、左右を
+        # 渡しても正面向きのテクセル(顔など)は正面参照のまま守られる。
+        # 前後だけだと**側面はどちらからも観測されない**(実測: 脚の側面テクセルの
+        # うち参照から直接転写できたのは10.8%だけで、残りは拡散の推測)。
         refine_references = refine_references or {}
-        references = {"front": refine_references.get("front", image)}
-        if back_image is not None:
-            references["back"] = refine_references.get("back", back_image)
+        extra_views = extra_views or {}
+        sources: dict[str, Optional[Image.Image]] = {
+            "front": image,
+            "back": back_image,
+            "left": extra_views.get("left"),
+            "right": extra_views.get("right"),
+        }
+        references = {
+            view: refine_references.get(view, fallback)
+            for view, fallback in sources.items()
+            if refine_references.get(view, fallback) is not None
+        }
         try:
             # 精細化前のアトラスを保存しておく(調整・切り分け用: これがあれば
             # GPU再生成なしで texrefine だけを再実行できる)。
@@ -484,6 +498,7 @@ class JobManager:
                     job,
                     extra_views.get("back"),
                     refine_references,
+                    extra_views,
                 )
                 job.textured = textured_mesh is not None
 

@@ -179,6 +179,18 @@ SHADOW_DEEPEN_MAX_SATURATION = 45.0
 SHADOW_DEEPEN_SATURATION_RAMP = 30.0
 SHADOW_DEEPEN_STRENGTH = 0.75
 
+# --- シルエット不一致ガード(ポーズ違いの参照を安全に使う) ------------------
+# 側面参照は、Tポーズのままだと腕がカメラ方向へ伸びて胴の側面を隠すため、
+# 生成側で**腕を前へ出した**姿勢にせざるを得ない。すると腕だけメッシュ(Tポーズ)と
+# 位置が食い違い、そのまま投影すると腕の色が背景や胴へ流れ込む。
+# メッシュのシルエット(合成ビューの被覆)と参照のアルファを比べ、食い違う
+# 領域からはサンプルしない。胴・脚は姿勢が一致するので通常どおり転写される。
+# ポーズ違いに限らず、体型が食い違う参照全般への保護になる。
+SILHOUETTE_DISAGREE_DILATE_FRACTION = 0.004  # 不一致域をこの半径(画像辺比)広げる
+# 不一致がこの割合を超えるビューは、そもそも別物として警告する(捨てはしない:
+# 一致部分は使えるため)。
+SILHOUETTE_DISAGREE_WARN_FRACTION = 0.35
+
 # 可視性判定の深度バッファは参照画像をこの係数で縮めた格子で持つ。
 # サンプル密度はUVテクセル面積基準なので、画像解像度そのままでは
 # 疎な面にピンホール(誤って「可視」になる穴)ができる。粗くするほど
@@ -353,6 +365,37 @@ def _dark_feature_mask(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
     keep = (areas >= min_area_px) & (areas <= max_area)
     keep[0] = False
     return keep[components]
+
+
+def silhouette_agreement_mask(
+    synth_mask: np.ndarray, reference: Image.Image
+) -> tuple[np.ndarray, float]:
+    """メッシュと参照のシルエットが一致する画素のマスクと、不一致率を返す。
+
+    腕を前へ出した側面参照のように**ポーズが違う**参照でも、一致する部分
+    (胴・脚)だけを安全に使えるようにする。不一致域は少し広げて、境界付近の
+    にじみも落とす。
+
+    Args:
+        synth_mask: メッシュを描いた合成ビューの被覆マスク (h, w)。
+        reference: 参照画像(アルファ付き)。合成ビューと同じ解像度であること。
+
+    Returns:
+        (一致マスク, 不一致率)。不一致率は「どちらか一方にしかない画素」の割合。
+    """
+    from scipy.ndimage import binary_closing, binary_dilation, binary_fill_holes
+
+    # 合成ビューは表面サンプルの点描きなので被覆マスクに細かい穴が空く。
+    # 閉じてから穴埋めして、実体のあるシルエットに直してから比べる
+    # (これを怠ると穴が全部「不一致」に数えられ、参照全体が捨てられる)。
+    radius = max(int(SILHOUETTE_DISAGREE_DILATE_FRACTION * max(synth_mask.shape)), 1)
+    solid = binary_fill_holes(binary_closing(synth_mask, iterations=radius))
+
+    ref_mask = np.asarray(reference.convert("RGBA"))[..., 3] > 128
+    disagree = solid ^ ref_mask
+    union = solid | ref_mask
+    ratio = float(disagree.sum()) / max(int(union.sum()), 1)
+    return ~binary_dilation(disagree, iterations=radius), ratio
 
 
 def _feature_components(
@@ -824,21 +867,38 @@ def refine_texture_with_references(
 
     # 参照の目・鼻・口をメッシュ側の位置へ剛体移動し、以降のサンプリングは
     # この補正済み参照から行う(位置ずれした顔パーツが「浮く」のを防ぐ)。
+    # あわせて、メッシュとシルエットが食い違う領域(腕を前へ出した側面参照など)を
+    # 信頼できる画素から外す。
     for view in views:
         synth_rgb, synth_mask = synth_views[view].image()
         rgb, trusted, view_normal, image = view_data[view]
+
+        agree, disagreement = silhouette_agreement_mask(synth_mask, image)
+        if disagreement > SILHOUETTE_DISAGREE_WARN_FRACTION:
+            logger.warning(
+                "The %s reference disagrees with the mesh silhouette over %.0f%% of the "
+                "subject (different pose or proportions?); using the matching parts only.",
+                view,
+                disagreement * 100,
+            )
+        else:
+            logger.info(
+                "Silhouette disagreement on the %s view: %.1f%%.", view, disagreement * 100
+            )
+        trusted = trusted & agree
+
         try:
             corrected, moved = align_reference_features(synth_rgb, synth_mask, image)
         except Exception:
             logger.exception("Feature alignment failed for the %s view; using it as-is.", view)
+            view_data[view] = (rgb, trusted, view_normal, image)
             continue
-        if moved:
-            view_data[view] = (
-                np.asarray(corrected.convert("RGB"), dtype=np.float32),
-                trusted,
-                view_normal,
-                image,
-            )
+        view_data[view] = (
+            np.asarray(corrected.convert("RGB"), dtype=np.float32) if moved else rgb,
+            trusted,
+            view_normal,
+            image,
+        )
 
     # --- パス2: 可視かつ信頼できるサンプルだけを参照画像から転写する --------
     occluded_samples = 0
