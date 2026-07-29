@@ -191,6 +191,19 @@ SHADOW_DEEPEN_STRENGTH = 0.75
 PRIMARY_VIEW_MIN_DOT_WITH_SIDES = 0.5
 _PRIMARY_VIEWS = ("front", "back")
 
+# 側面参照を頭に使わない。頭は正面・背面が十分に観測しており(顔は正面向き、
+# 後頭部は背面向き)、本当に側面しか見えないのは耳・こめかみという狭い領域
+# だけ。一方で顔は細かいので、側面参照のわずかな位置ずれや拡散の混入が
+# はっきり見える(実測: 頭のシルエット不一致は11.4%と胴12.8%・脚19.2%より
+# 低い=位置は合っているのに、頬に黒い塊・髪に肌色の滲みが出た)。
+# 利得がほぼ無くリスクだけがあるので、頭から上は前後に任せる。
+#
+# 頭の付け根は**メッシュから測る**(固定の高さ比では体型差に耐えない)。
+# Tポーズは腕で最大幅になり、肩から上で幅が急に落ちるので、その落ち際を
+# 境目とする。実測: 人型で全高の81%(=首)、犬で59%(=首)と妥当に出る。
+HEAD_WIDTH_FRACTION = 0.40
+_HEAD_PROFILE_BINS = 64
+
 # --- シルエット不一致ガード(ポーズ違いの参照を安全に使う) ------------------
 # 側面参照は、Tポーズのままだと腕がカメラ方向へ伸びて胴の側面を隠すため、
 # 生成側で**腕を前へ出した**姿勢にせざるを得ない。すると腕だけメッシュ(Tポーズ)と
@@ -278,6 +291,39 @@ def _barycentric(n: int, rng: np.random.Generator) -> np.ndarray:
     r1, r2 = rng.random(n), rng.random(n)
     su = np.sqrt(r1)
     return np.column_stack([1.0 - su, su * (1.0 - r2), su * r2]).astype(np.float32)
+
+
+def head_base_height(mesh: trimesh.Trimesh) -> float:
+    """頭の付け根の高さ(Z)を返す。求まらなければメッシュ上端(=頭無し扱い)。
+
+    Tポーズでは腕を含む横幅が最大になり、肩から上で急に細くなる。最大幅の段
+    より上を走査し、幅が `HEAD_WIDTH_FRACTION` を下回った最初の段を境目とする。
+    """
+    vertices = np.asarray(mesh.vertices)
+    z = vertices[:, 2]
+    low, high = float(z.min()), float(z.max())
+    if not np.isfinite(low) or high <= low:
+        return high
+
+    edges = np.linspace(low, high, _HEAD_PROFILE_BINS + 1)
+    index = np.clip(np.searchsorted(edges, z, side="right") - 1, 0, _HEAD_PROFILE_BINS - 1)
+    widths = np.zeros(_HEAD_PROFILE_BINS)
+    filled = np.flatnonzero(np.bincount(index, minlength=_HEAD_PROFILE_BINS))
+    for i in filled:
+        band = vertices[index == i, 0]
+        widths[i] = float(band.max() - band.min())
+    # 頂点が疎なメッシュでは空の段ができ、そこが幅0の切れ込みに見えて
+    # 頭の付け根を誤検出する(colorproc._mesh_silhouette_profile と同じ罠)。
+    if 2 <= len(filled) < _HEAD_PROFILE_BINS:
+        widths = np.interp(np.arange(_HEAD_PROFILE_BINS), filled, widths[filled])
+
+    widest = float(widths.max())
+    if widest <= 0:
+        return high
+    for i in range(int(np.argmax(widths)), _HEAD_PROFILE_BINS):
+        if widths[i] < widest * HEAD_WIDTH_FRACTION:
+            return low + (i / _HEAD_PROFILE_BINS) * (high - low)
+    return high
 
 
 def _blend_weight(dot: np.ndarray) -> np.ndarray:
@@ -914,6 +960,15 @@ def refine_texture_with_references(
 
     # --- パス2: 可視かつ信頼できるサンプルだけを参照画像から転写する --------
     primary_columns = [i for i, v in enumerate(views) if v in _PRIMARY_VIEWS]
+    has_sides = bool(primary_columns) and len(primary_columns) < len(views)
+    head_base = head_base_height(mesh) if has_sides else None
+    if head_base is not None:
+        logger.info(
+            "Side references stop at the head base (z=%.1f of %.1f); the head is left "
+            "to the front/back references.",
+            head_base,
+            float(np.asarray(mesh.vertices)[:, 2].max()),
+        )
     occluded_samples = 0
     assigned_samples = 0
     for points, sample_normals, sample_uv in _iter_surface_samples(
@@ -927,12 +982,13 @@ def refine_texture_with_references(
         dots = np.stack([sample_normals @ view_data[v][2] for v in views], axis=1)  # (S, V)
         best = np.argmax(dots, axis=1)
 
-        # 側面参照があるときは、正面・背面が十分正対している面を渡さない
-        # (顔の細部が側面参照のわずかな位置ずれで壊れるのを防ぐ)。
-        if primary_columns and len(primary_columns) < len(views):
+        # 側面参照があるときは、正面・背面が十分正対している面と、頭より上の
+        # 面を側面に渡さない(顔の細部が側面参照のわずかなずれで壊れるのを防ぐ)。
+        if has_sides:
             primary_dots = dots[:, primary_columns]
             primary_pick = np.asarray(primary_columns)[np.argmax(primary_dots, axis=1)]
             keep_primary = primary_dots.max(axis=1) >= PRIMARY_VIEW_MIN_DOT_WITH_SIDES
+            keep_primary |= points[:, 2] >= head_base
             best = np.where(keep_primary, primary_pick, best)
 
         best_dot = dots[np.arange(len(dots)), best]

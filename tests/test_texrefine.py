@@ -442,3 +442,56 @@ def test_side_views_do_not_take_face_on_surfaces():
     # 真横を向く面は側面参照が担当する
     sideways = colors[np.abs(normals @ np.array([1.0, 0.0, 0.0])) > 0.95]
     assert sideways[:, 1].mean() > sideways[:, 0].mean(), "真横が側面参照で塗られていない"
+
+
+def test_head_base_is_found_below_the_narrowing_above_the_shoulders():
+    """Tポーズの肩から上で幅が落ちる位置を頭の付け根とする。"""
+    # 胴+横に張り出した腕、その上に細い頭、というTポーズ状の形
+    torso = trimesh.creation.box(extents=(20, 10, 60))
+    torso.apply_translation([0, 0, 30])
+    arms = trimesh.creation.box(extents=(100, 8, 8))
+    arms.apply_translation([0, 0, 55])
+    head = trimesh.creation.box(extents=(16, 16, 20))
+    head.apply_translation([0, 0, 70])
+    mesh = trimesh.util.concatenate([torso, arms, head])
+
+    base = texrefine.head_base_height(mesh)
+    assert 55 < base < 65, f"頭の付け根が肩と頭頂の間にない: {base}"
+
+
+def _narrow_topped_mesh_with_uv(texture_size: int = 512) -> trimesh.Trimesh:
+    """上半分が細い「頭付き」の球。頭の付け根が中腹に検出される。
+
+    素の球は真横を向く面が赤道付近にしか無く、頭の上下で挙動を比べられない。
+    """
+    mesh = _sphere_with_uv(texture_size)
+    vertices = np.asarray(mesh.vertices).copy()
+    upper = vertices[:, 2] > 0
+    vertices[upper, :2] *= 0.35
+    mesh.vertices = vertices
+    return mesh
+
+
+def test_side_views_are_not_used_above_the_head_base():
+    """頭の付け根より上では側面参照を使わない(顔が側面のずれで壊れるため)。"""
+    mesh = _narrow_topped_mesh_with_uv()
+    base = texrefine.head_base_height(mesh)
+    vertices = np.asarray(mesh.vertices)
+    assert vertices[:, 2].min() < base < vertices[:, 2].max(), f"付け根が範囲外: {base}"
+
+    front = _circular_reference(color=REFERENCE_RED)
+    side = _circular_reference(color=(20, 220, 40))
+    stats = texrefine.refine_texture_with_references(
+        mesh, {"front": front, "left": side, "right": side}
+    )
+    assert stats.applied, stats.reason
+
+    colors = sample_vertex_colors_from_texture(mesh)[:, :3].astype(int)
+    normals = np.asarray(mesh.vertex_normals)
+    sideways = np.abs(normals @ np.array([1.0, 0.0, 0.0])) > 0.9
+    above = sideways & (vertices[:, 2] > base + 5)
+    below = sideways & (vertices[:, 2] < base - 5)
+    assert above.sum() > 20 and below.sum() > 20, "頭の上下に真横向きの頂点が必要"
+    # 付け根より下の真横は側面(緑)、上は側面を使わない
+    assert colors[below][:, 1].mean() > colors[below][:, 0].mean(), "側面が使われていない"
+    assert colors[above][:, 1].mean() < colors[above][:, 0].mean(), "頭に側面が使われている"
