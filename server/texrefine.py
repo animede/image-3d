@@ -102,6 +102,21 @@ REJECT_FILL_MAX_UNKNOWNS = 2_000_000
 # 2反復=4テクセル幅までの隙間を繋ぐ(チャート間ガターはそれより広い前提)。
 REJECT_FILL_CLOSING_ITERATIONS = 2
 
+# 埋めを繰り返す回数。1パスだと「埋めた結果が次のパスの足場になる」性質を
+# 使えず、前後ビューの境目(側面)のように棄却領域が広い場所で大量に取り
+# 残す(実測: 人型2048参照で47万テクセルが2パス目以降で初めて埋まる)。
+# 進捗が止まれば早期終了する。
+REJECT_FILL_PASSES = 4
+
+# **孤島の例外**: 周囲がほぼ転写済みで囲まれた小さな棄却の塊は、texgen の
+# 描き込みではなくサンプリング/可視性判定のゆらぎによる取りこぼしである。
+# 平坦ゲート(texgenに情報があるか)を適用すると、texgen のノイズを「情報」と
+# 誤認してゴマ塩が残る(実測: 側面の継ぎ目帯で2793個の1〜20px斑点)。
+# サイズ上限を設けることで、texgen だけが見える広い領域(犬の帽子の垂れの裏)は
+# 従来どおり保護される。
+REJECT_FILL_ISLAND_MAX_PX = 400
+REJECT_FILL_ISLAND_MIN_BOUNDARY = 0.9
+
 # --- 顔の特徴(目・鼻・口)は texgen に任せる -------------------------------
 # 生成メッシュの目・鼻は参照画像と数%ずれる(実測: 目の中心で10〜25px/1024)。
 # texgen はメッシュの法線・位置マップに条件付けて描くので**形状に揃っており**、
@@ -536,7 +551,6 @@ def _fill_rejected_regions(
     """
     if not rejected.any():
         return 0.0
-    source = blend > 0.0  # 転写済み+ガター埋め(同一チャート近傍の複製)
 
     from scipy.ndimage import binary_closing, label, maximum_filter, uniform_filter
     from scipy.sparse import coo_matrix
@@ -551,78 +565,93 @@ def _fill_rejected_regions(
     local_std = np.sqrt(np.maximum(mean_sq - mean * mean, 0.0))
     flat = local_std < REJECT_FILL_FLAT_STD
 
-    # UV面積の大きい面はサンプル上限で棄却テクセルが塩粒状に途切れるため、
-    # 閉包で面として繋いでから領域判定する。閉包で増えた分にも平坦条件と
-    # 「まだ何も転写されていない」条件を課す(転写済み・描き込みは守る)。
-    candidates = rejected & flat
-    if not candidates.any():
-        return 0.0
-    candidates = (
-        binary_closing(candidates, iterations=REJECT_FILL_CLOSING_ITERATIONS)
-        & flat
-        & (blend <= 0.0)
-    )
-    if not candidates.any():
-        return 0.0
+    def select_fill_mask() -> np.ndarray:
+        """このパスで埋める対象テクセルを選ぶ。"""
+        source = blend > 0.0  # 転写済み+ガター埋め(同一チャート近傍の複製)
+        remaining = rejected & (blend <= 0.0)
+        if not remaining.any():
+            return np.zeros_like(remaining)
 
-    # 領域ごとに「境界の何割が転写済みか」を見て採否を決める。
-    # 境界テクセルの帰属は 3x3 最大値フィルタで近似する(2領域が同じ境界
-    # テクセルに接する場合は大きいラベルが取るが、判定用途には十分)。
-    regions, n_regions = label(candidates)
-    ring_labels = maximum_filter(regions, size=3)
-    ring = (regions == 0) & (ring_labels > 0)
-    labels_on_ring = ring_labels[ring]
-    total = np.bincount(labels_on_ring, minlength=n_regions + 1).astype(np.float64)
-    covered_on_ring = np.bincount(
-        labels_on_ring, weights=source[ring].astype(np.float64), minlength=n_regions + 1
-    )
-    keep = covered_on_ring / np.maximum(total, 1.0) >= REJECT_FILL_MIN_BOUNDARY_COVERAGE
-    keep[0] = False
-    fill_mask = keep[regions]
-    n_unknown = int(fill_mask.sum())
-    if n_unknown == 0:
-        return 0.0
-    if n_unknown > REJECT_FILL_MAX_UNKNOWNS:
-        logger.warning(
-            "Skipping rejected-region fill: %d texels exceed the solver cap (%d).",
-            n_unknown,
-            REJECT_FILL_MAX_UNKNOWNS,
+        def analyse(mask: np.ndarray):
+            """閉包→連結成分ごとの (ラベル画像, 境界の転写済み率, サイズ) を返す。
+
+            UV面積の大きい面はサンプル上限で棄却テクセルが塩粒状に途切れるため、
+            閉包で面として繋いでから領域判定する。境界テクセルの帰属は 3x3
+            最大値フィルタで近似する(2領域が同じ境界テクセルに接する場合は
+            大きいラベルが取るが、判定用途には十分)。
+            """
+            closed = binary_closing(mask, iterations=REJECT_FILL_CLOSING_ITERATIONS)
+            closed &= blend <= 0.0
+            regions, n = label(closed)
+            if n == 0:
+                return regions, np.zeros(1), np.zeros(1), closed
+            ring_labels = maximum_filter(regions, size=3)
+            ring = (regions == 0) & (ring_labels > 0)
+            on_ring = ring_labels[ring]
+            total = np.bincount(on_ring, minlength=n + 1).astype(np.float64)
+            covered = np.bincount(
+                on_ring, weights=source[ring].astype(np.float64), minlength=n + 1
+            )
+            sizes = np.bincount(regions.ravel(), minlength=n + 1)
+            return regions, covered / np.maximum(total, 1.0), sizes, closed
+
+        # 孤島判定は**棄却テクセル全体**の連結成分で行う(平坦かどうかに関わらず、
+        # 転写済みに囲まれた小さな塊はサンプリング/可視性のゆらぎによる
+        # 取りこぼしなので、texgen のノイズごと埋めてよい)。
+        regions_all, boundary_all, sizes_all, closed_all = analyse(remaining)
+        island = (
+            (sizes_all <= REJECT_FILL_ISLAND_MAX_PX)
+            & (boundary_all >= REJECT_FILL_ISLAND_MIN_BOUNDARY)
         )
-        return 0.0
+        island[0] = False
 
-    # 4近傍ラプラシアン。未知数=埋める対象、Dirichlet=転写済み、その他はNeumann。
-    index = np.full((h, w), -1, dtype=np.int64)
-    ys, xs = np.where(fill_mask)
-    index[ys, xs] = np.arange(n_unknown)
+        # 広い領域は従来どおり「texgen が平坦」なテクセルだけを、平坦部分の
+        # 連結成分で判定する(全棄却で括ると非平坦部と併合して境界率が下がり、
+        # 本来埋まるはずの平坦域まで落ちる)。
+        regions_flat, boundary_flat, _, closed_flat = analyse(remaining & flat)
+        bulk = boundary_flat >= REJECT_FILL_MIN_BOUNDARY_COVERAGE
+        bulk[0] = False
 
-    rows: list[np.ndarray] = []
-    cols: list[np.ndarray] = []
-    vals: list[np.ndarray] = []
-    rhs = np.zeros((n_unknown, 3), dtype=np.float64)
-    diag = np.zeros(n_unknown, dtype=np.float64)
+        return (closed_all & island[regions_all]) | (closed_flat & bulk[regions_flat] & flat)
 
-    for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-        ny, nx = ys + dy, xs + dx
-        inside = (ny >= 0) & (ny < h) & (nx >= 0) & (nx < w)
-        idx_self = index[ys[inside], xs[inside]]
-        n_idx = index[ny[inside], nx[inside]]
+    def solve_pass(fill_mask: np.ndarray) -> int:
+        """1パス分の調和拡散を解いて `refined`/`blend` を更新し、埋めた数を返す。"""
+        source = blend > 0.0
+        n_unknown = int(fill_mask.sum())
 
-        is_unknown = n_idx >= 0
-        np.add.at(diag, idx_self[is_unknown], 1.0)
-        rows.append(idx_self[is_unknown])
-        cols.append(n_idx[is_unknown])
-        vals.append(np.full(int(is_unknown.sum()), -1.0))
+        # 4近傍ラプラシアン。未知数=埋める対象、Dirichlet=転写済み、その他はNeumann。
+        index = np.full((h, w), -1, dtype=np.int64)
+        ys, xs = np.where(fill_mask)
+        index[ys, xs] = np.arange(n_unknown)
 
-        is_source = (~is_unknown) & source[ny[inside], nx[inside]]
-        np.add.at(diag, idx_self[is_source], 1.0)
-        np.add.at(rhs, idx_self[is_source], refined[ny[inside][is_source], nx[inside][is_source]])
+        rows: list[np.ndarray] = []
+        cols: list[np.ndarray] = []
+        vals: list[np.ndarray] = []
+        rhs = np.zeros((n_unknown, 3), dtype=np.float64)
+        diag = np.zeros(n_unknown, dtype=np.float64)
 
-    # どの方向にも未知数・境界が無い孤立テクセルは texgen のまま固定する
-    isolated = diag == 0.0
-    diag[isolated] = 1.0
-    rhs[isolated] = base[ys[isolated], xs[isolated]]
+        for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            ny, nx = ys + dy, xs + dx
+            inside = (ny >= 0) & (ny < h) & (nx >= 0) & (nx < w)
+            idx_self = index[ys[inside], xs[inside]]
+            n_idx = index[ny[inside], nx[inside]]
 
-    matrix = coo_matrix(
+            is_unknown = n_idx >= 0
+            np.add.at(diag, idx_self[is_unknown], 1.0)
+            rows.append(idx_self[is_unknown])
+            cols.append(n_idx[is_unknown])
+            vals.append(np.full(int(is_unknown.sum()), -1.0))
+
+            is_source = (~is_unknown) & source[ny[inside], nx[inside]]
+            np.add.at(diag, idx_self[is_source], 1.0)
+            np.add.at(rhs, idx_self[is_source], refined[ny[inside][is_source], nx[inside][is_source]])
+
+        # どの方向にも未知数・境界が無い孤立テクセルは texgen のまま固定する
+        isolated = diag == 0.0
+        diag[isolated] = 1.0
+        rhs[isolated] = base[ys[isolated], xs[isolated]]
+
+        matrix = coo_matrix(
         (
             np.concatenate([diag] + vals),
             (
@@ -631,29 +660,51 @@ def _fill_rejected_regions(
             ),
         ),
         shape=(n_unknown, n_unknown),
-    ).tocsr()
+        ).tocsr()
 
-    # ラプラシアンは対称正定値なので共役勾配で解く(LU分解は73万未知数で
-    # メモリも時間も跳ねる)。初期値に texgen の色を使うと、正解に近い場所
-    # から始まるぶん速く、収束打ち切り時も「texgen より悪くならない」。
-    solution = np.empty_like(rhs)
-    for channel in range(3):
-        x, info = cg(
-            matrix,
-            rhs[:, channel],
-            x0=base[ys, xs, channel].astype(np.float64),
-            rtol=1e-4,
-            maxiter=1500,
-        )
-        if info != 0:
-            logger.info("Harmonic fill CG stopped early (info=%d); using the partial solution.", info)
-        solution[:, channel] = x
+        # ラプラシアンは対称正定値なので共役勾配で解く(LU分解は73万未知数で
+        # メモリも時間も跳ねる)。初期値に texgen の色を使うと、正解に近い場所
+        # から始まるぶん速く、収束打ち切り時も「texgen より悪くならない」。
+        solution = np.empty_like(rhs)
+        for channel in range(3):
+            x, info = cg(
+                matrix,
+                rhs[:, channel],
+                x0=base[ys, xs, channel].astype(np.float64),
+                rtol=1e-4,
+                maxiter=1500,
+            )
+            if info != 0:
+                logger.info("Harmonic fill CG stopped early (info=%d); using the partial solution.", info)
+            solution[:, channel] = x
 
-    refined[ys, xs] = np.clip(solution, 0.0, 255.0)
-    blend[ys, xs] = 1.0
-    ratio = n_unknown / float(h * w)
+        refined[ys, xs] = np.clip(solution, 0.0, 255.0)
+        blend[ys, xs] = 1.0
+        return n_unknown
+
+    # 埋めた結果は次のパスの足場(Dirichlet境界)になるので、進捗が無くなるまで
+    # 繰り返す。1パスだけだと前後ビューの境目のように棄却域が広い場所で
+    # 大量に取り残す(実測: 人型2048参照で2パス目以降に47万テクセルが埋まる)。
+    total_filled = 0
+    for _ in range(REJECT_FILL_PASSES):
+        fill_mask = select_fill_mask()
+        n_unknown = int(fill_mask.sum())
+        if n_unknown == 0:
+            break
+        if n_unknown > REJECT_FILL_MAX_UNKNOWNS:
+            logger.warning(
+                "Stopping rejected-region fill: %d texels exceed the solver cap (%d).",
+                n_unknown,
+                REJECT_FILL_MAX_UNKNOWNS,
+            )
+            break
+        total_filled += solve_pass(fill_mask)
+
+    if total_filled == 0:
+        return 0.0
+    ratio = total_filled / float(h * w)
     logger.info(
-        "Filled %.2f%% of texels (rejected but featureless in texgen) by harmonic diffusion.",
+        "Filled %.2f%% of texels (rejected, no usable texgen content) by harmonic diffusion.",
         ratio * 100,
     )
     return ratio
