@@ -416,3 +416,29 @@ def test_silhouette_guard_tolerates_the_point_sampled_synth_holes():
     holes = rng.random(synth.shape) < 0.3
     _, ratio = texrefine.silhouette_agreement_mask(synth & ~holes, ref)
     assert ratio < 0.05, "サンプル穴を不一致と誤判定している"
+
+
+def test_side_views_do_not_take_face_on_surfaces():
+    """側面参照を足しても、正面を正対して向く面は正面参照のまま。
+
+    側面参照はシルエットが一致していても内部の特徴が数pxずれることがあり、
+    顔のような細かい領域では黒い塊として見える(実ジョブ24d313abで確認)。
+    正面・背面が dot>=0.5 で見えている面は側面に渡さない。
+    """
+    mesh = _sphere_with_uv()
+    front = _circular_reference(color=REFERENCE_RED)
+    side = _circular_reference(color=(20, 220, 40))  # 側面は緑
+    stats = texrefine.refine_texture_with_references(
+        mesh, {"front": front, "left": side, "right": side}
+    )
+    assert stats.applied, stats.reason
+
+    colors = sample_vertex_colors_from_texture(mesh)[:, :3].astype(int)
+    normals = np.asarray(mesh.vertex_normals)
+    facing = normals @ np.array([0.0, -1.0, 0.0])
+    front_on = colors[facing > 0.9]
+    assert np.allclose(front_on.mean(axis=0), REFERENCE_RED, atol=15), "正対面が側面色で塗られた"
+
+    # 真横を向く面は側面参照が担当する
+    sideways = colors[np.abs(normals @ np.array([1.0, 0.0, 0.0])) > 0.95]
+    assert sideways[:, 1].mean() > sideways[:, 0].mean(), "真横が側面参照で塗られていない"

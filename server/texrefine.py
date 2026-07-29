@@ -179,6 +179,18 @@ SHADOW_DEEPEN_MAX_SATURATION = 45.0
 SHADOW_DEEPEN_SATURATION_RAMP = 30.0
 SHADOW_DEEPEN_STRENGTH = 0.75
 
+# 側面参照を足したとき、正面・背面が担当を譲る法線しきい値。
+# `colorproc._PRIMARY_VIEW_MIN_DOT_WITH_SIDES` と同じ値・同じ理由。
+# 側面参照はシルエットが一致していても**内部の特徴が数px ずれる**ことがあり
+# (実測: 頭のシルエット不一致は11.4%と胴12.8%・脚19.2%より低いのに、頬や耳に
+# 黒い塊が出た)、ずれが目に付くのは顔のような小さく細かい領域。逆に胴や脚の
+# ような広く平坦な面ではずれは見えず、側面参照の効果だけが得られる。
+# そこで**正面・背面が十分に正対して見えている面(dot>=0.5、視線から60°以内)は
+# 側面参照に渡さない**。顔は正面のまま残り、真横を向く胴・脚の側面だけが
+# 側面参照の担当になる。
+PRIMARY_VIEW_MIN_DOT_WITH_SIDES = 0.5
+_PRIMARY_VIEWS = ("front", "back")
+
 # --- シルエット不一致ガード(ポーズ違いの参照を安全に使う) ------------------
 # 側面参照は、Tポーズのままだと腕がカメラ方向へ伸びて胴の側面を隠すため、
 # 生成側で**腕を前へ出した**姿勢にせざるを得ない。すると腕だけメッシュ(Tポーズ)と
@@ -901,6 +913,7 @@ def refine_texture_with_references(
         )
 
     # --- パス2: 可視かつ信頼できるサンプルだけを参照画像から転写する --------
+    primary_columns = [i for i, v in enumerate(views) if v in _PRIMARY_VIEWS]
     occluded_samples = 0
     assigned_samples = 0
     for points, sample_normals, sample_uv in _iter_surface_samples(
@@ -913,6 +926,15 @@ def refine_texture_with_references(
         # 各サンプルを、最も正対して見えるビューに割り当てる。
         dots = np.stack([sample_normals @ view_data[v][2] for v in views], axis=1)  # (S, V)
         best = np.argmax(dots, axis=1)
+
+        # 側面参照があるときは、正面・背面が十分正対している面を渡さない
+        # (顔の細部が側面参照のわずかな位置ずれで壊れるのを防ぐ)。
+        if primary_columns and len(primary_columns) < len(views):
+            primary_dots = dots[:, primary_columns]
+            primary_pick = np.asarray(primary_columns)[np.argmax(primary_dots, axis=1)]
+            keep_primary = primary_dots.max(axis=1) >= PRIMARY_VIEW_MIN_DOT_WITH_SIDES
+            best = np.where(keep_primary, primary_pick, best)
+
         best_dot = dots[np.arange(len(dots)), best]
 
         weight = _blend_weight(best_dot)
