@@ -336,6 +336,12 @@ async function checkHealth() {
     if (data.generator === "pixal3d" || data.generator === "trellis2") {
       document.getElementById("dinov3-credit").hidden = false;
     }
+    // TRELLIS.2 の既定ステップは12。hunyuan向けのUI既定(30)のまま生成すると
+    // 前髪の乱れや帽子状の幾何の幻視(後頭部の赤い輪)が出やすい(実測)。
+    if (data.generator === "trellis2") {
+      const steps = document.querySelector('input[name="steps"]');
+      if (steps && steps.value === "30") steps.value = "12";
+    }
   } catch (err) {
     console.error(err);
   }
