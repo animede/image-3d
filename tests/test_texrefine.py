@@ -614,3 +614,53 @@ def test_local_base_matching_needs_enough_anchors():
         base, refined, blend, covered, sampled, positions, normal_sums, counts
     )
     assert out is None
+
+
+# --- 背景色の抜き残し(髪の隙間)の除外 ----------------------------------------
+
+
+def _gap_test_image(gap_shape="wedge"):
+    """白背景を抜いた被写体に、不透明な白い隙間が残った参照を模す。
+
+    被写体は暗色の矩形 (髪に見立てる)。gap_shape:
+      - "wedge": 細長い白の楔 (髪の隙間 → 除外されるべき)
+      - "round": 中央奥の丸い白 (目のハイライト → 残すべき)
+    """
+    h = w = 256
+    rgb = np.zeros((h, w, 3), dtype=np.float32)
+    alpha = np.zeros((h, w), dtype=np.uint8)
+    # 透明背景 (元の背景色=白がRGBに残る)
+    rgb[:, :] = 255.0
+    # 被写体: 中央の暗色矩形
+    rgb[40:216, 40:216] = 40.0
+    alpha[40:216, 40:216] = 255
+    if gap_shape == "wedge":
+        # シルエット近くの細長い白 (2px幅 x 15px。面積上限 6e-4×256² ≒ 39px 未満)
+        rgb[50:65, 48:50] = 255.0
+    else:
+        # 奥の丸い白 (11px四方に内接する円 ≒ 充填率0.78、アスペクト1)
+        yy, xx = np.mgrid[0:h, 0:w]
+        circle = (yy - 128) ** 2 + (xx - 128) ** 2 <= 6**2
+        rgb[circle] = 255.0
+    return rgb, alpha
+
+
+def test_background_gap_wedges_are_dropped():
+    rgb, alpha = _gap_test_image("wedge")
+    mask = texrefine._background_gap_mask(rgb, alpha)
+    assert mask is not None
+    assert mask[55, 48], "髪の隙間の楔が除外されていない"
+    assert not mask[128, 128]
+
+
+def test_round_highlights_deep_inside_are_kept():
+    rgb, alpha = _gap_test_image("round")
+    mask = texrefine._background_gap_mask(rgb, alpha)
+    dropped = int(mask.sum()) if mask is not None else 0
+    assert dropped == 0, f"丸いハイライトが除外された ({dropped}px)"
+
+
+def test_background_gap_mask_needs_transparency():
+    rgb = np.full((64, 64, 3), 255.0, dtype=np.float32)
+    alpha = np.full((64, 64), 255, dtype=np.uint8)
+    assert texrefine._background_gap_mask(rgb, alpha) is None

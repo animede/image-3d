@@ -265,6 +265,26 @@ SILHOUETTE_DISAGREE_DILATE_FRACTION = 0.004  # 不一致域をこの半径(画�
 # 一致部分は使えるため)。
 SILHOUETTE_DISAGREE_WARN_FRACTION = 0.35
 
+# --- 背景色の抜き残し(髪の隙間)の除外 ------------------------------------
+# 背景除去は髪の房の**あいだの隙間**まで透過にできないことがあり、背景色
+# (白など)が不透明のまま小さな島として残る (実測: 4面の参照とも白の小島が
+# 70〜128個)。そのまま転写すると髪に白いポツが写る。
+# 「背景色に近い色 × 小さな島 × シルエット(透明領域)の近く」の3条件で
+# 信頼画素から外す。距離条件は、顔の奥にある目の白いハイライト(同じ白)を
+# 巻き込まないためのもの (髪の隙間はシルエット外縁の近くに出る)。
+# 背景色は透明画素のRGB中央値から推定する (rembg・色キーとも元の背景色を
+# RGBに残したまま alpha=0 にするため)。透明画素が無い参照では何もしない。
+BACKGROUND_GAP_TOLERANCE = 16  # 背景色とのチャンネル毎の許容差
+BACKGROUND_GAP_MAX_AREA_FRACTION = 6e-4  # 島の最大面積 (画像画素数比。2048²で~2500px)
+BACKGROUND_GAP_MAX_SILHOUETTE_DIST_FRACTION = 0.05  # シルエットからの最大距離 (長辺比)
+# 形状条件: 髪の隙間は房のあいだの**細長い楔形**、目のハイライトは**円形**。
+# 距離条件だけでは目のハイライトを巻き込む (実測: 前髪の透明な隙間が顔の
+# すぐ近くまで来ており、左目のハイライトが距離条件を満たしてしまった)。
+# 細長い (アスペクト比が高い) か、バウンディングボックスに対しスカスカ
+# (充填率が低い=楔・ギザギザ) な島だけを落とす。
+BACKGROUND_GAP_MIN_ASPECT = 2.0
+BACKGROUND_GAP_MAX_SOLIDITY = 0.45  # bbox充填率がこれ以下なら楔形とみなす
+
 # 可視性判定の深度バッファは参照画像をこの係数で縮めた格子で持つ。
 # サンプル密度はUVテクセル面積基準なので、画像解像度そのままでは
 # 疎な面にピンホール(誤って「可視」になる穴)ができる。粗くするほど
@@ -881,6 +901,49 @@ def deepen_neutral_shadows(texture: np.ndarray) -> np.ndarray:
     return texture * factor[..., None]
 
 
+def _background_gap_mask(rgb: np.ndarray, alpha: np.ndarray) -> Optional[np.ndarray]:
+    """背景色の抜き残し(髪の隙間などの不透明な背景色の小島)のマスクを返す。
+
+    定数ブロックのコメント参照。透明画素が無い(=背景色を推定できない)
+    参照では None を返す。
+    """
+    from scipy import ndimage
+
+    transparent = alpha == 0
+    if not transparent.any():
+        return None
+    bg = np.median(rgb[transparent], axis=0)
+    near_bg = (np.abs(rgb - bg[None, None, :]) <= BACKGROUND_GAP_TOLERANCE).all(axis=2)
+    near_bg &= alpha > 0
+    if not near_bg.any():
+        return None
+
+    h, w = alpha.shape
+    max_area = BACKGROUND_GAP_MAX_AREA_FRACTION * (h * w)
+    max_dist = BACKGROUND_GAP_MAX_SILHOUETTE_DIST_FRACTION * max(h, w)
+    # 各画素からシルエット(透明領域)までの距離
+    silhouette_dist = distance_transform_edt(~transparent)
+
+    labels, n = ndimage.label(near_bg)
+    if n == 0:
+        return None
+    index = range(1, n + 1)
+    sizes = ndimage.sum(near_bg, labels, index)
+    min_dist = ndimage.minimum(silhouette_dist, labels, index)
+    slices = ndimage.find_objects(labels)
+    box_h = np.array([s[0].stop - s[0].start for s in slices], dtype=np.float64)
+    box_w = np.array([s[1].stop - s[1].start for s in slices], dtype=np.float64)
+    aspect = np.maximum(box_h, box_w) / np.maximum(np.minimum(box_h, box_w), 1.0)
+    solidity = sizes / np.maximum(box_h * box_w, 1.0)
+    wedge_like = (aspect >= BACKGROUND_GAP_MIN_ASPECT) | (
+        solidity <= BACKGROUND_GAP_MAX_SOLIDITY
+    )
+    drop = (sizes <= max_area) & (min_dist <= max_dist) & wedge_like
+    if not drop.any():
+        return None
+    return drop[labels - 1] & near_bg
+
+
 def _match_base_to_reference(
     base: np.ndarray,
     refined: np.ndarray,
@@ -1129,6 +1192,15 @@ def refine_texture_with_references(
         rgb = np.asarray(image.convert("RGB"), dtype=np.float32)
         alpha = np.asarray(image.getchannel("A"), dtype=np.uint8)
         trusted = colorproc._trusted_pixel_mask(alpha)
+        gaps = _background_gap_mask(rgb, alpha)
+        if gaps is not None and gaps.any():
+            trusted = trusted & ~gaps
+            logger.info(
+                "Ignoring %d background-coloured gap pixels on the %s reference "
+                "(unpunched holes between hair strands).",
+                int(gaps.sum()),
+                view,
+            )
         view_data[view] = (rgb, trusted, np.asarray(colorproc._VIEW_NORMALS[view]), image)
 
     accum_rgb = np.zeros((h * w, 3), dtype=np.float32)
