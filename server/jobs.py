@@ -49,6 +49,37 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _assemble_refine_references(
+    image: Image.Image,
+    back_image: Optional[Image.Image],
+    refine_references: Optional[dict[str, Image.Image]],
+    extra_views: Optional[dict[str, Image.Image]],
+) -> dict[str, Image.Image]:
+    """texrefine に渡す参照画像 (view→画像) を組み立てる。
+
+    texrefine はビューごとに可視性と法線で担当範囲を決めるので、左右を
+    渡しても正面向きのテクセル(顔など)は正面参照のまま守られる。
+    前後だけだと**側面はどちらからも観測されない**(実測: 脚の側面テクセルの
+    うち参照から直接転写できたのは10.8%だけで、残りは拡散の推測)。
+
+    `refine_references` (ネイティブ解像度) があるビューはそちらを優先し、
+    無ければ前処理済み画像 (1024px) にフォールバックする。
+    """
+    refine_references = refine_references or {}
+    extra_views = extra_views or {}
+    sources: dict[str, Optional[Image.Image]] = {
+        "front": image,
+        "back": back_image,
+        "left": extra_views.get("left"),
+        "right": extra_views.get("right"),
+    }
+    return {
+        view: refine_references.get(view, fallback)
+        for view, fallback in sources.items()
+        if refine_references.get(view, fallback) is not None
+    }
+
+
 def _mesh_vertex_colors(mesh: trimesh.Trimesh) -> Optional[np.ndarray]:
     """メッシュが明示的な頂点カラー(ColorVisuals, kind='vertex')を持つ場合に返す。
 
@@ -232,23 +263,9 @@ class JobManager:
         if not job.params.get("texture_refine"):
             return painted
 
-        # texrefine はビューごとに可視性と法線で担当範囲を決めるので、左右を
-        # 渡しても正面向きのテクセル(顔など)は正面参照のまま守られる。
-        # 前後だけだと**側面はどちらからも観測されない**(実測: 脚の側面テクセルの
-        # うち参照から直接転写できたのは10.8%だけで、残りは拡散の推測)。
-        refine_references = refine_references or {}
-        extra_views = extra_views or {}
-        sources: dict[str, Optional[Image.Image]] = {
-            "front": image,
-            "back": back_image,
-            "left": extra_views.get("left"),
-            "right": extra_views.get("right"),
-        }
-        references = {
-            view: refine_references.get(view, fallback)
-            for view, fallback in sources.items()
-            if refine_references.get(view, fallback) is not None
-        }
+        references = _assemble_refine_references(
+            image, back_image, refine_references, extra_views
+        )
         try:
             # 精細化前のアトラスを保存しておく(調整・切り分け用: これがあれば
             # GPU再生成なしで texrefine だけを再実行できる)。
@@ -270,6 +287,87 @@ class JobManager:
             job.warnings.append(f"テクスチャの高解像度化に失敗し、texgenの結果をそのまま使います: {exc}")
 
         return painted
+
+    def _run_pretextured_paint(
+        self,
+        pretextured: trimesh.Trimesh,
+        processed_mesh: trimesh.Trimesh,
+        image: Image.Image,
+        job: "Job",
+        back_image: Optional[Image.Image] = None,
+        refine_references: Optional[dict[str, Image.Image]] = None,
+        extra_views: Optional[dict[str, Image.Image]] = None,
+    ) -> Optional[trimesh.Trimesh]:
+        """ジェネレータ自身のテクスチャ付きメッシュを使う paint 経路。
+
+        trellis2 のようにジェネレータがUV+テクスチャ付きメッシュを
+        `metadata["pretextured_mesh"]` で返す場合、texgen (512px天井) を
+        通さずにそれをビューア用GLBとし、`texture_refine` 指定時は既存の
+        texrefine を直接適用する (検証スパイク trellis2-hybrid-20260730 で
+        品質確認済みのハイブリッド構成)。
+
+        pretextured は生成スケールのままなので、meshproc 済みメッシュに
+        合わせてスケール・接地・センタリングする (bboxの高さ基準。両者は
+        同一の生成結果由来なので比率は一致する)。
+
+        _run_paint と同じ graceful degradation: 失敗時は None を返して
+        警告を記録し、正面/背面投影方式にフォールバックする。
+        """
+        try:
+            textured = pretextured.copy()
+            tb = textured.bounds
+            pb = processed_mesh.bounds
+            height = float(tb[1][2] - tb[0][2])
+            if height <= 0:
+                raise ValueError("テクスチャ付きメッシュの高さが0です")
+            textured.apply_scale(float(pb[1][2] - pb[0][2]) / height)
+            tb = textured.bounds
+            textured.apply_translation(
+                [
+                    (pb[0][0] + pb[1][0]) / 2 - (tb[0][0] + tb[1][0]) / 2,
+                    (pb[0][1] + pb[1][1]) / 2 - (tb[0][1] + tb[1][1]) / 2,
+                    pb[0][2] - tb[0][2],
+                ]
+            )
+        except Exception as exc:
+            logger.exception(
+                "Pretextured mesh scaling failed for job %s; falling back", job.job_id
+            )
+            job.warnings.append(
+                f"生成テクスチャの適用に失敗したため、正面/背面投影方式にフォールバックしました: {exc}"
+            )
+            return None
+
+        if not job.params.get("texture_refine"):
+            return textured
+
+        references = _assemble_refine_references(
+            image, back_image, refine_references, extra_views
+        )
+        try:
+            # 精細化前のアトラスを保存しておく (texgen経路と同じファイル名:
+            # これがあればGPU再生成なしで texrefine だけを再実行できる)。
+            raw_texture = texrefine._extract_texture_image(textured.visual)
+            if raw_texture is not None:
+                raw_texture.convert("RGB").save(job.dir_path() / "texture_texgen.png")
+        except Exception:
+            logger.exception("Could not save the pre-refinement atlas for job %s", job.job_id)
+        try:
+            stats = texrefine.refine_texture_with_references(textured, references)
+            if not stats.applied:
+                logger.warning(
+                    "Texture refinement skipped for job %s: %s", job.job_id, stats.reason
+                )
+                job.warnings.append(f"テクスチャの高解像度化を適用できませんでした: {stats.reason}")
+        except Exception as exc:
+            logger.exception(
+                "Texture refinement failed for job %s; keeping generator texture", job.job_id
+            )
+            job.warnings.append(
+                f"テクスチャの高解像度化に失敗し、生成テクスチャをそのまま使います: {exc}"
+            )
+
+        return textured
 
     # --- 永続化 -----------------------------------------------------------
     def load_history(self) -> None:
@@ -460,6 +558,12 @@ class JobManager:
                 None, self.generator.generate, processed, params, extra_views or None
             )
 
+            # ジェネレータ (trellis2) が自前のUV+テクスチャ付きメッシュを添付して
+            # いる場合は取り外しておく (meshproc へは形状+頂点カラーのみ渡す)。
+            pretextured_mesh: Optional[trimesh.Trimesh] = None
+            if isinstance(getattr(raw_mesh, "metadata", None), dict):
+                pretextured_mesh = raw_mesh.metadata.pop("pretextured_mesh", None)
+
             set_status(STATUS_POSTPROCESSING)
             processed_mesh, stats = await loop.run_in_executor(
                 None, meshproc.process, raw_mesh, params.target_height_mm, params.max_faces
@@ -490,16 +594,30 @@ class JobManager:
             # failedにせず警告を記録し、正面/背面投影方式にフォールバックする。
             textured_mesh: Optional[trimesh.Trimesh] = None
             if params.texture_mode == "paint":
-                textured_mesh = await loop.run_in_executor(
-                    None,
-                    self._run_paint,
-                    processed_mesh,
-                    processed,
-                    job,
-                    extra_views.get("back"),
-                    refine_references,
-                    extra_views,
-                )
+                if pretextured_mesh is not None:
+                    # ジェネレータ自前テクスチャ経路 (trellis2): texgen を通さない。
+                    textured_mesh = await loop.run_in_executor(
+                        None,
+                        self._run_pretextured_paint,
+                        pretextured_mesh,
+                        processed_mesh,
+                        processed,
+                        job,
+                        extra_views.get("back"),
+                        refine_references,
+                        extra_views,
+                    )
+                else:
+                    textured_mesh = await loop.run_in_executor(
+                        None,
+                        self._run_paint,
+                        processed_mesh,
+                        processed,
+                        job,
+                        extra_views.get("back"),
+                        refine_references,
+                        extra_views,
+                    )
                 job.textured = textured_mesh is not None
 
             color_mode = params.color_mode == "color4"

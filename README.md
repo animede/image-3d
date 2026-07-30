@@ -131,7 +131,7 @@ $env:IMAGE3D_PORT = "8000"
 
 | 変数 | デフォルト | 説明 |
 |---|---|---|
-| `IMAGE3D_GENERATOR` | `mock` | `mock` \| `hunyuan3d` |
+| `IMAGE3D_GENERATOR` | `mock` | `mock` \| `hunyuan3d` \| `pixal3d` \| `trellis2` |
 | `IMAGE3D_HOST` | `127.0.0.1` | バインドアドレス |
 | `IMAGE3D_PORT` | `8000` | ポート |
 | `IMAGE3D_MAX_UPLOAD_BYTES` | `20971520`(20MB) | アップロード上限 |
@@ -774,6 +774,32 @@ rig-service からは以下が得られる(詳細は rig-service の README):
   Godot 4 はそのままインポートでき、`SkeletonProfileHumanoid` の BoneMap が
   自動で埋まる(Godot 4.4.1 で検証済み)。
 - **VRM 1.0** — 上記に `VRMC_vrm` 拡張(meta + humanoid 21ボーン)を足したもの。
+
+## TRELLIS.2ジェネレータ (形状エンジンハイブリッド)
+
+`IMAGE3D_GENERATOR=trellis2` で、形状生成を **TRELLIS.2-4B**
+(microsoft/TRELLIS.2, MIT) に置き換えられる。アニメキャラで
+hunyuan3d より形状忠実度が高い(指5本の分離・髪の房・眼窩の造形。
+検証: `data/spikes/trellis2-hybrid-20260730/`、メモリ
+trellis2-hybrid-spike-verdict)。
+
+- **テクスチャは texgen (512px天井) を通らない**。TRELLIS.2 自身の
+  テクスチャ付きメッシュ (`o_voxel.postprocess.to_glb(remesh=True)`,
+  narrow-band Dual Contouring で実質閉曲面化) をそのままビューアGLBにし、
+  `texture_refine=true` なら既存の texrefine で参照画像を全解像度反映する
+  (`server/jobs.py` の `_run_pretextured_paint`)。
+- 実測 (RTX PRO 6000): 生成 ~25s (VRAM ~3.3GB) + GLB化 ~4分 (VRAM ~4.5GB、
+  うちGPU UV展開 ~226s)。
+- 前提は pixal3d と同じ: 専用venv `.venv-pixal3d` + `third_party/TRELLIS.2`。
+  `.claude/launch.json` の **image3d-server-trellis2** (port 8023) で起動する。
+  hunyuan3d サーバ (8020) と同時起動できるので、ポートで使い分ける。
+- 本物の xformers / nvdiffrast は不要:
+  `server/generators/trellis2_shims/` の互換スタブ (xformers=SDPA代替,
+  nvdiffrast=drtk転送) が import できない場合のみ自動で使われる。
+- 生成は単一画像 (front) のみ。back/left/right を付けたジョブは
+  texture_refine の参照としてのみ利用される。
+- TRELLIS.2 も画像条件付けに DINOv3 を使うため、UIに "Built with DINOv3"
+  クレジットが表示される (DINOv3 License の付帯義務)。
 
 ## リポジトリ構成
 

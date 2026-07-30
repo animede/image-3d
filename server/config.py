@@ -99,6 +99,24 @@ if PIXAL3D_RASTERIZER not in _PIXAL3D_RASTERIZER_CHOICES:
     )
 
 
+# --- TRELLIS.2 設定 (形状エンジンハイブリッド。.venv-pixal3d 前提) --------------
+# 検証スパイク data/spikes/trellis2-hybrid-20260730 の採用判断に基づく。
+# TRELLIS.2本体のリポジトリclone先 (pipインストールせずsys.path経由でimportする)
+TRELLIS2_REPO_DIR = Path(
+    os.environ.get("IMAGE3D_TRELLIS2_REPO_DIR", BASE_DIR / "third_party" / "TRELLIS.2")
+)
+# HuggingFaceリポジトリID (モデル重み ~16GB、初回実行時に自動DL)
+TRELLIS2_MODEL_PATH = os.environ.get("IMAGE3D_TRELLIS2_MODEL_PATH", "microsoft/TRELLIS.2-4B")
+# パイプライン種別 ('512' | '1024' | '1024_cascade' | '1536_cascade')。
+# スパイクの実測 (25.5s / VRAM 3.3GB / 形状忠実) は 1024_cascade。
+TRELLIS2_PIPELINE_TYPE = os.environ.get("IMAGE3D_TRELLIS2_PIPELINE_TYPE", "1024_cascade")
+# GLB化 (o_voxel.postprocess.to_glb remesh=True) のテクスチャサイズ / デシメーション目標。
+# 50万面/2048pxで to_glb 全体 ~4分 (うちUV展開 ~226s)、VRAMピーク ~4.5GB (実測)。
+TRELLIS2_TEXTURE_SIZE = int(os.environ.get("IMAGE3D_TRELLIS2_TEXTURE_SIZE", "2048"))
+TRELLIS2_DECIMATION_TARGET = int(
+    os.environ.get("IMAGE3D_TRELLIS2_DECIMATION_TARGET", "500000")
+)
+
 # --- rig-service 連携 (別リポジトリ rig-service の docs/RIG_SERVICE_PLAN.md §7 R4) ---
 # 生成済みモデルにボーンを付けてVRM化する独立サービスのベースURL
 # (例: http://127.0.0.1:8100)。**未設定ならUIに「リグ/VRM化」ボタンを出さない**。

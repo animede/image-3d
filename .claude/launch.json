@@ -49,6 +49,25 @@
       "port": 8022
     },
     {
+      "name": "image3d-server-trellis2",
+      "runtimeExecutable": "env",
+      "runtimeArgs": [
+        "IMAGE3D_GENERATOR=trellis2",
+        "IMAGE3D_RIGSVC_URL=http://127.0.0.1:8100",
+        "ATTN_BACKEND=sdpa",
+        "SPARSE_ATTN_BACKEND=xformers",
+        "SPARSE_CONV_BACKEND=flex_gemm",
+        "CUDA_HOME=/usr/local/cuda-12.8",
+        ".venv-pixal3d/bin/uvicorn",
+        "server.main:app",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8023"
+      ],
+      "port": 8023
+    },
+    {
       "name": "rig-service",
       "runtimeExecutable": "../rig-service/run.sh",
       "runtimeArgs": [],

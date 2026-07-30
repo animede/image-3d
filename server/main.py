@@ -60,6 +60,12 @@ def _build_generator():
         from .generators.pixal3d import Pixal3DGenerator
 
         return Pixal3DGenerator()
+    if name == "trellis2":
+        # TRELLIS.2も専用venv (.venv-pixal3d) 前提のため明示指定でのみ使用する
+        # (.claude/launch.json の image3d-server-trellis2 参照)。
+        from .generators.trellis2 import Trellis2Generator
+
+        return Trellis2Generator()
     raise ValueError(f"Unknown generator: {name}")
 
 
@@ -460,7 +466,10 @@ async def health():
         "generator": job_manager.generator.name,
         "python_version": platform.python_version(),
         "gpu": gpu_info,
-        "texgen_available": texture.is_available(),
+        # texgen (hy3dgen) が無くても、ジェネレータ自身がテクスチャを生成する
+        # 場合 (trellis2) は texture_mode=paint を提供できる。
+        "texgen_available": texture.is_available()
+        or getattr(job_manager.generator, "provides_texture", False),
         # 未設定(null)ならフロントは「リグ/VRM化」ボタンを出さない
         "rigsvc_url": config.RIGSVC_URL,
     }

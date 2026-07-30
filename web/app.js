@@ -328,9 +328,10 @@ async function checkHealth() {
     if (data.generator === "mock") {
       document.getElementById("mock-warning").hidden = false;
     }
-    // Pixal3Dは画像条件付けにDINOv3を使用しており、DINOv3 Licenseの付帯義務
-    // として "Built with DINOv3" の表示が求められている(README「ライセンス」節参照)。
-    if (data.generator === "pixal3d") {
+    // Pixal3D / TRELLIS.2 は画像条件付けにDINOv3を使用しており、DINOv3 License
+    // の付帯義務として "Built with DINOv3" の表示が求められている
+    // (README「ライセンス」節参照)。
+    if (data.generator === "pixal3d" || data.generator === "trellis2") {
       document.getElementById("dinov3-credit").hidden = false;
     }
   } catch (err) {
