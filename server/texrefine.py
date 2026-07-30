@@ -216,6 +216,43 @@ _PRIMARY_VIEWS = ("front", "back")
 HEAD_WIDTH_FRACTION = 0.40
 _HEAD_PROFILE_BINS = 64
 
+# --- 頭部のチャート境界処理 (2026-07-30, TRELLIS.2ハイブリッドで導入) ----------
+# o_voxel の to_glb が作るUVアトラスは微細チャートの集合で、顔だけで1000個超に
+# 分断される (実測: trellis2ジョブで顔領域1419クラスタ)。チャートごとに参照の
+# 投影・棄却が独立に決まるため、境界で色と混合率が不連続になり、目の周りの
+# 矩形の継ぎ目・顔中央の縦線として見える。対策は2つ:
+#   1. シーム調和: 「3Dでは隣接、UVでは別チャート」のテクセル対を突き合わせ、
+#      両方転写済みなら色・混合率を平均する (法線一致ガード付き。薄いシェルの
+#      表裏を誤って対にしない)。
+#   2. 片側フェザー: 混合率を min(blend, gaussian(blend)) で**下げる方向だけ**
+#      滑らかにする。上げる方向に滑らかにすると、転写できなかった(refinedが
+#      黒い)テクセルへ blend が漏れて黒が滲むため、必ず min 合成にすること。
+# どちらも頭部テクセル (head_texels, 側面参照があるときのみ) に限定し、
+# 前後2面のみの従来ジョブ (犬など) の挙動は変えない。
+HEAD_SEAM_HARMONIZE_UV_DIST = 2.0  # ガター(未サンプル域)からこのテクセル距離以内を境界とみなす
+HEAD_SEAM_MIN_UV_DIST = 4.0  # UV距離がこれ以下の対は同一チャート内の単なる隣人なので除外
+HEAD_SEAM_RADIUS_FACTOR = 2.0  # 3D対応付け半径 = 境界テクセルの典型間隔 × この係数
+HEAD_SEAM_NORMAL_DOT = 0.5  # 法線の向きがこれ以上一致する対だけ平均する
+HEAD_BLEND_FEATHER_SIGMA = 3.0  # 片側フェザーのガウスσ(テクセル)
+
+# --- 元テクスチャの色調合わせ (match_base_colors, trellis2 経路) --------------
+# 転写できたテクセル (アンカー) では「元色→参照色」の差分が取れる。この差分を
+# **3D空間の近傍**から距離加重で補間し、転写できなかったテクセル (目のくぼみ・
+# 鼻の脇など遮蔽棄却された凹み) の元色に足す。目のくぼみは周囲の頬から、
+# 髪は隣の髪から補正を受ける。
+# グローバルな変換 (アフィン/トーンカーブLUT) は不採用: 値→値の写像が一意で
+# ない (実測: 元が明るい画素の対応先が白い服と黒い脚に割れ、アフィンは
+# scale 0.33 へ発散、LUTは227階調の移動を要求) ため、必ず局所で行うこと。
+# アトラス空間での平滑化も不可 (チャートが微細に分断され、隣のチャートは
+# 3Dでは無関係な部位のため)。
+BASE_MATCH_MIN_BLEND = 0.6  # アンカーに使う最小混合率
+BASE_MATCH_MIN_PAIRS = 5_000  # アンカーがこれ未満なら無補正
+BASE_MATCH_MAX_ANCHORS = 300_000  # KD木に載せるアンカー上限 (超過は無作為抽出)
+BASE_MATCH_NEIGHBORS = 8  # 補間に使う近傍アンカー数
+BASE_MATCH_RADIUS_FACTOR = 8.0  # 有効半径 = アンカー典型間隔 × この係数
+BASE_MATCH_NORMAL_DOT = 0.3  # 法線がこれ以上一致するアンカーだけ使う (薄シェル表裏の混入防止)
+BASE_MATCH_MAX_SHIFT = 96.0  # 補正量の上限 (チャンネル毎、階調)
+
 # --- シルエット不一致ガード(ポーズ違いの参照を安全に使う) ------------------
 # 側面参照は、Tポーズのままだと腕がカメラ方向へ伸びて胴の側面を隠すため、
 # 生成側で**腕を前へ出した**姿勢にせざるを得ない。すると腕だけメッシュ(Tポーズ)と
@@ -844,9 +881,190 @@ def deepen_neutral_shadows(texture: np.ndarray) -> np.ndarray:
     return texture * factor[..., None]
 
 
+def _match_base_to_reference(
+    base: np.ndarray,
+    refined: np.ndarray,
+    blend: np.ndarray,
+    covered_2d: np.ndarray,
+    sampled_2d: np.ndarray,
+    positions: np.ndarray,
+    normal_sums: np.ndarray,
+    counts: np.ndarray,
+) -> Optional[np.ndarray]:
+    """元テクスチャの色調を、3D近傍の転写済みテクセルの差分で局所補正する。
+
+    定数ブロックのコメント参照。戻り値は補正済み base (アンカー不足なら None)。
+    """
+    from scipy.spatial import cKDTree
+
+    h, w = blend.shape
+    counts_2d = counts.reshape(h, w)
+    strong = covered_2d & (blend >= BASE_MATCH_MIN_BLEND) & (counts_2d > 0)
+    n_anchors = int(strong.sum())
+    if n_anchors < BASE_MATCH_MIN_PAIRS:
+        return None
+    targets_mask = sampled_2d & ~strong
+    if not targets_mask.any():
+        return None
+
+    pos = positions.reshape(h, w, 3)
+    nrm = normal_sums.reshape(h, w, 3)
+
+    def _texel_data(mask):
+        ys, xs = np.where(mask)
+        c = counts_2d[ys, xs]
+        p = pos[ys, xs] / c[:, None]
+        n = nrm[ys, xs]
+        n = n / np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-9)
+        return ys, xs, p, n
+
+    a_ys, a_xs, a_pos, a_nrm = _texel_data(strong)
+    diff = refined[a_ys, a_xs] - base[a_ys, a_xs]
+    if n_anchors > BASE_MATCH_MAX_ANCHORS:
+        rng = np.random.default_rng(0)
+        pick = rng.choice(n_anchors, size=BASE_MATCH_MAX_ANCHORS, replace=False)
+        a_pos, a_nrm, diff = a_pos[pick], a_nrm[pick], diff[pick]
+
+    tree = cKDTree(a_pos)
+    sample = a_pos[:: max(1, len(a_pos) // 10_000)]
+    nn_dist, _ = tree.query(sample, k=2)
+    spacing = float(np.median(nn_dist[:, 1]))
+    if spacing <= 0.0:
+        return None
+    radius = spacing * BASE_MATCH_RADIUS_FACTOR
+
+    t_ys, t_xs, t_pos, t_nrm = _texel_data(targets_mask)
+    dists, idx = tree.query(
+        t_pos, k=BASE_MATCH_NEIGHBORS, distance_upper_bound=radius
+    )
+    valid = np.isfinite(dists)
+    idx_safe = np.where(valid, idx, 0)
+    # 薄いシェルの表裏 (3Dでは近いが逆向き) のアンカーは使わない
+    dot = (a_nrm[idx_safe] * t_nrm[:, None, :]).sum(axis=2)
+    valid &= dot >= BASE_MATCH_NORMAL_DOT
+    weight = np.where(valid, 1.0 / np.maximum(dists, spacing * 0.25), 0.0)
+    total = weight.sum(axis=1)
+    has_support = total > 0.0
+    if not has_support.any():
+        return None
+    correction = np.einsum("tk,tkc->tc", weight, diff[idx_safe])
+    correction[has_support] /= total[has_support, None]
+    correction[~has_support] = 0.0
+    # 補正の届く範囲の**外縁だけ**柔らかく落とす (半径の70%までは全強度。
+    # 距離0から線形に落とすと凹みの中心で補正が半減し、残像が出る)。
+    nearest = np.where(valid, dists, np.inf).min(axis=1)
+    feather = np.clip((radius - nearest) / (0.3 * radius), 0.0, 1.0)
+    correction *= feather[:, None]
+    correction = np.clip(correction, -BASE_MATCH_MAX_SHIFT, BASE_MATCH_MAX_SHIFT)
+
+    matched = base.copy()
+    matched[t_ys, t_xs] = np.clip(base[t_ys, t_xs] + correction, 0.0, 255.0)
+    logger.info(
+        "Locally matched the base texture tone to the references: %d of %d "
+        "uncovered texels corrected from %d anchors (mean |shift| %.1f levels).",
+        int(has_support.sum()),
+        len(t_ys),
+        len(a_pos),
+        float(np.abs(correction[has_support]).mean()) if has_support.any() else 0.0,
+    )
+    return matched
+
+
+def _harmonize_chart_seams(
+    refined: np.ndarray,
+    blend: np.ndarray,
+    positions: np.ndarray,
+    normal_sums: np.ndarray,
+    counts: np.ndarray,
+    covered_2d: np.ndarray,
+    region: np.ndarray,
+) -> float:
+    """チャート境界をまたいで、同じ3D位置に対応するテクセルの色・混合率を揃える。
+
+    微細チャートのアトラス(o_voxel to_glb)では、3Dで隣接する面がUV上の離れた
+    チャートに割れており、参照投影のわずかな位相差が境界の線になる。
+    ガター(未サンプル域)に接する転写済みテクセルを3D位置でKD木対応付けし、
+    対応グループの平均に置き換える。書き換えは `region`(頭部)かつ転写済み
+    (covered)のテクセルのみ。
+
+    Args:
+        refined: (h, w, 3) 転写色。**その場で**書き換える。
+        blend: (h, w) 混合率。**その場で**書き換える。
+        positions: (h*w, 3) テクセルに落ちたサンプル3D座標の合計。
+        normal_sums: (h*w, 3) 同・法線の合計。
+        counts: (h*w,) 同・サンプル数。
+        covered_2d: (h, w) 参照から転写できたテクセル。
+        region: (h, w) 処理対象領域(頭部テクセル)。
+
+    Returns:
+        調和したテクセルの数(観測用)。
+    """
+    from scipy.spatial import cKDTree
+
+    h, w = blend.shape
+    counts_2d = counts.reshape(h, w)
+    gutter = counts_2d == 0
+    if not gutter.any():
+        return 0.0
+    distance = distance_transform_edt(~gutter)
+    boundary = covered_2d & region & (distance <= HEAD_SEAM_HARMONIZE_UV_DIST)
+    ys, xs = np.where(boundary)
+    if len(ys) < 2:
+        return 0.0
+
+    flat = ys * w + xs
+    pos = positions[flat] / counts[flat, None]
+    nrm = normal_sums[flat]
+    norm = np.linalg.norm(nrm, axis=1, keepdims=True)
+    nrm = nrm / np.maximum(norm, 1e-9)
+
+    tree = cKDTree(pos)
+    # 境界テクセルの典型3D間隔(正の最近傍距離の中央値)を対応付け半径の基準に
+    # する。別チャートの対応点が**完全に同一座標**のこともある(最近傍距離0)ため、
+    # 0は除いて測る。全対応が同一座標なら極小半径で同一点対だけを拾う。
+    nn_dist, _ = tree.query(pos, k=2)
+    positive = nn_dist[:, 1][nn_dist[:, 1] > 0.0]
+    spacing = float(np.median(positive)) if positive.size else 0.0
+    radius = spacing * HEAD_SEAM_RADIUS_FACTOR if spacing > 0.0 else 1e-9
+    pairs = tree.query_pairs(radius, output_type="ndarray")
+    if len(pairs) == 0:
+        return 0.0
+
+    # 同一チャート内の単なる隣人(UVでも近い)は除外し、薄いシェルの表裏を
+    # 誤って対にしないよう法線の一致を要求する。
+    uv_dist = np.hypot(
+        ys[pairs[:, 0]].astype(np.float32) - ys[pairs[:, 1]].astype(np.float32),
+        xs[pairs[:, 0]].astype(np.float32) - xs[pairs[:, 1]].astype(np.float32),
+    )
+    dot = (nrm[pairs[:, 0]] * nrm[pairs[:, 1]]).sum(axis=1)
+    pairs = pairs[(uv_dist > HEAD_SEAM_MIN_UV_DIST) & (dot >= HEAD_SEAM_NORMAL_DOT)]
+    if len(pairs) == 0:
+        return 0.0
+
+    rgb = refined[ys, xs]
+    bl = blend[ys, xs]
+    sum_rgb = rgb.copy()
+    sum_blend = bl.copy()
+    count = np.ones(len(ys), dtype=np.float32)
+    i0, i1 = pairs[:, 0], pairs[:, 1]
+    np.add.at(sum_rgb, i0, rgb[i1])
+    np.add.at(sum_rgb, i1, rgb[i0])
+    np.add.at(sum_blend, i0, bl[i1])
+    np.add.at(sum_blend, i1, bl[i0])
+    np.add.at(count, i0, 1.0)
+    np.add.at(count, i1, 1.0)
+
+    touched = count > 1.0
+    refined[ys[touched], xs[touched]] = sum_rgb[touched] / count[touched, None]
+    blend[ys[touched], xs[touched]] = sum_blend[touched] / count[touched]
+    return float(touched.sum())
+
+
 def refine_texture_with_references(
     mesh: trimesh.Trimesh,
     references: dict[str, Image.Image],
+    *,
+    match_base_colors: bool = False,
 ) -> RefineStats:
     """texgen 済みメッシュのテクスチャを、参照画像の全解像度で上書きする。
 
@@ -855,6 +1073,13 @@ def refine_texture_with_references(
     Args:
         mesh: UV とテクスチャを持つ texgen の出力。Z-up・正面が -Y。
         references: ビュー名(`colorproc.VIEW_NAMES`)-> 背景除去済み参照画像。
+        match_base_colors: 元テクスチャの色調を、転写できたテクセルの
+            「元色→参照色」対応から推定したチャンネル毎のアフィン変換で
+            参照側に合わせる。TRELLIS.2 の自前テクスチャは参照より彩度が
+            くすむため、遮蔽などで転写できず元テクスチャが残る領域
+            (目のくぼみ・鼻の脇の凹み)が色調差の「箱」として見える。
+            色調を揃えればこの境界は消える (trellis2 経路で有効化。
+            texgen (delight済み) の経路は従来どおり無補正)。
 
     Returns:
         RefineStats。適用できなかった場合は `applied=False` と `reason`。
@@ -983,6 +1208,10 @@ def refine_texture_with_references(
             float(np.asarray(mesh.vertices)[:, 2].max()),
         )
     head_texels = np.zeros((h, w), dtype=bool) if has_sides else None
+    # 頭部のシーム調和用: テクセルごとの3D位置・法線の平均を取るための累積
+    # (has_sides のときのみ確保。50MB×2 程度)。
+    accum_pos = np.zeros((h * w, 3), dtype=np.float32) if has_sides else None
+    accum_nrm = np.zeros((h * w, 3), dtype=np.float32) if has_sides else None
     occluded_samples = 0
     assigned_samples = 0
     for points, sample_normals, sample_uv in _iter_surface_samples(
@@ -991,6 +1220,9 @@ def refine_texture_with_references(
         tx = np.clip(sample_uv[:, 0].astype(np.int64), 0, w - 1)
         ty = np.clip(sample_uv[:, 1].astype(np.int64), 0, h - 1)
         flat = ty * w + tx
+        if accum_pos is not None:
+            np.add.at(accum_pos, flat, points.astype(np.float32))
+            np.add.at(accum_nrm, flat, sample_normals.astype(np.float32))
 
         # 各サンプルを、最も正対して見えるビューに割り当てる。
         dots = np.stack([sample_normals @ view_data[v][2] for v in views], axis=1)  # (S, V)
@@ -1055,6 +1287,23 @@ def refine_texture_with_references(
     blend = blend.reshape(h, w)
     covered_2d = covered.reshape(h, w)
 
+    # 元テクスチャの色調を参照に合わせる (trellis2 経路のみ。定数ブロック参照)。
+    # 以降の拡散シード・最終混合はすべて補正済みの base を使う。
+    # 3D位置の累積 (accum_pos) が必要なため側面参照ありのジョブに限られる。
+    if match_base_colors and accum_pos is not None:
+        matched_base = _match_base_to_reference(
+            base,
+            refined,
+            blend,
+            covered_2d,
+            accum_count.reshape(h, w) > 0,
+            accum_pos,
+            accum_nrm,
+            accum_count,
+        )
+        if matched_base is not None:
+            base = matched_base
+
     # 取りこぼしと UV チャート外周を、最近傍の上書き済みテクセルで埋める。
     # 埋めないとバイリニア補間がチャート外の texgen 色を拾って継ぎ目になる。
     # ただし「サンプルは届いたが遮蔽/フチで棄却された」テクセル(count>0,
@@ -1092,6 +1341,31 @@ def refine_texture_with_references(
     from scipy.ndimage import median_filter
 
     blend = median_filter(blend, size=3)
+
+    # 頭部のチャート境界処理 (定数ブロックのコメント参照):
+    # シーム調和(3D対応するチャート境界テクセルの色・混合率を平均)のあと、
+    # 混合率を下げる方向にだけフェザーして、参照/texgen の切り替わりの
+    # 矩形の縁を柔らかくする。min 合成なので黒滲みは構造的に起きない。
+    if head_texels is not None and head_texels.any():
+        harmonized = _harmonize_chart_seams(
+            refined,
+            blend,
+            accum_pos,
+            accum_nrm,
+            accum_count,
+            covered_2d,
+            head_texels,
+        )
+        from scipy.ndimage import gaussian_filter
+
+        feathered = gaussian_filter(blend, sigma=HEAD_BLEND_FEATHER_SIGMA)
+        blend = np.where(head_texels, np.minimum(blend, feathered), blend)
+        logger.info(
+            "Head chart-seam treatment: harmonized %d boundary texels, feathered "
+            "the blend map (sigma %.1f).",
+            int(harmonized),
+            HEAD_BLEND_FEATHER_SIGMA,
+        )
 
     result = base * (1.0 - blend[..., None]) + refined * blend[..., None]
     result = deepen_neutral_shadows(result)

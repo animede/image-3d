@@ -497,3 +497,120 @@ def test_side_views_are_not_used_above_the_head_base():
     # 頭の真横は側面を使わない。転写されず texgen(無彩色)のまま残ってよい。
     above_rgb = colors[above].mean(axis=0)
     assert above_rgb[1] <= above_rgb[0] + 10, f"頭に側面(緑)が使われている: {above_rgb}"
+
+
+# --- 頭部のチャート境界処理と局所色補正 (trellis2 経路, 2026-07-30) ------------
+
+
+def test_harmonize_chart_seams_averages_texels_at_the_same_3d_spot():
+    """3Dでは同じ場所・UVでは別チャートの境界テクセルの色と混合率が揃うこと。"""
+    h = w = 32
+    refined = np.zeros((h, w, 3), dtype=np.float32)
+    blend = np.zeros((h, w), dtype=np.float32)
+    counts = np.zeros(h * w, dtype=np.float32)
+    positions = np.zeros((h * w, 3), dtype=np.float32)
+    normal_sums = np.zeros((h * w, 3), dtype=np.float32)
+    covered = np.zeros((h, w), dtype=bool)
+    region = np.ones((h, w), dtype=bool)
+
+    # チャートA: (2..5, 2..5) / チャートB: (2..5, 20..23)。同じ3D帯を指す。
+    for bx, colour, bl in [(2, 200.0, 1.0), (20, 100.0, 0.5)]:
+        for y in range(2, 6):
+            for x in range(bx, bx + 4):
+                flat = y * w + x
+                counts[flat] = 1.0
+                positions[flat] = (float(y), float(x - bx), 0.0)  # 3Dで一致
+                normal_sums[flat] = (0.0, 0.0, 1.0)
+                refined[y, x] = colour
+                blend[y, x] = bl
+                covered[y, x] = True
+
+    touched = texrefine._harmonize_chart_seams(
+        refined, blend, positions, normal_sums, counts, covered, region
+    )
+    assert touched > 0
+    # 対応する両側とも平均 (150, 0.75) に寄る
+    assert refined[3, 3, 0] == pytest.approx(150.0, abs=1.0)
+    assert refined[3, 21, 0] == pytest.approx(150.0, abs=1.0)
+    assert blend[3, 3] == pytest.approx(0.75, abs=0.01)
+
+
+def test_harmonize_chart_seams_keeps_opposite_facing_sheets_apart():
+    """薄いシェルの表裏 (3Dで近接・法線が逆) は平均しないこと。"""
+    h = w = 32
+    refined = np.zeros((h, w, 3), dtype=np.float32)
+    blend = np.zeros((h, w), dtype=np.float32)
+    counts = np.zeros(h * w, dtype=np.float32)
+    positions = np.zeros((h * w, 3), dtype=np.float32)
+    normal_sums = np.zeros((h * w, 3), dtype=np.float32)
+    covered = np.zeros((h, w), dtype=bool)
+    region = np.ones((h, w), dtype=bool)
+
+    for bx, colour, nz in [(2, 200.0, 1.0), (20, 100.0, -1.0)]:
+        for y in range(2, 6):
+            for x in range(bx, bx + 4):
+                flat = y * w + x
+                counts[flat] = 1.0
+                positions[flat] = (float(y), float(x - bx), 0.0)
+                normal_sums[flat] = (0.0, 0.0, nz)
+                refined[y, x] = colour
+                blend[y, x] = 1.0
+                covered[y, x] = True
+
+    texrefine._harmonize_chart_seams(
+        refined, blend, positions, normal_sums, counts, covered, region
+    )
+    assert refined[3, 3, 0] == pytest.approx(200.0, abs=1.0), "表裏が混ざった"
+    assert refined[3, 21, 0] == pytest.approx(100.0, abs=1.0), "表裏が混ざった"
+
+
+def test_local_base_matching_corrects_uncovered_from_3d_neighbours():
+    """未転写テクセルの元色が、3D近傍アンカーの「参照-元」差分で補正されること。"""
+    h = w = 128
+    rng = np.random.default_rng(0)
+    base = np.full((h, w, 3), 100.0, dtype=np.float32)
+    refined = np.zeros((h, w, 3), dtype=np.float32)
+    blend = np.zeros((h, w), dtype=np.float32)
+    counts = np.zeros(h * w, dtype=np.float32)
+    positions = np.zeros((h * w, 3), dtype=np.float32)
+    normal_sums = np.zeros((h * w, 3), dtype=np.float32)
+    covered = np.zeros((h, w), dtype=bool)
+
+    # アンカー: ほぼ全面。3D位置はUVと一致する平面。参照は base+50。
+    hole = (slice(60, 68), slice(60, 68))
+    for y in range(h):
+        for x in range(w):
+            flat = y * w + x
+            counts[flat] = 1.0
+            positions[flat] = (float(y), float(x), 0.0)
+            normal_sums[flat] = (0.0, 0.0, 1.0)
+    covered[:, :] = True
+    covered[hole] = False
+    blend[covered] = 1.0
+    refined[covered] = 150.0
+    sampled = np.ones((h, w), dtype=bool)
+
+    matched = texrefine._match_base_to_reference(
+        base, refined, blend, covered, sampled, positions, normal_sums, counts
+    )
+    assert matched is not None
+    # 穴の中心は周囲の差分 (+50) で補正される
+    assert matched[63, 63, 0] == pytest.approx(150.0, abs=8.0)
+    # 転写済みテクセルの base は触らない
+    assert matched[10, 10, 0] == pytest.approx(100.0, abs=0.1)
+
+
+def test_local_base_matching_needs_enough_anchors():
+    h = w = 16
+    base = np.full((h, w, 3), 100.0, dtype=np.float32)
+    refined = np.zeros((h, w, 3), dtype=np.float32)
+    blend = np.zeros((h, w), dtype=np.float32)
+    counts = np.ones(h * w, dtype=np.float32)
+    positions = np.zeros((h * w, 3), dtype=np.float32)
+    normal_sums = np.tile(np.array([0.0, 0.0, 1.0], dtype=np.float32), (h * w, 1))
+    covered = np.zeros((h, w), dtype=bool)
+    sampled = np.ones((h, w), dtype=bool)
+    out = texrefine._match_base_to_reference(
+        base, refined, blend, covered, sampled, positions, normal_sums, counts
+    )
+    assert out is None

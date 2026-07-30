@@ -353,7 +353,12 @@ class JobManager:
         except Exception:
             logger.exception("Could not save the pre-refinement atlas for job %s", job.job_id)
         try:
-            stats = texrefine.refine_texture_with_references(textured, references)
+            # match_base_colors: TRELLIS.2 の自前テクスチャは参照より彩度が
+            # くすむため、色調を参照へ合わせる (遮蔽で転写できない領域が
+            # 色調差の「箱」として見えるのを防ぐ。texrefine の定数ブロック参照)。
+            stats = texrefine.refine_texture_with_references(
+                textured, references, match_base_colors=True
+            )
             if not stats.applied:
                 logger.warning(
                     "Texture refinement skipped for job %s: %s", job.job_id, stats.reason

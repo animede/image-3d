@@ -88,6 +88,8 @@ const extraViewFiles = { back: null, left: null, right: null };
 let sheetPanels = [];
 
 const viewer = new Viewer(viewerCanvas);
+// デバッグ用: コンソール/自動検証からカメラ操作できるように公開する(挙動には無関係)。
+window.viewer = viewer;
 
 // --- ファイル選択 / ドラッグ&ドロップ ---------------------------------------
 dropzone.addEventListener("click", () => fileInput.click());

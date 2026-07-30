@@ -324,6 +324,24 @@ class Trellis2Generator(Generator):
             trimesh.transformations.rotation_matrix(math.pi / 2, [1, 0, 0])
         )
 
+        # UVチャート境界の複製頂点間で法線を統一する。to_glb のチャートは
+        # ボクセル格子に沿って細かく分割され、頂点の44%が境界の複製になる。
+        # 複製ごとに法線が食い違う (実測: グループ内で中央値27.7°、90%点87.5°)
+        # ため、そのままだと顔一面にチャート境界のシェーディング段差が出る。
+        self._unify_seam_normals(textured)
+
+        # metallic/roughness テクスチャは捨てて完全拡散にする。TRELLIS.2 は
+        # 自前の特徴位置 (目など) に艶を焼くが、texrefine は baseColor しか
+        # 上書きしないため、参照から転写した目と艶の位置がずれて「灰色の矩形」
+        # として浮く (実測: 目の周りの箱の正体。環境マップの無いビューアでは
+        # metallic 面はベース色に関わらず灰色に沈む)。アニメ調キャラの参照は
+        # 拡散色なので、艶を落とすほうが忠実になる。
+        material = getattr(textured.visual, "material", None)
+        if material is not None and hasattr(material, "metallicRoughnessTexture"):
+            material.metallicRoughnessTexture = None
+            material.metallicFactor = 0.0
+            material.roughnessFactor = 1.0
+
         # meshproc 用の戻り値: テクスチャから頂点カラー化し、UVアトラス境界の
         # 頂点複製を位置ベースで溶接する (浮遊小部品除去が本体を削らないため。
         # pixal3d の実測: 溶接で数万成分 → 主要1成分に復元)。
@@ -341,6 +359,47 @@ class Trellis2Generator(Generator):
         # meshproc 済みメッシュに合わせて行う)。
         mesh.metadata[PRETEXTURED_MESH_KEY] = textured
         return mesh
+
+    @staticmethod
+    def _unify_seam_normals(mesh: trimesh.Trimesh) -> None:
+        """位置が同じ複製頂点 (UVチャート境界) の法線を面積重み付き平均で揃える。
+
+        薄いシェル (髪・服) の表裏は同じ位置に**逆向き**の頂点が重なるため、
+        単純平均すると法線が潰れる。グループ平均と逆を向くメンバーは平均から
+        除外し、その頂点自身も元の法線を保つ。メッシュは**その場で**書き換える。
+        """
+        vertices = np.asarray(mesh.vertices)
+        faces = np.asarray(mesh.faces)
+        scale = float(np.linalg.norm(mesh.extents)) or 1.0
+        key = np.round(vertices / (scale * 1e-6)).astype(np.int64)
+        _, inverse = np.unique(key, axis=0, return_inverse=True)
+
+        # 頂点ごとの面積重み付き法線 (隣接面の合計)
+        face_normal = mesh.face_normals * mesh.area_faces[:, None]
+        per_vertex = np.zeros_like(vertices)
+        np.add.at(per_vertex, faces.ravel(), np.repeat(face_normal, 3, axis=0))
+
+        # 1回目: グループ平均で主方向を決める
+        n_groups = int(inverse.max()) + 1
+        group_sum = np.zeros((n_groups, 3))
+        np.add.at(group_sum, inverse, per_vertex)
+        group_dir = group_sum / np.maximum(
+            np.linalg.norm(group_sum, axis=1, keepdims=True), 1e-12
+        )
+
+        # 2回目: 主方向と同じ向きのメンバーだけで平均し直す (裏面を混ぜない)
+        agree = (per_vertex * group_dir[inverse]).sum(axis=1) > 0.0
+        group_sum2 = np.zeros((n_groups, 3))
+        np.add.at(group_sum2, inverse[agree], per_vertex[agree])
+        group_dir2 = group_sum2 / np.maximum(
+            np.linalg.norm(group_sum2, axis=1, keepdims=True), 1e-12
+        )
+
+        own = per_vertex / np.maximum(
+            np.linalg.norm(per_vertex, axis=1, keepdims=True), 1e-12
+        )
+        unified = np.where(agree[:, None], group_dir2[inverse], own)
+        mesh.vertex_normals = unified
 
     @staticmethod
     def _to_textured_trimesh(raw: Any) -> trimesh.Trimesh:
