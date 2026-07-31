@@ -703,7 +703,7 @@ def _interior_fixture():
     refined = np.zeros((h, w, 3), dtype=np.float32)
     blend = np.zeros((h, w), dtype=np.float32)
     covered = np.zeros((h, w), dtype=bool)
-    sampled = np.zeros((h, w), dtype=bool)
+    blocked = np.zeros((h, w), dtype=bool)
     counts = np.zeros(h * w, dtype=np.float32)
     positions = np.zeros((h * w, 3), dtype=np.float32)
     normal_sums = np.zeros((h * w, 3), dtype=np.float32)
@@ -715,7 +715,6 @@ def _interior_fixture():
             counts[f] = 1.0
             positions[f] = (float(y), float(x), 0.0)
             normal_sums[f] = (0, 0, 1)
-            sampled[y, x] = True
             covered[y, x] = True
             blend[y, x] = 1.0
             refined[y, x] = (40.0, 180.0, 200.0)  # 青(シャツ)
@@ -727,15 +726,15 @@ def _interior_fixture():
             counts[f] = 1.0
             positions[f] = (float(y - 36), float(x), -2.0)
             normal_sums[f] = (0, 0, 1)
-            sampled[y, x] = True
+            blocked[y, x] = True  # 遮蔽の証拠あり(=外側の面に覆われている)
             base[y, x] = (230.0, 120.0, 30.0)  # オレンジ(生成器の隠れ面)
-    return base, refined, blend, covered, sampled, positions, normal_sums, counts
+    return base, refined, blend, covered, blocked, positions, normal_sums, counts
 
 
 def test_hidden_interiors_inherit_covering_surface_colour():
-    base, refined, blend, covered, sampled, positions, normal_sums, counts = _interior_fixture()
+    base, refined, blend, covered, blocked, positions, normal_sums, counts = _interior_fixture()
     painted = texrefine._paint_hidden_interiors(
-        base, refined, blend, covered, sampled, positions, normal_sums, counts, None
+        base, refined, blend, covered, blocked, positions, normal_sums, counts, None
     )
     assert painted > 0
     # 隠れ面はシャツの青に寄る(完全一致でなく HIDDEN_INTERIOR_BLEND の割合)
@@ -746,11 +745,26 @@ def test_hidden_interiors_inherit_covering_surface_colour():
 
 
 def test_hidden_interiors_respect_head_exclusion():
-    base, refined, blend, covered, sampled, positions, normal_sums, counts = _interior_fixture()
+    base, refined, blend, covered, blocked, positions, normal_sums, counts = _interior_fixture()
     head = np.zeros(base.shape[:2], dtype=bool)
     head[36:, :] = True  # 隠れ面をすべて頭扱いにする
     painted = texrefine._paint_hidden_interiors(
-        base, refined, blend, covered, sampled, positions, normal_sums, counts, head
+        base, refined, blend, covered, blocked, positions, normal_sums, counts, head
+    )
+    assert painted == 0
+    assert base[50, 32, 0] == pytest.approx(230.0)
+
+
+def test_visible_rejected_texels_are_not_painted():
+    """遮蔽の証拠が無い未転写テクセル(斜め棄却などの可視面)は塗らない。
+
+    これを塗ると、脇のアクセント色がシャツ側面へ流れてマゼンタの汚れになる
+    (実測でシャツ帯のマゼンタが倍増した回帰)。
+    """
+    base, refined, blend, covered, blocked, positions, normal_sums, counts = _interior_fixture()
+    blocked[:, :] = False  # 遮蔽の証拠なし = ただの棄却(可視)
+    painted = texrefine._paint_hidden_interiors(
+        base, refined, blend, covered, blocked, positions, normal_sums, counts, None
     )
     assert painted == 0
     assert base[50, 32, 0] == pytest.approx(230.0)

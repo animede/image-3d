@@ -258,10 +258,14 @@ BASE_MATCH_MAX_SHIFT = 96.0  # 補正量の上限 (チャンネル毎、階調)
 # 独自の色(実測: オレンジ)を塗る。静止時は不可視だが、リグでポーズを付けると
 # 数mmの層ずれで覗き、「衣装の色が変わった」ように見える(rig-service側の
 # ウェイト対策後も残る数mmは原理的に消せない)。
-# 対策: **全ビューで遮蔽棄却されたテクセル**(=静止時に見えない面)の元色を、
-# 3D近傍で同じ向きの転写済みアンカー(=それを覆っている表面)の**転写色そのもの**
-# へ寄せる。「服の裏は服の色」にしておけば、覗いても目立たない。
+# 対策: **遮蔽の証拠があるテクセル**(まともな角度でビューに割り当てられたのに
+# 深度バッファで遮られたもの=静止時に見えない面)の元色を、3D近傍で同じ向きの
+# 転写済みアンカー(=それを覆っている表面)の**転写色そのもの**へ寄せる。
+# 「服の裏は服の色」にしておけば、覗いても目立たない。
 # 通常の局所色補正(差分の伝播)より広い半径で、色を直接ブレンドする点が違う。
+# **「未転写」だけを条件にしてはならない**: 斜め棄却・内容ずれガード棄却の面は
+# 静止時に**見えている**ので、塗ると脇のアクセント色がシャツ側面へ流れて
+# マゼンタの汚れになる(実測: シャツ帯のマゼンタが51,785→93,916テクセルに倍増)。
 # 頭部には適用しない(前髪下の額に髪色が付くと、下から覗いた時に破綻する)。
 HIDDEN_INTERIOR_RADIUS_FACTOR = 40.0  # 半径 = アンカー典型間隔 × この係数
 HIDDEN_INTERIOR_NORMAL_DOT = 0.3  # 覆っている面と同じ向きのアンカーだけ使う
@@ -1064,13 +1068,13 @@ def _paint_hidden_interiors(
     refined: np.ndarray,
     blend: np.ndarray,
     covered_2d: np.ndarray,
-    sampled_2d: np.ndarray,
+    blocked_2d: np.ndarray,
     positions: np.ndarray,
     normal_sums: np.ndarray,
     counts: np.ndarray,
     head_texels: Optional[np.ndarray],
 ) -> int:
-    """全ビューで遮蔽されたテクセルへ、覆っている表面の転写色を継承させる。
+    """遮蔽の証拠があるテクセルへ、覆っている表面の転写色を継承させる。
 
     定数ブロック (HIDDEN_INTERIOR_*) のコメント参照。base を**その場で**
     書き換え、継承したテクセル数を返す。
@@ -1080,8 +1084,9 @@ def _paint_hidden_interiors(
     h, w = blend.shape
     counts_2d = counts.reshape(h, w)
     anchors_mask = covered_2d & (blend >= BASE_MATCH_MIN_BLEND) & (counts_2d > 0)
-    # 対象: サンプルは届いたが1ビューからも転写されなかった面 (=静止時に不可視)
-    targets_mask = sampled_2d & ~covered_2d
+    # 対象: 転写されず、かつ**遮蔽された割り当てサンプルを持つ**面のみ
+    # (=静止時に不可視。斜め棄却だけの可視面を塗ってはならない: 定数コメント参照)
+    targets_mask = blocked_2d & ~covered_2d
     if head_texels is not None:
         targets_mask &= ~head_texels
     if not anchors_mask.any() or not targets_mask.any():
@@ -1392,6 +1397,8 @@ def refine_texture_with_references(
     # (has_sides のときのみ確保。50MB×2 程度)。
     accum_pos = np.zeros((h * w, 3), dtype=np.float32) if has_sides else None
     accum_nrm = np.zeros((h * w, 3), dtype=np.float32) if has_sides else None
+    # 遮蔽の証拠 (深度バッファに遮られた割り当てサンプル数)。隠れ面の色継承用。
+    accum_blocked = np.zeros(h * w, dtype=np.float32) if has_sides else None
     occluded_samples = 0
     assigned_samples = 0
     for points, sample_normals, sample_uv in _iter_surface_samples(
@@ -1441,6 +1448,11 @@ def refine_texture_with_references(
             visibility = depth_buffers[view].visibility(points[sel], px, py)
             assigned_samples += int(sel.sum())
             occluded_samples += int((visibility <= 0.0).sum())
+            if accum_blocked is not None:
+                # 遮蔽の証拠を記録 (隠れ面の色継承の対象判定に使う)
+                blocked_local = np.flatnonzero(sel)[visibility <= 0.0]
+                if len(blocked_local):
+                    np.add.at(accum_blocked, flat[blocked_local], 1.0)
             # フチ・透明画素に落ちたサンプルも信用しない(黒筋の原因)。
             ok = trusted[py, px] & (visibility > 0.0)
             if view not in _PRIMARY_VIEWS:
@@ -1490,14 +1502,14 @@ def refine_texture_with_references(
         )
         if matched_base is not None:
             base = matched_base
-        # 服の下などの完全遮蔽面には、覆っている表面の色を継承させる
+        # 服の下などの遮蔽面には、覆っている表面の色を継承させる
         # (ポーズ時の覗きを目立たなくする。HIDDEN_INTERIOR_* 参照)。
         painted = _paint_hidden_interiors(
             base,
             refined,
             blend,
             covered_2d,
-            accum_count.reshape(h, w) > 0,
+            accum_blocked.reshape(h, w) > 0,
             accum_pos,
             accum_nrm,
             accum_count,
