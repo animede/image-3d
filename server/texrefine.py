@@ -265,6 +265,18 @@ SILHOUETTE_DISAGREE_DILATE_FRACTION = 0.004  # 不一致域をこの半径(画�
 # 一致部分は使えるため)。
 SILHOUETTE_DISAGREE_WARN_FRACTION = 0.35
 
+# --- 側面参照の内容ずれガード(手にシャツの色が乗る対策) ----------------------
+# シルエット一致は「そこに何かが写っている」ことしか保証しない。Tポーズの手は
+# 真横へ突き出ているため、側面ビューでは参照画像の**胴体や前に突き出した腕**の
+# 位置に投影され、シルエットは一致するのに内容は別物(シャツの青緑・髪の紫)を
+# 拾う(実測: 指先が側面ビューに正対するため強く転写され、指がシャツ色になる)。
+# 対策: 側面ビューからの転写は、参照画素と合成ビュー(メッシュ+元テクスチャ)の
+# 色差がこの閾値以内の場合に限る。「側面参照は精細化には使うが**色替えには
+# 使わない**」という意味。閾値はチャンネル最大差で、texgen のくすみ
+# (同系色で数十)は通し、別部位(肌vsシャツで150超)は弾く余裕を持たせる。
+# 正面・背面には適用しない(texgen が顔を描かないことがあり、正当な大差がある)。
+SIDE_VIEW_MAX_SYNTH_DELTA = 100.0
+
 # --- 背景色の抜き残し(髪の隙間)の除外 ------------------------------------
 # 背景除去は髪の房の**あいだの隙間**まで透過にできないことがあり、背景色
 # (白など)が不透明のまま小さな島として残る (実測: 4面の参照とも白の小島が
@@ -1236,8 +1248,12 @@ def refine_texture_with_references(
     # この補正済み参照から行う(位置ずれした顔パーツが「浮く」のを防ぐ)。
     # あわせて、メッシュとシルエットが食い違う領域(腕を前へ出した側面参照など)を
     # 信頼できる画素から外す。
+    # 合成ビューは側面の内容ずれガード (SIDE_VIEW_MAX_SYNTH_DELTA) でも使うため
+    # 保持しておく。
+    synth_maps: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     for view in views:
         synth_rgb, synth_mask = synth_views[view].image()
+        synth_maps[view] = (np.asarray(synth_rgb, dtype=np.float32), synth_mask)
         rgb, trusted, view_normal, image = view_data[view]
 
         agree, disagreement = silhouette_agreement_mask(synth_mask, image)
@@ -1335,6 +1351,13 @@ def refine_texture_with_references(
             occluded_samples += int((visibility <= 0.0).sum())
             # フチ・透明画素に落ちたサンプルも信用しない(黒筋の原因)。
             ok = trusted[py, px] & (visibility > 0.0)
+            if view not in _PRIMARY_VIEWS:
+                # 側面の内容ずれガード (定数ブロック参照): 参照画素が合成ビュー
+                # (メッシュ+元テクスチャ)の色と大きく食い違う場所は、ポーズ違いで
+                # 別の部位(胴のシャツ等)が写っているので転写しない。
+                synth_rgb_map, synth_mask_map = synth_maps[view]
+                delta = np.abs(synth_rgb_map[py, px] - rgb[py, px]).max(axis=1)
+                ok &= synth_mask_map[py, px] & (delta <= SIDE_VIEW_MAX_SYNTH_DELTA)
             if not ok.any():
                 continue
             idx = np.flatnonzero(sel)[ok]

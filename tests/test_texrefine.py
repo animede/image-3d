@@ -427,7 +427,7 @@ def test_side_views_do_not_take_face_on_surfaces():
     """
     mesh = _sphere_with_uv()
     front = _circular_reference(color=REFERENCE_RED)
-    side = _circular_reference(color=(20, 220, 40))  # 側面は緑
+    side = _circular_reference(color=(40, 210, 60))  # 側面は緑
     stats = texrefine.refine_texture_with_references(
         mesh, {"front": front, "left": side, "right": side}
     )
@@ -480,7 +480,7 @@ def test_side_views_are_not_used_above_the_head_base():
     assert vertices[:, 2].min() < base < vertices[:, 2].max(), f"付け根が範囲外: {base}"
 
     front = _circular_reference(color=REFERENCE_RED)
-    side = _circular_reference(color=(20, 220, 40))
+    side = _circular_reference(color=(40, 210, 60))
     stats = texrefine.refine_texture_with_references(
         mesh, {"front": front, "left": side, "right": side}
     )
@@ -664,3 +664,30 @@ def test_background_gap_mask_needs_transparency():
     rgb = np.full((64, 64, 3), 255.0, dtype=np.float32)
     alpha = np.full((64, 64), 255, dtype=np.uint8)
     assert texrefine._background_gap_mask(rgb, alpha) is None
+
+
+# --- 側面参照の内容ずれガード (SIDE_VIEW_MAX_SYNTH_DELTA) ----------------------
+
+
+def test_side_views_do_not_recolour_mismatched_content():
+    """側面参照の色が元テクスチャと大きく食い違う場所は転写しない。
+
+    Tポーズの手は側面ビューでは参照画像の胴体(シャツ)の位置に投影され、
+    シルエットは一致するのに内容は別物を拾う(実測: 指がシャツの青緑になる)。
+    「側面は精細化に使うが色替えには使わない」を色差ガードで保証する。
+    """
+    mesh = _sphere_with_uv()
+    front = _circular_reference(color=REFERENCE_RED)
+    # グレー(128)から最大差100超の色 = 別部位が写っているとみなされる
+    side = _circular_reference(color=(240, 20, 240))
+    stats = texrefine.refine_texture_with_references(
+        mesh, {"front": front, "left": side, "right": side}
+    )
+    assert stats.applied, stats.reason
+
+    colors = sample_vertex_colors_from_texture(mesh)[:, :3].astype(int)
+    normals = np.asarray(mesh.vertex_normals)
+    sideways = colors[np.abs(normals @ np.array([1.0, 0.0, 0.0])) > 0.95]
+    # マゼンタ(R,B高・G低)へ寄っていないこと(texgen グレーのまま、または拡散)
+    assert sideways[:, 0].mean() < 180, f"側面が別内容の色で塗られた: {sideways.mean(axis=0)}"
+    assert sideways[:, 2].mean() < 180, f"側面が別内容の色で塗られた: {sideways.mean(axis=0)}"
