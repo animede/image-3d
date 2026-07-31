@@ -270,6 +270,16 @@ BASE_MATCH_MAX_SHIFT = 96.0  # 補正量の上限 (チャンネル毎、階調)
 HIDDEN_INTERIOR_RADIUS_FACTOR = 40.0  # 半径 = アンカー典型間隔 × この係数
 HIDDEN_INTERIOR_NORMAL_DOT = 0.3  # 覆っている面と同じ向きのアンカーだけ使う
 HIDDEN_INTERIOR_BLEND = 0.85  # 継承の強さ (1.0で完全置換。元の陰影を少し残す)
+# 「盲目領域」= 全ビューでの最大dotがこの値未満 = どの参照からも原理的に
+# 覆えない面 (襟の胸元・肩の上面のような**上下向きの棚**。参照は4方向とも
+# 水平視点のため)。ここに生成器の幻覚色(赤い胸元)が残ると、可視なのに
+# 直しようがない。盲目領域も色継承の対象にする。周囲のアンカーは向きが
+# 直交する(棚 vs 垂直面)ため、法線条件はこの緩い値を使う — 対面
+# (dot≈-1, 薄シェルの裏)だけは引き続き排除する。
+# 注意: 「ガードで棄却されただけの参照可視面」を対象にしてはならない
+# (マゼンタ流出事故の教訓)。盲目領域は max_dot 条件で厳密に区別できる。
+BLIND_ZONE_MAX_DOT = 0.15
+BLIND_ZONE_NORMAL_DOT = -0.1
 
 # --- シルエット不一致ガード(ポーズ違いの参照を安全に使う) ------------------
 # 側面参照は、Tポーズのままだと腕がカメラ方向へ伸びて胴の側面を隠すため、
@@ -425,9 +435,12 @@ def head_base_height(mesh: trimesh.Trimesh) -> float:
     return high
 
 
-def _blend_weight(dot: np.ndarray, minimum: float = MIN_CONFIDENCE_DOT) -> np.ndarray:
-    """法線と視線の内積 -> 参照画像を信用する重み (0..1)。"""
-    span = max(FULL_CONFIDENCE_DOT - minimum, 1e-9)
+def _blend_weight(dot: np.ndarray, minimum=MIN_CONFIDENCE_DOT) -> np.ndarray:
+    """法線と視線の内積 -> 参照画像を信用する重み (0..1)。
+
+    `minimum` はスカラーまたはサンプルごとの配列 (ビュー×部位別の下限)。
+    """
+    span = np.maximum(FULL_CONFIDENCE_DOT - minimum, 1e-9)
     return np.clip((dot - minimum) / span, 0.0, 1.0).astype(np.float32)
 
 
@@ -463,7 +476,7 @@ def _iter_surface_samples(
         norm = np.linalg.norm(sample_normals, axis=1, keepdims=True)
         sample_normals /= np.maximum(norm, 1e-9)
         sample_uv = (tri_uv * bary).sum(axis=1)  # (S, 2)
-        yield points, sample_normals, sample_uv
+        yield points, sample_normals, sample_uv, start + face_idx
 
 
 class _SynthView:
@@ -1069,26 +1082,37 @@ def _paint_hidden_interiors(
     blend: np.ndarray,
     covered_2d: np.ndarray,
     blocked_2d: np.ndarray,
+    blind_2d: Optional[np.ndarray],
     positions: np.ndarray,
     normal_sums: np.ndarray,
     counts: np.ndarray,
     head_texels: Optional[np.ndarray],
+    comp_2d: Optional[np.ndarray] = None,
 ) -> int:
-    """遮蔽の証拠があるテクセルへ、覆っている表面の転写色を継承させる。
+    """遮蔽面・盲目領域へ、周囲の表面の転写色を継承させる。
 
-    定数ブロック (HIDDEN_INTERIOR_*) のコメント参照。base を**その場で**
-    書き換え、継承したテクセル数を返す。
+    定数ブロック (HIDDEN_INTERIOR_* / BLIND_ZONE_*) のコメント参照。
+    `comp_2d` (連結成分ラベル) があるときは**同じ成分のアンカーだけ**から
+    継承する (シャツはシャツから、肌は肌から。襟下のシャツの棚に首の肌が
+    流れ込むのを防ぐ)。base を**その場で**書き換え、継承したテクセル数を返す。
     """
     from scipy.spatial import cKDTree
 
     h, w = blend.shape
     counts_2d = counts.reshape(h, w)
     anchors_mask = covered_2d & (blend >= BASE_MATCH_MIN_BLEND) & (counts_2d > 0)
-    # 対象: 転写されず、かつ**遮蔽された割り当てサンプルを持つ**面のみ
-    # (=静止時に不可視。斜め棄却だけの可視面を塗ってはならない: 定数コメント参照)
-    targets_mask = blocked_2d & ~covered_2d
+    # 対象: 転写されず、かつ (a)**遮蔽された割り当てサンプルを持つ** または
+    # (b)**盲目領域** (全ビューで dot が低くどの参照からも覆えない) のみ。
+    # 斜め棄却・ガード棄却だけの可視面を塗ってはならない (定数コメント参照)。
+    targets_mask = blocked_2d.copy()
+    if blind_2d is not None:
+        targets_mask |= blind_2d
+    targets_mask &= ~covered_2d
     if head_texels is not None:
         targets_mask &= ~head_texels
+    blind_only = (
+        blind_2d & ~blocked_2d if blind_2d is not None else np.zeros_like(blocked_2d)
+    )
     if not anchors_mask.any() or not targets_mask.any():
         return 0
 
@@ -1125,7 +1149,17 @@ def _paint_hidden_interiors(
     valid = np.isfinite(dists)
     idx_safe = np.where(valid, idx, 0)
     dot = (a_nrm[idx_safe] * t_nrm[:, None, :]).sum(axis=2)
-    valid &= dot >= HIDDEN_INTERIOR_NORMAL_DOT
+    # 盲目領域は周囲アンカーの向きが直交する(棚 vs 垂直面)ため緩い閾値、
+    # 遮蔽面は覆っている層と平行なので従来の閾値 (定数コメント参照)。
+    dot_threshold = np.where(
+        blind_only[t_ys, t_xs], BLIND_ZONE_NORMAL_DOT, HIDDEN_INTERIOR_NORMAL_DOT
+    )
+    valid &= dot >= dot_threshold[:, None]
+    if comp_2d is not None:
+        a_comp = comp_2d[a_ys, a_xs]
+        t_comp = comp_2d[t_ys, t_xs]
+        both_known = (a_comp[idx_safe] >= 0) & (t_comp[:, None] >= 0)
+        valid &= ~both_known | (a_comp[idx_safe] == t_comp[:, None])
     weight = np.where(valid, 1.0 / np.maximum(dists, spacing * 0.25), 0.0)
     total = weight.sum(axis=1)
     has_support = total > 0.0
@@ -1327,7 +1361,7 @@ def refine_texture_with_references(
     synth_views = {
         view: _SynthView(view_data[view][3], view_data[view][2]) for view in views
     }
-    for points, _, sample_uv in _iter_surface_samples(
+    for points, _, sample_uv, _face_ids in _iter_surface_samples(
         vertices, normals, uv_texels, faces, counts_all
     ):
         tx = np.clip(sample_uv[:, 0].astype(np.int64), 0, w - 1)
@@ -1399,9 +1433,24 @@ def refine_texture_with_references(
     accum_nrm = np.zeros((h * w, 3), dtype=np.float32) if has_sides else None
     # 遮蔽の証拠 (深度バッファに遮られた割り当てサンプル数)。隠れ面の色継承用。
     accum_blocked = np.zeros(h * w, dtype=np.float32) if has_sides else None
+    # 全ビューでの最大dot (盲目領域の判定用)。
+    accum_maxdot = np.zeros(h * w, dtype=np.float32) if has_sides else None
+    # テクセルごとの連結成分ラベル (色継承を「同じ成分から」に限定するため。
+    # 襟下のシャツの棚に首の肌が継承される事故を防ぐ)。UVシームの頂点複製で
+    # 成分が砕けるので、位置で溶接してから面隣接の成分を取る。
+    texel_comp = None
+    if has_sides:
+        welded = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+        welded.merge_vertices()
+        import trimesh.graph as _tgraph
+
+        face_comp = _tgraph.connected_component_labels(
+            welded.face_adjacency, len(faces)
+        ).astype(np.int32)
+        texel_comp = np.full(h * w, -1, dtype=np.int32)
     occluded_samples = 0
     assigned_samples = 0
-    for points, sample_normals, sample_uv in _iter_surface_samples(
+    for points, sample_normals, sample_uv, sample_faces in _iter_surface_samples(
         vertices, normals, uv_texels, faces, counts_all
     ):
         tx = np.clip(sample_uv[:, 0].astype(np.int64), 0, w - 1)
@@ -1410,10 +1459,14 @@ def refine_texture_with_references(
         if accum_pos is not None:
             np.add.at(accum_pos, flat, points.astype(np.float32))
             np.add.at(accum_nrm, flat, sample_normals.astype(np.float32))
+        if texel_comp is not None:
+            texel_comp[flat] = face_comp[sample_faces]
 
         # 各サンプルを、最も正対して見えるビューに割り当てる。
         dots = np.stack([sample_normals @ view_data[v][2] for v in views], axis=1)  # (S, V)
         best = np.argmax(dots, axis=1)
+        if accum_maxdot is not None:
+            np.maximum.at(accum_maxdot, flat, dots.max(axis=1).astype(np.float32))
 
         # 側面参照があるときは、正面・背面が十分正対している面と、頭より上の
         # 面を側面に渡さない(顔の細部が側面参照のわずかなずれで壊れるのを防ぐ)。
@@ -1431,7 +1484,20 @@ def refine_texture_with_references(
 
         best_dot = dots[np.arange(len(dots)), best]
 
-        weight = _blend_weight(best_dot, min_dot)
+        # dot下限はビュー×部位別 (MIN_CONFIDENCE_DOT_WITH_SIDES のコメント参照):
+        # 側面参照は常に 0.40。正面・背面は、頭(前後の取り合いがコイン投げに
+        # なる場所)だけ 0.40 で、頭より下は従来どおり 0.20 まで届かせる。
+        # 0.40 を全ビューに掛けると、襟の上向き斜面・脚の内側の斜め帯が
+        # どのビューにも覆われず、生成器の生の色(赤い胸元・ピンクの内腿)が
+        # 残る (実測: 襟元帯の63%が生のまま)。
+        if has_sides:
+            is_primary = np.isin(best, primary_columns)
+            minimum = np.where(
+                is_primary & ~on_head, MIN_CONFIDENCE_DOT, MIN_CONFIDENCE_DOT_WITH_SIDES
+            )
+        else:
+            minimum = min_dot
+        weight = _blend_weight(best_dot, minimum)
         # 遮蔽・フチ落ちしたサンプルも分母には入れる(境界のテクセルが
         # 自動的に texgen 側へ寄り、遮蔽の切り替わりが線にならない)。
         np.add.at(accum_count, flat, 1.0)
@@ -1510,10 +1576,13 @@ def refine_texture_with_references(
             blend,
             covered_2d,
             accum_blocked.reshape(h, w) > 0,
+            (accum_count.reshape(h, w) > 0)
+            & (accum_maxdot.reshape(h, w) < BLIND_ZONE_MAX_DOT),
             accum_pos,
             accum_nrm,
             accum_count,
             head_texels,
+            comp_2d=texel_comp.reshape(h, w) if texel_comp is not None else None,
         )
         if painted:
             logger.info(

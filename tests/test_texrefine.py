@@ -734,7 +734,7 @@ def _interior_fixture():
 def test_hidden_interiors_inherit_covering_surface_colour():
     base, refined, blend, covered, blocked, positions, normal_sums, counts = _interior_fixture()
     painted = texrefine._paint_hidden_interiors(
-        base, refined, blend, covered, blocked, positions, normal_sums, counts, None
+        base, refined, blend, covered, blocked, None, positions, normal_sums, counts, None
     )
     assert painted > 0
     # 隠れ面はシャツの青に寄る(完全一致でなく HIDDEN_INTERIOR_BLEND の割合)
@@ -749,7 +749,7 @@ def test_hidden_interiors_respect_head_exclusion():
     head = np.zeros(base.shape[:2], dtype=bool)
     head[36:, :] = True  # 隠れ面をすべて頭扱いにする
     painted = texrefine._paint_hidden_interiors(
-        base, refined, blend, covered, blocked, positions, normal_sums, counts, head
+        base, refined, blend, covered, blocked, None, positions, normal_sums, counts, head
     )
     assert painted == 0
     assert base[50, 32, 0] == pytest.approx(230.0)
@@ -764,7 +764,7 @@ def test_visible_rejected_texels_are_not_painted():
     base, refined, blend, covered, blocked, positions, normal_sums, counts = _interior_fixture()
     blocked[:, :] = False  # 遮蔽の証拠なし = ただの棄却(可視)
     painted = texrefine._paint_hidden_interiors(
-        base, refined, blend, covered, blocked, positions, normal_sums, counts, None
+        base, refined, blend, covered, blocked, None, positions, normal_sums, counts, None
     )
     assert painted == 0
     assert base[50, 32, 0] == pytest.approx(230.0)
