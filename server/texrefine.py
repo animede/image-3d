@@ -253,6 +253,20 @@ BASE_MATCH_RADIUS_FACTOR = 8.0  # 有効半径 = アンカー典型間隔 × こ
 BASE_MATCH_NORMAL_DOT = 0.3  # 法線がこれ以上一致するアンカーだけ使う (薄シェル表裏の混入防止)
 BASE_MATCH_MAX_SHIFT = 96.0  # 補正量の上限 (チャンネル毎、階調)
 
+# --- 隠れ面の色継承 (match_base_colors の追加パス, 2026-07-31) ----------------
+# 服と体が別シェルのメッシュ(TRELLIS.2)では、服の下の体表面に生成器が
+# 独自の色(実測: オレンジ)を塗る。静止時は不可視だが、リグでポーズを付けると
+# 数mmの層ずれで覗き、「衣装の色が変わった」ように見える(rig-service側の
+# ウェイト対策後も残る数mmは原理的に消せない)。
+# 対策: **全ビューで遮蔽棄却されたテクセル**(=静止時に見えない面)の元色を、
+# 3D近傍で同じ向きの転写済みアンカー(=それを覆っている表面)の**転写色そのもの**
+# へ寄せる。「服の裏は服の色」にしておけば、覗いても目立たない。
+# 通常の局所色補正(差分の伝播)より広い半径で、色を直接ブレンドする点が違う。
+# 頭部には適用しない(前髪下の額に髪色が付くと、下から覗いた時に破綻する)。
+HIDDEN_INTERIOR_RADIUS_FACTOR = 40.0  # 半径 = アンカー典型間隔 × この係数
+HIDDEN_INTERIOR_NORMAL_DOT = 0.3  # 覆っている面と同じ向きのアンカーだけ使う
+HIDDEN_INTERIOR_BLEND = 0.85  # 継承の強さ (1.0で完全置換。元の陰影を少し残す)
+
 # --- シルエット不一致ガード(ポーズ違いの参照を安全に使う) ------------------
 # 側面参照は、Tポーズのままだと腕がカメラ方向へ伸びて胴の側面を隠すため、
 # 生成側で**腕を前へ出した**姿勢にせざるを得ない。すると腕だけメッシュ(Tポーズ)と
@@ -1045,6 +1059,84 @@ def _match_base_to_reference(
     return matched
 
 
+def _paint_hidden_interiors(
+    base: np.ndarray,
+    refined: np.ndarray,
+    blend: np.ndarray,
+    covered_2d: np.ndarray,
+    sampled_2d: np.ndarray,
+    positions: np.ndarray,
+    normal_sums: np.ndarray,
+    counts: np.ndarray,
+    head_texels: Optional[np.ndarray],
+) -> int:
+    """全ビューで遮蔽されたテクセルへ、覆っている表面の転写色を継承させる。
+
+    定数ブロック (HIDDEN_INTERIOR_*) のコメント参照。base を**その場で**
+    書き換え、継承したテクセル数を返す。
+    """
+    from scipy.spatial import cKDTree
+
+    h, w = blend.shape
+    counts_2d = counts.reshape(h, w)
+    anchors_mask = covered_2d & (blend >= BASE_MATCH_MIN_BLEND) & (counts_2d > 0)
+    # 対象: サンプルは届いたが1ビューからも転写されなかった面 (=静止時に不可視)
+    targets_mask = sampled_2d & ~covered_2d
+    if head_texels is not None:
+        targets_mask &= ~head_texels
+    if not anchors_mask.any() or not targets_mask.any():
+        return 0
+
+    pos = positions.reshape(h, w, 3)
+    nrm = normal_sums.reshape(h, w, 3)
+
+    def _texel_data(mask):
+        ys, xs = np.where(mask)
+        c = counts_2d[ys, xs]
+        p = pos[ys, xs] / c[:, None]
+        n = nrm[ys, xs]
+        n = n / np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-9)
+        return ys, xs, p, n
+
+    a_ys, a_xs, a_pos, a_nrm = _texel_data(anchors_mask)
+    if len(a_pos) > BASE_MATCH_MAX_ANCHORS:
+        rng = np.random.default_rng(1)
+        pick = rng.choice(len(a_pos), size=BASE_MATCH_MAX_ANCHORS, replace=False)
+        a_pos, a_nrm = a_pos[pick], a_nrm[pick]
+        a_ys, a_xs = a_ys[pick], a_xs[pick]
+    a_rgb = refined[a_ys, a_xs]
+
+    tree = cKDTree(a_pos)
+    sample = a_pos[:: max(1, len(a_pos) // 10_000)]
+    nn_dist, _ = tree.query(sample, k=2)
+    positive = nn_dist[:, 1][nn_dist[:, 1] > 0]
+    spacing = float(np.median(positive)) if positive.size else 0.0
+    if spacing <= 0.0:
+        return 0
+    radius = spacing * HIDDEN_INTERIOR_RADIUS_FACTOR
+
+    t_ys, t_xs, t_pos, t_nrm = _texel_data(targets_mask)
+    dists, idx = tree.query(t_pos, k=BASE_MATCH_NEIGHBORS, distance_upper_bound=radius)
+    valid = np.isfinite(dists)
+    idx_safe = np.where(valid, idx, 0)
+    dot = (a_nrm[idx_safe] * t_nrm[:, None, :]).sum(axis=2)
+    valid &= dot >= HIDDEN_INTERIOR_NORMAL_DOT
+    weight = np.where(valid, 1.0 / np.maximum(dists, spacing * 0.25), 0.0)
+    total = weight.sum(axis=1)
+    has_support = total > 0.0
+    if not has_support.any():
+        return 0
+    inherited = np.einsum("tk,tkc->tc", weight, a_rgb[idx_safe])
+    inherited[has_support] /= total[has_support, None]
+    sel = has_support
+    ys, xs = t_ys[sel], t_xs[sel]
+    base[ys, xs] = (
+        base[ys, xs] * (1.0 - HIDDEN_INTERIOR_BLEND)
+        + inherited[sel] * HIDDEN_INTERIOR_BLEND
+    )
+    return int(sel.sum())
+
+
 def _harmonize_chart_seams(
     refined: np.ndarray,
     blend: np.ndarray,
@@ -1398,6 +1490,25 @@ def refine_texture_with_references(
         )
         if matched_base is not None:
             base = matched_base
+        # 服の下などの完全遮蔽面には、覆っている表面の色を継承させる
+        # (ポーズ時の覗きを目立たなくする。HIDDEN_INTERIOR_* 参照)。
+        painted = _paint_hidden_interiors(
+            base,
+            refined,
+            blend,
+            covered_2d,
+            accum_count.reshape(h, w) > 0,
+            accum_pos,
+            accum_nrm,
+            accum_count,
+            head_texels,
+        )
+        if painted:
+            logger.info(
+                "Painted %d fully-occluded interior texels with the colour of "
+                "the covering surface.",
+                painted,
+            )
 
     # 取りこぼしと UV チャート外周を、最近傍の上書き済みテクセルで埋める。
     # 埋めないとバイリニア補間がチャート外の texgen 色を拾って継ぎ目になる。

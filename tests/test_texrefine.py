@@ -691,3 +691,66 @@ def test_side_views_do_not_recolour_mismatched_content():
     # マゼンタ(R,B高・G低)へ寄っていないこと(texgen グレーのまま、または拡散)
     assert sideways[:, 0].mean() < 180, f"側面が別内容の色で塗られた: {sideways.mean(axis=0)}"
     assert sideways[:, 2].mean() < 180, f"側面が別内容の色で塗られた: {sideways.mean(axis=0)}"
+
+
+# --- 隠れ面の色継承 (_paint_hidden_interiors) ---------------------------------
+
+
+def _interior_fixture():
+    """外側表面(転写済み・青)と、その内側の隠れ面(未転写・オレンジ)を模す。"""
+    h = w = 64
+    base = np.zeros((h, w, 3), dtype=np.float32)
+    refined = np.zeros((h, w, 3), dtype=np.float32)
+    blend = np.zeros((h, w), dtype=np.float32)
+    covered = np.zeros((h, w), dtype=bool)
+    sampled = np.zeros((h, w), dtype=bool)
+    counts = np.zeros(h * w, dtype=np.float32)
+    positions = np.zeros((h * w, 3), dtype=np.float32)
+    normal_sums = np.zeros((h * w, 3), dtype=np.float32)
+
+    # 外側表面: アトラス上半分。3D では z=0 の平面、法線 +Z。
+    for y in range(0, 28):
+        for x in range(w):
+            f = y * w + x
+            counts[f] = 1.0
+            positions[f] = (float(y), float(x), 0.0)
+            normal_sums[f] = (0, 0, 1)
+            sampled[y, x] = True
+            covered[y, x] = True
+            blend[y, x] = 1.0
+            refined[y, x] = (40.0, 180.0, 200.0)  # 青(シャツ)
+            base[y, x] = (60.0, 160.0, 180.0)
+    # 隠れ面: アトラス下半分。3D では同じ (y,x) だが 2 だけ下の層、法線 +Z。
+    for y in range(36, 64):
+        for x in range(w):
+            f = y * w + x
+            counts[f] = 1.0
+            positions[f] = (float(y - 36), float(x), -2.0)
+            normal_sums[f] = (0, 0, 1)
+            sampled[y, x] = True
+            base[y, x] = (230.0, 120.0, 30.0)  # オレンジ(生成器の隠れ面)
+    return base, refined, blend, covered, sampled, positions, normal_sums, counts
+
+
+def test_hidden_interiors_inherit_covering_surface_colour():
+    base, refined, blend, covered, sampled, positions, normal_sums, counts = _interior_fixture()
+    painted = texrefine._paint_hidden_interiors(
+        base, refined, blend, covered, sampled, positions, normal_sums, counts, None
+    )
+    assert painted > 0
+    # 隠れ面はシャツの青に寄る(完全一致でなく HIDDEN_INTERIOR_BLEND の割合)
+    assert base[50, 32, 2] > 150, f"隠れ面が継承されていない: {base[50,32]}"
+    assert base[50, 32, 0] < 100
+    # 外側表面の base は触らない
+    assert base[10, 32, 0] == pytest.approx(60.0)
+
+
+def test_hidden_interiors_respect_head_exclusion():
+    base, refined, blend, covered, sampled, positions, normal_sums, counts = _interior_fixture()
+    head = np.zeros(base.shape[:2], dtype=bool)
+    head[36:, :] = True  # 隠れ面をすべて頭扱いにする
+    painted = texrefine._paint_hidden_interiors(
+        base, refined, blend, covered, sampled, positions, normal_sums, counts, head
+    )
+    assert painted == 0
+    assert base[50, 32, 0] == pytest.approx(230.0)
