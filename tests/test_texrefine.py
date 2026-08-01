@@ -768,3 +768,41 @@ def test_visible_rejected_texels_are_not_painted():
     )
     assert painted == 0
     assert base[50, 32, 0] == pytest.approx(230.0)
+
+
+# --- 頭部トーン転写モード (_apply_head_tone_only) ------------------------------
+
+
+def test_head_tone_only_applies_smooth_tone_and_blocks_transfer():
+    """頭部は直接転写が止まり(blend=0)、低周波トーンだけが base に乗る。"""
+    h = w = 64
+    base = np.full((h, w, 3), 100.0, dtype=np.float32)
+    refined = np.zeros((h, w, 3), dtype=np.float32)
+    blend = np.zeros((h, w), dtype=np.float32)
+    covered = np.zeros((h, w), dtype=bool)
+    head = np.zeros((h, w), dtype=bool)
+    counts = np.zeros(h * w, dtype=np.float32)
+    positions = np.zeros((h * w, 3), dtype=np.float32)
+
+    head[:, :] = True
+    # アンカー: 左半分は転写済みで「+50 明るい」参照
+    for y in range(h):
+        for x in range(w):
+            f = y * w + x
+            counts[f] = 1.0
+            positions[f] = (float(y) * 0.1, float(x) * 0.1, 0.0)  # 半径5に十分収まる密度
+            if x < 32:
+                covered[y, x] = True
+                blend[y, x] = 1.0
+                refined[y, x] = 150.0
+
+    toned = texrefine._apply_head_tone_only(
+        base, refined, blend, covered, head, positions, counts
+    )
+    assert toned > 0
+    # 頭部の blend はゼロ (直接転写しない)
+    assert float(blend[head].max()) == 0.0
+    # アンカー近傍の base は +50 に寄る (低周波なので厳密一致は求めない)
+    assert base[16, 40, 0] > 120, f"トーンが乗っていない: {base[16, 40]}"
+    # 補正はアンカーの平均なので、鋭い高周波は持ち込まれない
+    assert abs(float(base[16, 40, 0]) - float(base[17, 41, 0])) < 10

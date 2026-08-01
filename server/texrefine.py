@@ -281,6 +281,18 @@ HIDDEN_INTERIOR_BLEND = 0.85  # 継承の強さ (1.0で完全置換。元の陰�
 BLIND_ZONE_MAX_DOT = 0.15
 BLIND_ZONE_NORMAL_DOT = -0.1
 
+# --- 頭部トーン転写モード (head_tone_only, trellis2 経路) ----------------------
+# texrefine は「texgen の顔は描かれていない(512px・のっぺらぼう)」前提の道具で、
+# 参照の直接転写が常に勝ちだった。TRELLIS.2 は**最初から位置の正しい一貫した
+# 顔を描く**ため、数pxずれた参照を高ブレンドで重ねると二重輪郭・ソース混在の
+# 斑点ノイズが出て、素の顔より悪化する(実測: 頬・顎の黒斑点)。
+# 対策: 頭部は参照からの直接転写をやめ、転写できたテクセルの「参照-元」差分を
+# **大きな半径で平均した低周波トーン**だけを元テクスチャに乗せる。
+# 構造(線画・目鼻)は生成器、色味(明るさ・血色)は参照、という分業。
+HEAD_TONE_RADIUS = 5.0  # トーン平均の3D半径 (モデル高さ100基準 ≒ 顔幅の半分)
+HEAD_TONE_MIN_ANCHORS = 20  # これ未満のアンカーしか無いテクセルは無補正
+HEAD_TONE_MAX_SHIFT = 96.0  # 補正量の上限 (チャンネル毎、階調)
+
 # --- シルエット不一致ガード(ポーズ違いの参照を安全に使う) ------------------
 # 側面参照は、Tポーズのままだと腕がカメラ方向へ伸びて胴の側面を隠すため、
 # 生成側で**腕を前へ出した**姿勢にせざるを得ない。すると腕だけメッシュ(Tポーズ)と
@@ -996,10 +1008,14 @@ def _match_base_to_reference(
     positions: np.ndarray,
     normal_sums: np.ndarray,
     counts: np.ndarray,
+    exclude_2d: Optional[np.ndarray] = None,
 ) -> Optional[np.ndarray]:
     """元テクスチャの色調を、3D近傍の転写済みテクセルの差分で局所補正する。
 
-    定数ブロックのコメント参照。戻り値は補正済み base (アンカー不足なら None)。
+    定数ブロックのコメント参照。`exclude_2d` の領域は対象から外す
+    (頭部トーン転写モードでは頭は専用の低周波トーンだけにする。8近傍の
+    差分補正は高周波が残り、顔に斑点ノイズが出るため)。
+    戻り値は補正済み base (アンカー不足なら None)。
     """
     from scipy.spatial import cKDTree
 
@@ -1010,6 +1026,8 @@ def _match_base_to_reference(
     if n_anchors < BASE_MATCH_MIN_PAIRS:
         return None
     targets_mask = sampled_2d & ~strong
+    if exclude_2d is not None:
+        targets_mask = targets_mask & ~exclude_2d
     if not targets_mask.any():
         return None
 
@@ -1176,6 +1194,59 @@ def _paint_hidden_interiors(
     return int(sel.sum())
 
 
+def _apply_head_tone_only(
+    base: np.ndarray,
+    refined: np.ndarray,
+    blend: np.ndarray,
+    covered_2d: np.ndarray,
+    head_texels: np.ndarray,
+    positions: np.ndarray,
+    counts: np.ndarray,
+) -> int:
+    """頭部の直接転写を低周波トーン補正に置き換える (HEAD_TONE_* 参照)。
+
+    base の頭部へトーン補正を加え、blend の頭部を0にする(=構造は元のまま)。
+    補正したテクセル数を返す。
+    """
+    from scipy.spatial import cKDTree
+
+    h, w = blend.shape
+    counts_2d = counts.reshape(h, w)
+    anchors_mask = head_texels & covered_2d & (blend >= BASE_MATCH_MIN_BLEND)
+    targets_mask = head_texels & (counts_2d > 0)
+    corrected = 0
+    if anchors_mask.any() and targets_mask.any():
+        pos = positions.reshape(h, w, 3)
+
+        a_ys, a_xs = np.where(anchors_mask)
+        a_pos = pos[a_ys, a_xs] / counts_2d[a_ys, a_xs, None]
+        diff = refined[a_ys, a_xs] - base[a_ys, a_xs]
+
+        t_ys, t_xs = np.where(targets_mask)
+        t_pos = pos[t_ys, t_xs] / counts_2d[t_ys, t_xs, None]
+
+        tree = cKDTree(a_pos)
+        k = 64
+        dists, idx = tree.query(t_pos, k=k, distance_upper_bound=HEAD_TONE_RADIUS)
+        valid = np.isfinite(dists)
+        idx_safe = np.where(valid, idx, 0)
+        n_valid = valid.sum(axis=1)
+        has_support = n_valid >= HEAD_TONE_MIN_ANCHORS
+        # 半径内アンカーの単純平均(距離重みなし=低周波トーン)
+        tone = (diff[idx_safe] * valid[..., None]).sum(axis=1)
+        tone[has_support] /= n_valid[has_support, None]
+        tone = np.clip(tone, -HEAD_TONE_MAX_SHIFT, HEAD_TONE_MAX_SHIFT)
+        sel = has_support
+        base[t_ys[sel], t_xs[sel]] = np.clip(
+            base[t_ys[sel], t_xs[sel]] + tone[sel], 0, 255
+        )
+        corrected = int(sel.sum())
+
+    # 頭部は直接転写しない(構造は元テクスチャのまま)
+    blend[head_texels] = 0.0
+    return corrected
+
+
 def _harmonize_chart_seams(
     refined: np.ndarray,
     blend: np.ndarray,
@@ -1271,6 +1342,7 @@ def refine_texture_with_references(
     references: dict[str, Image.Image],
     *,
     match_base_colors: bool = False,
+    head_tone_only: bool = False,
 ) -> RefineStats:
     """texgen 済みメッシュのテクスチャを、参照画像の全解像度で上書きする。
 
@@ -1565,6 +1637,7 @@ def refine_texture_with_references(
             accum_pos,
             accum_nrm,
             accum_count,
+            exclude_2d=head_texels if head_tone_only else None,
         )
         if matched_base is not None:
             base = matched_base
@@ -1628,6 +1701,19 @@ def refine_texture_with_references(
     from scipy.ndimage import median_filter
 
     blend = median_filter(blend, size=3)
+
+    # 頭部トーン転写モード (定数ブロック HEAD_TONE_* 参照): 頭部は直接転写を
+    # やめ、低周波トーンだけを元テクスチャへ乗せる。以降の頭部シーム調和・
+    # フェザーは blend=0 のため実質無効になる。
+    if head_tone_only and head_texels is not None and head_texels.any() and accum_pos is not None:
+        toned = _apply_head_tone_only(
+            base, refined, blend, covered_2d, head_texels, accum_pos, accum_count
+        )
+        logger.info(
+            "Head tone-only mode: kept the generator's face structure and "
+            "applied low-frequency tone to %d texels.",
+            toned,
+        )
 
     # 頭部のチャート境界処理 (定数ブロックのコメント参照):
     # シーム調和(3D対応するチャート境界テクセルの色・混合率を平均)のあと、

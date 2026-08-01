@@ -356,8 +356,11 @@ class JobManager:
             # match_base_colors: TRELLIS.2 の自前テクスチャは参照より彩度が
             # くすむため、色調を参照へ合わせる (遮蔽で転写できない領域が
             # 色調差の「箱」として見えるのを防ぐ。texrefine の定数ブロック参照)。
+            # head_tone_only: TRELLIS.2 は最初から位置の正しい顔を描くため、
+            # 頭部は直接転写せず低周波トーンだけ参照に合わせる (直接転写は
+            # 数pxのずれで頬・顎に斑点ノイズが出て素の顔より悪化する。実測)。
             stats = texrefine.refine_texture_with_references(
-                textured, references, match_base_colors=True
+                textured, references, match_base_colors=True, head_tone_only=True
             )
             if not stats.applied:
                 logger.warning(
