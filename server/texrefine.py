@@ -249,8 +249,16 @@ BASE_MATCH_MIN_BLEND = 0.6  # アンカーに使う最小混合率
 BASE_MATCH_MIN_PAIRS = 5_000  # アンカーがこれ未満なら無補正
 BASE_MATCH_MAX_ANCHORS = 300_000  # KD木に載せるアンカー上限 (超過は無作為抽出)
 BASE_MATCH_NEIGHBORS = 8  # 補間に使う近傍アンカー数
+# 有効半径: アンカー間隔基準だけだと**アンカーが密なほど半径が小さくなる**ため、
+# 手足の側面のような幅のある未転写帯に届かない (実測: 脚側面の56,327テクセル中
+# 5,485=10%にしか補正が届かず、前後との色差が帯として残った)。モデル寸法比の
+# 下限を併用する。
 BASE_MATCH_RADIUS_FACTOR = 8.0  # 有効半径 = アンカー典型間隔 × この係数
-BASE_MATCH_NORMAL_DOT = 0.3  # 法線がこれ以上一致するアンカーだけ使う (薄シェル表裏の混入防止)
+BASE_MATCH_RADIUS_FRACTION = 0.05  # 同・モデル対角比の下限 (身長100で約6mm)
+# 法線条件: **直交は許可し、対向のみ排除する**。脚の側面を挟む前後のアンカーは
+# 法線が直交する(dot≈0)ので、0.3 では必要なアンカーを全部落としてしまう。
+# 薄シェルの裏面(dot≈-1)だけを排除すれば目的は足りる。
+BASE_MATCH_NORMAL_DOT = -0.1
 BASE_MATCH_MAX_SHIFT = 96.0  # 補正量の上限 (チャンネル毎、階調)
 
 # --- 隠れ面の色継承 (match_base_colors の追加パス, 2026-07-31) ----------------
@@ -1009,6 +1017,7 @@ def _match_base_to_reference(
     normal_sums: np.ndarray,
     counts: np.ndarray,
     exclude_2d: Optional[np.ndarray] = None,
+    comp_2d: Optional[np.ndarray] = None,
 ) -> Optional[np.ndarray]:
     """元テクスチャの色調を、3D近傍の転写済みテクセルの差分で局所補正する。
 
@@ -1055,7 +1064,9 @@ def _match_base_to_reference(
     spacing = float(np.median(nn_dist[:, 1]))
     if spacing <= 0.0:
         return None
-    radius = spacing * BASE_MATCH_RADIUS_FACTOR
+    # アンカー密度基準とモデル寸法基準の大きい方 (定数コメント参照)
+    extent = float(np.linalg.norm(a_pos.max(axis=0) - a_pos.min(axis=0)))
+    radius = max(spacing * BASE_MATCH_RADIUS_FACTOR, extent * BASE_MATCH_RADIUS_FRACTION)
 
     t_ys, t_xs, t_pos, t_nrm = _texel_data(targets_mask)
     dists, idx = tree.query(
@@ -1066,6 +1077,14 @@ def _match_base_to_reference(
     # 薄いシェルの表裏 (3Dでは近いが逆向き) のアンカーは使わない
     dot = (a_nrm[idx_safe] * t_nrm[:, None, :]).sum(axis=2)
     valid &= dot >= BASE_MATCH_NORMAL_DOT
+    if comp_2d is not None:
+        # 半径を広げた分、別部位(服↔肌)からトーンを貰わないよう成分で仕切る
+        a_comp = comp_2d[a_ys, a_xs]
+        if n_anchors > BASE_MATCH_MAX_ANCHORS:
+            a_comp = a_comp[pick]
+        t_comp = comp_2d[t_ys, t_xs]
+        both_known = (a_comp[idx_safe] >= 0) & (t_comp[:, None] >= 0)
+        valid &= ~both_known | (a_comp[idx_safe] == t_comp[:, None])
     weight = np.where(valid, 1.0 / np.maximum(dists, spacing * 0.25), 0.0)
     total = weight.sum(axis=1)
     has_support = total > 0.0
@@ -1638,6 +1657,7 @@ def refine_texture_with_references(
             accum_nrm,
             accum_count,
             exclude_2d=head_texels if head_tone_only else None,
+            comp_2d=texel_comp.reshape(h, w) if texel_comp is not None else None,
         )
         if matched_base is not None:
             base = matched_base
