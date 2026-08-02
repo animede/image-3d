@@ -4,7 +4,6 @@ FastAPI TestClient + mockジェネレータでジョブ作成→完了までポ�
 GET model.glb / download?format=stl を検証する。STL出力はtrimeshで再読込し
 watertight・高さ(mm)を機械検証する(DEVELOPMENT_POLICY.md §5)。
 """
-import base64
 import io
 import json
 import time
@@ -363,54 +362,6 @@ def test_single_view_job_has_views_front_only(client):
     job = _wait_for_completion(client, job_id)
     assert job["status"] == "completed", job.get("error")
     assert job["views"] == ["front"]
-
-
-def make_sheet_png_bytes(size=(900, 400), panel_w=200, panel_h=300, gap=100) -> bytes:
-    """/api/sheet/split テスト用の3パネル合成RGBAシート画像。"""
-    w, h = size
-    arr = np.zeros((h, w, 4), dtype=np.uint8)
-    y0 = (h - panel_h) // 2
-    colors = [(255, 0, 0, 255), (0, 255, 0, 255), (0, 0, 255, 255)]
-    x_starts = [gap, gap * 2 + panel_w, gap * 3 + panel_w * 2]
-    for x0, color in zip(x_starts, colors):
-        arr[y0 : y0 + panel_h, x0 : x0 + panel_w] = color
-    img = Image.fromarray(arr, "RGBA")
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
-
-
-def test_sheet_split_endpoint_detects_three_panels(client):
-    """POST /api/sheet/split: 合成3パネルシート -> panels長さ3、
-    suggested_viewが front/left/back の順であること。
-    """
-    sheet_bytes = make_sheet_png_bytes()
-    res = client.post(
-        "/api/sheet/split",
-        files={"image": ("sheet.png", sheet_bytes, "image/png")},
-    )
-    assert res.status_code == 200
-    data = res.json()
-    panels = data["panels"]
-    assert len(panels) == 3
-
-    for idx, panel in enumerate(panels):
-        assert panel["index"] == idx
-        assert panel["suggested_view"] in ("front", "left", "back", "right")
-        # image_b64はデコード可能なPNGであること
-        raw = base64.b64decode(panel["image_b64"])
-        decoded = Image.open(io.BytesIO(raw))
-        assert decoded.format == "PNG"
-
-    assert [p["suggested_view"] for p in panels] == ["front", "left", "back"]
-
-
-def test_sheet_split_endpoint_rejects_non_image(client):
-    res = client.post(
-        "/api/sheet/split",
-        files={"image": ("test.txt", b"not an image", "image/png")},
-    )
-    assert 400 <= res.status_code < 500
 
 
 def test_reject_invalid_texture_mode(client):

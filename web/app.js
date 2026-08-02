@@ -12,13 +12,6 @@ const progressBarFill = document.getElementById("progress-bar-fill");
 const progressError = document.getElementById("progress-error");
 const multiviewNote = document.getElementById("multiview-note");
 
-const sheetFileInput = document.getElementById("sheet-file-input");
-const sheetDropzone = document.getElementById("sheet-dropzone");
-const sheetSplitBtn = document.getElementById("sheet-split-btn");
-const sheetPanelsArea = document.getElementById("sheet-panels-area");
-const sheetPanelsList = document.getElementById("sheet-panels-list");
-const sheetApplyBtn = document.getElementById("sheet-apply-btn");
-
 const VIEW_LABELS_JA = {
   front: "正面",
   back: "背面",
@@ -84,9 +77,6 @@ let pollTimer = null;
 
 // 追加ビュー(back/left/right)の選択中File(未選択はnull)
 const extraViewFiles = { back: null, left: null, right: null };
-
-// キャラクターシート分割結果(パネル配列、各要素 {index, image_b64, suggested_view, blob})
-let sheetPanels = [];
 
 const viewer = new Viewer(viewerCanvas);
 // デバッグ用: コンソール/自動検証からカメラ操作できるように公開する(挙動には無関係)。
@@ -188,120 +178,6 @@ function updateMultiviewNote() {
     multiviewNote.textContent = "";
   }
 }
-
-// --- キャラクターシート分割 ---------------------------------------------------
-sheetDropzone.addEventListener("click", () => {
-  if (!sheetSplitBtn.disabled) sheetFileInput.click();
-});
-sheetSplitBtn.addEventListener("click", (e) => {
-  e.stopPropagation();
-  if (!sheetSplitBtn.disabled) sheetFileInput.click();
-});
-sheetDropzone.addEventListener("dragover", (e) => {
-  e.preventDefault();
-  if (!sheetSplitBtn.disabled) sheetDropzone.classList.add("dragover");
-});
-sheetDropzone.addEventListener("dragleave", () => sheetDropzone.classList.remove("dragover"));
-sheetDropzone.addEventListener("drop", async (e) => {
-  e.preventDefault();
-  sheetDropzone.classList.remove("dragover");
-  if (sheetSplitBtn.disabled || e.dataTransfer.files.length === 0) return;
-  await handleSheetFile(e.dataTransfer.files[0]);
-});
-sheetFileInput.addEventListener("change", async () => {
-  if (sheetFileInput.files.length === 0) return;
-  await handleSheetFile(sheetFileInput.files[0]);
-  sheetFileInput.value = "";
-});
-
-async function handleSheetFile(file) {
-  if (!file.type.startsWith("image/")) {
-    alert("シート画像ファイルを選択してください。");
-    return;
-  }
-  sheetSplitBtn.disabled = true;
-  sheetSplitBtn.textContent = "分割中...";
-  sheetDropzone.classList.add("processing");
-  try {
-    const formData = new FormData();
-    formData.append("image", file);
-    const res = await fetch("/api/sheet/split", { method: "POST", body: formData });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({ detail: res.statusText }));
-      throw new Error(err.detail || "シート分割に失敗しました。");
-    }
-    const data = await res.json();
-    sheetPanels = data.panels;
-    renderSheetPanels();
-  } catch (err) {
-    alert(err.message);
-  } finally {
-    sheetSplitBtn.disabled = false;
-    sheetSplitBtn.textContent = "シート画像を選んで分割";
-    sheetDropzone.classList.remove("processing");
-  }
-}
-
-function renderSheetPanels() {
-  sheetPanelsList.innerHTML = "";
-  if (sheetPanels.length === 0) {
-    sheetPanelsArea.hidden = true;
-    return;
-  }
-  sheetPanelsArea.hidden = false;
-
-  for (const panel of sheetPanels) {
-    const item = document.createElement("div");
-    item.className = "sheet-panel-item";
-
-    const thumb = document.createElement("img");
-    thumb.className = "sheet-panel-thumb";
-    thumb.src = `data:image/png;base64,${panel.image_b64}`;
-
-    const select = document.createElement("select");
-    select.className = "sheet-panel-select";
-    select.dataset.index = panel.index;
-    for (const v of ["front", "back", "left", "right", "none"]) {
-      const opt = document.createElement("option");
-      opt.value = v;
-      opt.textContent = VIEW_LABELS_JA[v];
-      if (v === panel.suggested_view) opt.selected = true;
-      select.appendChild(opt);
-    }
-
-    item.appendChild(thumb);
-    item.appendChild(select);
-    sheetPanelsList.appendChild(item);
-  }
-}
-
-sheetApplyBtn.addEventListener("click", () => {
-  const selects = sheetPanelsList.querySelectorAll(".sheet-panel-select");
-  const assignment = {}; // view -> panel
-  selects.forEach((select) => {
-    const view = select.value;
-    if (view === "none") return;
-    const idx = Number(select.dataset.index);
-    const panel = sheetPanels.find((p) => p.index === idx);
-    if (panel) assignment[view] = panel;
-  });
-
-  for (const [view, panel] of Object.entries(assignment)) {
-    const raw = atob(panel.image_b64);
-    const bytes = new Uint8Array(raw.length);
-    for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
-    const blob = new Blob([bytes], { type: "image/png" });
-    const file = new File([blob], `panel_${panel.index}_${view}.png`, { type: "image/png" });
-
-    if (view === "front") {
-      handleFileSelect(file);
-    } else if (view in extraViewFiles) {
-      setExtraViewFile(view, file);
-    }
-  }
-
-  updateMultiviewNote();
-});
 
 // --- カラーモード切替 -------------------------------------------------------
 colorModeCheckbox.addEventListener("change", () => {

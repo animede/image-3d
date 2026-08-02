@@ -17,8 +17,8 @@ Web UIの使い方は [`docs/USAGE.md`](docs/USAGE.md)、詳細仕様は
 - Phase 2 で `IMAGE3D_GENERATOR=hunyuan3d` により実モデルに切り替え可能(下記参照)。
 - Phase 2.5 で4色カラープリンタ向け出力(`color_mode=color4`)に対応
   (下記「Phase 2.5: 4色カラープリント対応」参照)。
-- Phase 3a でマルチビュー入力(正面+背面/左/右)とキャラクターシート自動分割に対応
-  (下記「Phase 3a: マルチビュー入力+キャラクターシート自動分割」参照)。
+- Phase 3a でマルチビュー入力(正面+背面/左/右)に対応
+  (下記「Phase 3a: マルチビュー入力」参照)。
 - Phase 3b でパラメータプリセット(FR-11)とビューアのオーバーハングヒートマップ
   (FR-12)に対応(下記「Phase 3b: プリセット+オーバーハングヒートマップ」参照、
   フロントエンドのみの変更でサーバAPIは不変)。
@@ -167,8 +167,6 @@ curl -s -X POST http://127.0.0.1:8000/api/jobs \
   -F "image_back=@back.png" \
   -F 'params={"seed":42}'
 
-# キャラクターシート分割(Phase 3a、ジョブを作らない同期API)
-curl -s -X POST http://127.0.0.1:8000/api/sheet/split -F "image=@sheet.png"
 ```
 
 全エンドポイントは [`docs/SPEC.md`](docs/SPEC.md) §5 を参照。
@@ -190,12 +188,8 @@ curl -s -X POST http://127.0.0.1:8000/api/sheet/split -F "image=@sheet.png"
 - `tests/test_colorproc.py`: 合成4色ブロック画像+単純メッシュで、頂点カラー投影・
   k-means量子化(パレット数がn_colors以下)・色ごとの分割(面数合計が元メッシュと
   一致)・パレット統計(face_ratio合計≈1.0)を検証。
-- `tests/test_sheet.py`: 合成RGBAシート画像(透明背景に離れた色付きシルエット3つ)で
-  パネル自動検出(面積フィルタ・近接マージ・左→右ソート)とsuggested_view推定を
-  rembgに依存せず決定的に検証。
 - `tests/test_api.py`(Phase 3a追加分): mockで `image` + `image_back` の2ビュー
-  ジョブがcompletedし、`views` フィールドが正しく記録されること、および
-  `POST /api/sheet/split` が合成シート画像から3パネルを検出することを検証。
+  ジョブがcompletedし、`views` フィールドが正しく記録されることを検証。
 - `tests/test_texture.py`(Phase 3c追加): GPU不要の純関数
   `texture.sample_vertex_colors_from_texture` を、合成UV平面メッシュ+
   既知の4色ブロックテクスチャでUV→ピクセル対応を検証。`texture.is_available()`
@@ -340,7 +334,7 @@ curl -s "http://127.0.0.1:8000/api/jobs/<job_id>/download?format=3mf" -o model_c
   正しく再現されることを確認した。`server/colorproc.py`の`_U_TO_X_SIGN=+1`
   (画像u=0が-X側、u=1が+X側)がこの実機検証で確定した値である。
 
-## Phase 3a: マルチビュー入力+キャラクターシート自動分割 (FR-9)
+## Phase 3a: マルチビュー入力 (FR-9)
 
 複数ビュー画像(正面必須+背面/左側面/右側面の任意組合せ)から3Dモデルを生成できる。
 複数ビュー時は Hunyuan3D-2 のマルチビューモデル `hunyuan3d-dit-v2-mv`
@@ -348,10 +342,6 @@ curl -s "http://127.0.0.1:8000/api/jobs/<job_id>/download?format=3mf" -o model_c
 別リポジトリである点に注意)を使用する。単一画像時は従来通り
 `hunyuan3d-dit-v2-0` を使用する。両パイプラインは別インスタンスとして
 共存常駐する(`server/generators/hunyuan3d.py`)。
-
-また、1枚のキャラクターシート画像(複数ビューが並んだ画像)から被写体パネルを
-自動検出し、各パネルをUI上で正面/背面/左/右のいずれかに割り当てて生成に
-使用できる(`server/sheet.py`)。
 
 ### 使い方(マルチビュー生成)
 
@@ -380,34 +370,6 @@ curl -s -X POST http://127.0.0.1:8000/api/jobs \
 (`color_mode=color4`時の頂点カラー、FR-8)は正面(front)画像を正面側に使い、
 背面(back)画像があれば背面側にも使用する。
 
-### 使い方(キャラクターシート自動分割)
-
-1. 左ペイン「キャラクターシート分割(任意)」の「シート画像を選んで分割」を
-   押し、複数ビューが1枚に並んだシート画像を選択する。
-2. `POST /api/sheet/split` が呼ばれ、検出されたパネルがサムネイル一覧として
-   表示される。各パネルには割当セレクト(正面/背面/左/右/使わない)が付き、
-   初期値は左からの並び順ヒューリスティクス(正面→側面→背面の順を仮定)で
-   自動推定される。
-3. 必要に応じて割当を修正し、「この割当を使用」を押すと、各パネル画像が
-   対応するアップロード欄(正面画像・追加ビュー欄)に反映される。
-4. 通常通り生成パラメータを設定して「3Dモデルを生成」を押す。
-
-パネル自動検出のロジック(`server/sheet.py`):
-
-1. 前景マスク取得: RGBA画像でアルファに情報があればそれを使用。無ければ
-   rembgでマスクを取得。それも不可なら四隅の背景色との色差で2値化する。
-2. マスクの連結成分解析(`scipy.ndimage.label`)。画像全体の1%未満の成分は
-   除去し、間隔が画像幅の2%未満のバウンディングボックス同士はマージする。
-3. 残ったボックスを左→右(同列なら上→下)にソートし、パディング付きで
-   切り出す(最大6パネル)。
-
-`/api/sheet/split` はジョブを作らない同期APIで、数秒で結果を返す:
-
-```bash
-curl -s -X POST http://127.0.0.1:8000/api/sheet/split -F "image=@sheet.png"
-# => {"panels": [{"index": 0, "image_b64": "...", "suggested_view": "front"}, ...]}
-```
-
 ### 実機検証結果 (GPU, momo.png + 左右反転画像)
 
 `IMAGE3D_GENERATOR=hunyuan3d`、front=`momo.png`(640x960)、
@@ -434,14 +396,6 @@ back=momo.pngの左右反転画像、`seed=42`、`color_mode=color4`, `n_colors=
   マルチビュー用パイプライン(`hunyuan3d-dit-v2-mv`)が共存常駐し、
   それぞれ単一ビュージョブ・複数ビュージョブを問題なく処理できることを確認した
   (VRAM: 両モデル常駐時で合計使用量 約46GB、他プロセス分約35.7GB含む)。
-
-### キャラクターシート分割の動作確認
-
-合成RGBAシート画像(透明背景に離れた色付きシルエット3つ)と実際のUI操作
-(ブラウザ経由でのcanvas生成シート画像)の両方で、3パネルの検出・
-左→右の順序・suggested_view(front/left/back)の初期推定・パネル画像への
-反映(正面画像プレビュー・追加ビュー欄への自動設定)を確認済み
-(`tests/test_sheet.py`、`tests/test_api.py`)。
 
 ## Phase 3b: プリセット+オーバーハングヒートマップ (FR-11, FR-12)
 
@@ -857,7 +811,6 @@ image-3d/
 │   ├── preprocess.py         # 画像前処理(背景除去・リサイズ)
 │   ├── meshproc.py           # メッシュ後処理
 │   ├── colorproc.py          # 4色カラープリント対応(Phase 2.5、頂点カラー投影・量子化・分割)
-│   ├── sheet.py              # キャラクターシート自動分割(Phase 3a、パネル検出)
 │   └── texture.py            # テクスチャ生成 texgen 統合(Phase 3c、paint常駐ラッパ・頂点カラーサンプリング)
 ├── web/                      # 静的フロントエンド
 ├── tests/                    # pytest
@@ -878,10 +831,6 @@ image-3d/
   モデルとは別リポジトリ `tencent/Hunyuan3D-2mv`)の追加ダウンロードが必要。
   厳密なマルチビュー幾何整合(正面・背面・側面の完全な形状一致)はモデル自体の
   性能に依存し、本アプリ側での補正は行わない(SPEC.md §7の制約通り)。
-- キャラクターシート自動分割(`server/sheet.py`)は、パネル同士が明確に離れて
-  いる・背景とのコントラストがある構図を前提とした簡易的な連結成分解析であり、
-  パネルが複雑に重なる・背景と被写体の色が近いシートでは誤検出する場合がある
-  (その場合はUI上で手動修正が必要)。
 - テクスチャ生成AIによるカラー3Dプリント(Hunyuan3D-2 paint pipeline)は
   Phase 3cで `texture_mode=paint` として対応済み(上記「Phase 3c」参照)。
   ビルド・依存が利用できない環境では自動的に無効化され、Phase 2.5の

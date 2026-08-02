@@ -1,8 +1,6 @@
 """FastAPIエントリポイント (SPEC.md §5 API仕様)。"""
 from __future__ import annotations
 
-import base64
-import io
 import json
 import logging
 import platform
@@ -13,7 +11,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import config, sheet
+from . import config
 from .generators.base import GenerationParams
 from .generators.mock import MockGenerator
 from .jobs import EXPORT_FORMATS, EXTRA_VIEW_LABELS, STATUS_COMPLETED, JobManager
@@ -406,40 +404,6 @@ async def delete_job(job_id: str):
     if not ok:
         raise HTTPException(status_code=404, detail="ジョブが見つかりません。")
     return {"deleted": True}
-
-
-@app.post("/api/sheet/split")
-async def split_sheet(image: UploadFile = File(...)):
-    """キャラクターシート画像から被写体パネルを自動検出する (SPEC.md §3.8 / FR-9)。
-
-    ジョブは作成しない同期API。数秒で結果を返す。
-    """
-    data = await _read_and_validate_upload(image, "image")
-
-    from .preprocess import load_and_validate_image
-
-    pil_image = load_and_validate_image(data, config.MAX_UPLOAD_BYTES)
-
-    import asyncio
-
-    loop = asyncio.get_running_loop()
-    panels = await loop.run_in_executor(None, sheet.split_sheet, pil_image)
-    views = sheet.suggested_views(len(panels))
-
-    result = []
-    for idx, (panel, suggested_view) in enumerate(zip(panels, views)):
-        buf = io.BytesIO()
-        panel.save(buf, format="PNG")
-        image_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-        result.append(
-            {
-                "index": idx,
-                "image_b64": image_b64,
-                "suggested_view": suggested_view,
-            }
-        )
-
-    return {"panels": result}
 
 
 @app.get("/api/health")

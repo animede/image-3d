@@ -248,69 +248,6 @@ html, body {
 .secondary-btn:hover { border-color: var(--accent); background: rgba(91, 140, 255, 0.1); }
 .secondary-btn:disabled { opacity: 0.6; cursor: not-allowed; }
 
-.sheet-dropzone {
-  padding: 14px 12px;
-}
-
-.sheet-dropzone p {
-  margin: 0 0 10px 0;
-}
-
-.sheet-dropzone.processing {
-  opacity: 0.75;
-  cursor: wait;
-}
-
-#sheet-panels-area {
-  margin-top: 12px;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-#sheet-panels-area[hidden] {
-  display: none;
-}
-
-#sheet-panels-list {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-}
-
-.sheet-panel-item {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 6px;
-  width: 84px;
-}
-
-.sheet-panel-thumb {
-  width: 80px;
-  height: 80px;
-  object-fit: contain;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background:
-    linear-gradient(45deg, #333 25%, transparent 25%),
-    linear-gradient(-45deg, #333 25%, transparent 25%),
-    linear-gradient(45deg, transparent 75%, #333 75%),
-    linear-gradient(-45deg, transparent 75%, #333 75%);
-  background-size: 12px 12px;
-  background-position: 0 0, 0 6px, 6px -6px, -6px 0px;
-}
-
-.sheet-panel-select {
-  width: 100%;
-  background: var(--bg-3);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 4px;
-  color: var(--text-0);
-  font-size: 11px;
-}
-
 .multiview-note {
   font-size: 12px;
   color: var(--accent);
