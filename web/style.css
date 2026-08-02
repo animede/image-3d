@@ -296,6 +296,10 @@ html, body {
   width: 16px;
   height: 16px;
   accent-color: var(--accent);
+  /* .field.checkbox は flex なので、ラベルが折り返すほど長いとチェックボックス
+     自身が縮められる(実測: 「参照画像で高精細化…」だけ 16px→13.2px)。
+     width を指定していても既定の flex-shrink:1 が勝つため、明示的に止める。 */
+  flex-shrink: 0;
 }
 
 .primary-btn {
