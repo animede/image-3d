@@ -5,6 +5,10 @@ import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 
 const BUILD_PLATE_MM = 220;
 
+// 自動回転の速さ。OrbitControls の autoRotateSpeed は「2.0 = 60fps で1周30秒」
+// という定義なので、この値がそのまま「ゆっくり1周30秒」になる。
+const AUTO_ROTATE_SPEED = 2.0;
+
 export class Viewer {
   constructor(canvas) {
     this.canvas = canvas;
@@ -21,6 +25,7 @@ export class Viewer {
     this.controls.enableDamping = true;
     this.controls.dampingFactor = 0.08;
     this.controls.target.set(0, 40, 0);
+    this.controls.autoRotateSpeed = AUTO_ROTATE_SPEED;
 
     this._setupLights();
     this._setupGrid();
@@ -149,6 +154,21 @@ export class Viewer {
     this.camera.far = maxDim * 50;
     this.camera.updateProjectionMatrix();
     this.controls.update();
+  }
+
+  /** モデルの頭-足軸まわりにカメラをゆっくり周回させる(ターンテーブル)。
+   *
+   * 生成メッシュは Z-up だが `loadGLB` のラッパーで X軸-90度回転して載せるので、
+   * **頭-足軸はシーンの +Y** になる。OrbitControls の自動回転はカメラの up
+   * (既定 +Y) まわりに `target` を周回するので、これがそのまま「頭が上・足が下の
+   * まま回る」動きになる(モデル自身は回さないので、床グリッドとの位置関係や
+   * オーバーハング判定の向きは変わらない)。
+   *
+   * ドラッグ・ホイール操作の最中は OrbitControls 側が自動回転を止めるため、
+   * 手動の視点変更と自然に共存する。
+   */
+  setAutoRotate(enabled) {
+    this.controls.autoRotate = enabled;
   }
 
   setWireframe(enabled) {

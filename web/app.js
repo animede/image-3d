@@ -47,6 +47,7 @@ const textureModeUnavailableNote = document.getElementById("texture-mode-unavail
 const shadingBtn = document.getElementById("shading-btn");
 const wireframeBtn = document.getElementById("wireframe-btn");
 const overhangBtn = document.getElementById("overhang-btn");
+const autoRotateBtn = document.getElementById("autorotate-btn");
 const overhangControls = document.getElementById("overhang-controls");
 const overhangThresholdSlider = document.getElementById("overhang-threshold");
 const overhangThresholdValue = document.getElementById("overhang-threshold-value");
@@ -576,6 +577,17 @@ function setViewModeButton(activeBtn) {
   [shadingBtn, wireframeBtn, overhangBtn].forEach((btn) => btn.classList.remove("active"));
   activeBtn.classList.add("active");
 }
+
+// --- 自動回転(ターンテーブル) ------------------------------------------------
+// 表示モードとは独立したトグル。モデルの頭-足軸まわりにカメラを周回させる
+// (viewer.setAutoRotate のコメント参照)。設定はビューア側に持つので、
+// 別のジョブを読み込んでも状態が続く。
+autoRotateBtn.addEventListener("click", () => {
+  const enabled = !autoRotateBtn.classList.contains("active");
+  viewer.setAutoRotate(enabled);
+  autoRotateBtn.classList.toggle("active", enabled);
+  autoRotateBtn.setAttribute("aria-pressed", String(enabled));
+});
 
 overhangThresholdSlider.addEventListener("input", () => {
   const deg = Number(overhangThresholdSlider.value);

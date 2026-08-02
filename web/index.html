@@ -194,6 +194,19 @@
           <button id="wireframe-btn" class="toggle-btn" type="button">ワイヤーフレーム</button>
           <button id="overhang-btn" class="toggle-btn" type="button">オーバーハング</button>
         </span>
+
+        <!-- 表示モード(排他)とは独立したトグルなので、別のグループに置く -->
+        <span class="viewer-toggle">
+          <button
+            id="autorotate-btn"
+            class="toggle-btn"
+            type="button"
+            title="頭を上にしたまま、モデルの縦軸まわりにゆっくり回します(1周30秒)"
+            aria-pressed="false"
+          >
+            自動回転
+          </button>
+        </span>
       </div>
 
       <div id="overhang-controls" hidden>
